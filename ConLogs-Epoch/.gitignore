@@ -1,0 +1,20 @@
+*.zip
+.DS_Store
+Thumbs.db
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pfx
+*.p12
+secrets/
+credentials.json
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
+.claude/
