@@ -131,7 +131,7 @@ local function shouldBeActive()
     if not (LoggingCombat and LoggingCombat()) then return false end
     if testForce then return true end
     local _, instType = IsInInstance()
-    if instType ~= "raid" and instType ~= "party" then return false end
+    if instType ~= "raid" and instType ~= "party" and instType ~= "pvp" then return false end
     return UnitAffectingCombat("player") and true or false
 end
 
