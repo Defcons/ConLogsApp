@@ -12,8 +12,10 @@
   chunk header). No UnitPosition / LibDeflate on this client, so payloads are the
   addon's existing `^`-delimited wire string, base64'd (no compression yet).
 
-  DEFAULT OFF — gated on ConLogsDB.config.relayEnabled. Overwriting the fail-reason
-  globals taints the secure environment, so this stays opt-in until hardened.
+  DEFAULT ON — runs for every user, so any /combatlog automatically embeds the data.
+  Disable per-user with `/conlogs relay off` (sets ConLogsDB.config.relayEnabled=false).
+  NOTE: overwriting the fail-reason globals taints the secure environment; the taint/
+  UIErrors suppression below keeps that invisible, but harden before a public release.
   Commands: /conlogs relay on | off | status | test
 =========================================================================== ]]--
 
@@ -124,7 +126,11 @@ end
 --==========================================================================--
 local testForce = false   -- set by /conlogs relay test for out-of-instance testing
 local function relayEnabled()
-    return (ConLogsDB and ConLogsDB.config and ConLogsDB.config.relayEnabled) and true or false
+    -- DEFAULT ON: the relay runs for every user (so any /combatlog automatically
+    -- carries gear/talents/positions). Only an explicit `/conlogs relay off`
+    -- (relayEnabled == false) disables it; nil/true both mean on.
+    if ConLogsDB and ConLogsDB.config and ConLogsDB.config.relayEnabled == false then return false end
+    return true
 end
 local function shouldBeActive()
     if not (relayEnabled() or testForce) then return false end
