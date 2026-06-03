@@ -44,7 +44,6 @@ const INSETS = {
   NetherstormArena: { x0:0, y0:0, x1:1, y1:1 },
   WarsongGulch:     { x0:0.16, y0:0.10, x1:0.84, y1:0.90 },  // estimate; refine with a real WSG track
 };
-const INSET = INSETS[TRACK.map] || { x0:0, y0:0, x1:1, y1:1 };
 
 // ---- mock fallback so the prototype is visible without a real log ----
 function mockTrack() {
@@ -57,6 +56,7 @@ function mockTrack() {
   return { map:"WarsongGulch", classMap:cls, names, snapshots:snaps };
 }
 const TRACK = window.TRACK || mockTrack();
+const INSET = INSETS[TRACK.map] || { x0:0, y0:0, x1:1, y1:1 };
 
 const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
 const bg = new Image(); bg.src = (TRACK.map || "WarsongGulch") + ".png";
