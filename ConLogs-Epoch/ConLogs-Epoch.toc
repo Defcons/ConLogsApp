@@ -10,4 +10,5 @@ ConLogs.lua
 ConLogsUI.lua
 ConLogsDummy.lua
 ConLogsDungeon.lua
+ConLogsRelay.lua
 ConLogsSpike.lua
