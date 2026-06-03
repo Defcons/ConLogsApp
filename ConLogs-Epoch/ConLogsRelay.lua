@@ -19,6 +19,8 @@
 
 local PREFIX_FAMILY = "[[CL_"   -- landed-evidence family prefix (all our chunk kinds share it)
 local CI_PREFIX     = "[[CL_CI_v1_"
+local TS_PREFIX     = "[[CL_TS_v1_"   -- telemetry snapshot (positions)
+local TELEMETRY_INTERVAL = 2.0        -- seconds between position snapshots
 local CHUNK_BODY    = 850       -- base64 chars per chunk (field cap ~1023, header ~46)
 local QUEUE_MAX     = 400       -- ring cap
 local CHUNK_TTL     = 600       -- seconds a chunk waits before TTL-evict
@@ -198,6 +200,75 @@ local function enqueueGroupCI(force)
 end
 
 --==========================================================================--
+-- position telemetry (TS) producer — periodic raid position snapshots
+-- Payload: TS|<getTimeMs>|<unixSec>|<guid>:<x>,<y>|<guid>:<x>,<y>|...
+-- (no UnitPosition on PE → normalized GetPlayerMapPosition map_x/map_y only)
+--==========================================================================--
+local function round4(n)
+    if type(n) ~= "number" then return 0 end
+    return math.floor(n * 10000 + 0.5) / 10000
+end
+
+-- GetPlayerMapPosition only returns non-zero when the world map is set to the
+-- player's current zone; do the dance only if needed, never while the map is open.
+local function withCurrentZoneMap(fn)
+    if type(GetPlayerMapPosition) == "function" then
+        local px, py = GetPlayerMapPosition("player")
+        if px and py and (px ~= 0 or py ~= 0) then return fn() end
+    end
+    local canAdjust = type(SetMapToCurrentZone) == "function"
+        and not (_G.WorldMapFrame and WorldMapFrame:IsShown())
+    if not canAdjust then return fn() end
+    local oldC = type(GetCurrentMapContinent) == "function" and GetCurrentMapContinent() or nil
+    local oldZ = type(GetCurrentMapZone) == "function" and GetCurrentMapZone() or nil
+    pcall(SetMapToCurrentZone)
+    local function pack(...) return { n = select('#', ...), ... } end
+    local r = pack(fn())
+    if oldC and oldC > 0 and type(SetMapZoom) == "function" then pcall(SetMapZoom, oldC, oldZ or 0) end
+    return unpack(r, 1, r.n)
+end
+
+local snapId = 0
+local function captureSnapshot()
+    local units = {}
+    local raidN = GetNumRaidMembers() or 0
+    if raidN > 0 then for i = 1, raidN do units[#units + 1] = "raid" .. i end
+    else units[#units + 1] = "player"; for i = 1, (GetNumPartyMembers() or 0) do units[#units + 1] = "party" .. i end end
+    local parts = {}
+    local mapFile, level = "", 0
+    withCurrentZoneMap(function()
+        -- map identity so the server knows which WorldMap background these 0-1
+        -- coords belong to (Naxx etc. normalize per wing/level).
+        if type(GetMapInfo) == "function" then mapFile = GetMapInfo() or "" end
+        if type(GetCurrentMapDungeonLevel) == "function" then level = GetCurrentMapDungeonLevel() or 0 end
+        for _, u in ipairs(units) do
+            if UnitExists(u) then
+                local x, y = GetPlayerMapPosition(u)
+                if x and y and (x ~= 0 or y ~= 0) then
+                    local g = (UnitGUID(u) or ""):gsub("^0x", "")
+                    parts[#parts + 1] = string.format("%s:%s,%s", g, round4(x), round4(y))
+                end
+            end
+        end
+    end)
+    if #parts == 0 then return nil end
+    -- TS|<getTimeMs>|<unixSec>|<mapFile>|<dungeonLevel>|<guid>:<x>,<y>|...
+    return string.format("TS|%d|%d|%s|%d|%s", math.floor((GetTime() or 0) * 1000), time() or 0, tostring(mapFile), level, table.concat(parts, "|"))
+end
+
+local function enqueueTS()
+    local payload = captureSnapshot()
+    if not payload then return end
+    snapId = snapId + 1
+    local b64 = b64encode(payload)
+    local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
+    for i = 1, total do
+        local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
+        enqueue(string.format("%s%s_%d_%d/%d]]%s", TS_PREFIX, session, snapId, i, total, piece))
+    end
+end
+
+--==========================================================================--
 -- driver: on each of the player's SPELL_CAST_FAILED events
 --==========================================================================--
 local function onFailed(...)
@@ -237,6 +308,15 @@ frame:SetScript("OnEvent", function(self, event, ...)
         if active then restoreGlobals() end
     end
 end)
+-- Position snapshot ticker: every TELEMETRY_INTERVAL while active, enqueue a TS chunk.
+local tsAccum = 0
+frame:SetScript("OnUpdate", function(self, elapsed)
+    if not active then return end
+    tsAccum = tsAccum + (elapsed or 0)
+    if tsAccum < TELEMETRY_INTERVAL then return end
+    tsAccum = 0
+    enqueueTS()
+end)
 frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 frame:RegisterEvent("PLAYER_REGEN_DISABLED")
 frame:RegisterEvent("PLAYER_REGEN_ENABLED")
@@ -267,8 +347,8 @@ local function cmdRelay(sub)
         installSuppress()
         active = true
         local n = enqueueGroupCI(true)
-        out(("test mode ON — queued %d chunk(s) for your group. Make sure /combatlog is on, then"):format(n))
-        out("fail some casts (abilities on cooldown). Search WoWCombatLog.txt for [[CL_CI_ . /conlogs relay off to stop.")
+        out(("test mode ON — queued %d gear chunk(s); positions now stream every %ds while active."):format(n, TELEMETRY_INTERVAL))
+        out("Make sure /combatlog is on, then fail casts (abilities on cooldown). Search the log for [[CL_CI_ (gear) and [[CL_TS_ (positions). /conlogs relay off to stop.")
     elseif sub == "status" then
         local _, instType = IsInInstance()
         out(("enabled=%s active=%s queued=%d logging=%s instance=%s testForce=%s"):format(
