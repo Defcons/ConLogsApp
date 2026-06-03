@@ -3217,6 +3217,61 @@ f:SetScript("OnEvent", function(self, event, ...)
         ConLogsDB.lastScanned = ConLogsDB.lastScanned or {}
         ConLogsDB.config      = ConLogsDB.config      or {}
         ConLogsDB.peerInfo    = ConLogsDB.peerInfo    or {}
+
+        -- Claude (ConLogs): one-time import of the legacy EpogArmory database.
+        -- ConLogs-Epoch is EpogArmory renamed; SavedVariables are per-addon, so the
+        -- old EpogArmoryDB is only readable while the EpogArmory addon is STILL
+        -- installed (its SV loads these globals). Whenever it's present and we haven't
+        -- imported yet, MERGE its data in per-guid (never clobbering newer ConLogs
+        -- entries) and mark done. If EpogArmory isn't installed we leave the flag
+        -- unset and retry on a later login, so the user can do it any time. Schema is
+        -- identical (same addon), so it's a straight merge — MigratePlayers reshapes
+        -- imported records like any other.
+        if not ConLogsDB._epogMigrated and type(_G.EpogArmoryDB) == "table" then
+            local function copy(t)
+                if type(t) ~= "table" then return t end
+                local o = {}; for k, v in pairs(t) do o[k] = copy(v) end; return o
+            end
+            local src = _G.EpogArmoryDB
+            local imported = 0
+            if type(src.players) == "table" then
+                for guid, prec in pairs(src.players) do
+                    if ConLogsDB.players[guid] == nil then
+                        ConLogsDB.players[guid] = copy(prec); imported = imported + 1
+                    end
+                end
+            end
+            if type(src.lastScanned) == "table" then
+                for g, ts in pairs(src.lastScanned) do
+                    if ConLogsDB.lastScanned[g] == nil then ConLogsDB.lastScanned[g] = ts end
+                end
+            end
+            if type(src.peerInfo) == "table" then
+                for n, info in pairs(src.peerInfo) do
+                    if ConLogsDB.peerInfo[n] == nil then ConLogsDB.peerInfo[n] = copy(info) end
+                end
+            end
+            if type(src.config) == "table" then
+                for k, v in pairs(src.config) do
+                    if ConLogsDB.config[k] == nil then ConLogsDB.config[k] = copy(v) end
+                end
+            end
+            if type(_G.EpogItemCacheDB) == "table" then
+                ConLogsItemCacheDB = ConLogsItemCacheDB or {}
+                for id, e in pairs(_G.EpogItemCacheDB) do
+                    if ConLogsItemCacheDB[id] == nil then ConLogsItemCacheDB[id] = copy(e) end
+                end
+            end
+            if type(_G.EpogTalentTreeDB) == "table" then
+                ConLogsTalentTreeDB = ConLogsTalentTreeDB or {}
+                for k, e in pairs(_G.EpogTalentTreeDB) do
+                    if ConLogsTalentTreeDB[k] == nil then ConLogsTalentTreeDB[k] = copy(e) end
+                end
+            end
+            ConLogsDB._epogMigrated = true
+            print(string.format("|cffffaa44ConLogs-Epoch|r: imported |cff00ff66%d|r player(s) from your previous EpogArmory database.", imported))
+        end
+
         -- v0.43: track every character that's logged into this account so
         -- /epogarmory main can validate against the list. SavedVariables is
         -- account-scoped, so this set accumulates across alts naturally.
