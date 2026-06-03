@@ -37,9 +37,13 @@ const CLASS_COLORS = {
   WARRIOR:"#C79C6E", MAGE:"#69CCF0", ROGUE:"#FFF569", DRUID:"#FF7D0A", HUNTER:"#ABD473",
   SHAMAN:"#0070DE", PRIEST:"#FFFFFF", WARLOCK:"#9482C9", PALADIN:"#F58CBA", DEATHKNIGHT:"#C41F3B",
 };
-// Calibration: where 0..1 coords map inside the 1024x768 map image. Tunable per map
-// once we overlay real positions (WSG art has a decorative border; field is inset).
-const INSET = { x0:0.16, y0:0.10, x1:0.84, y1:0.90 };
+// Calibration: where 0..1 coords map inside the map image. Per-map, since each
+// map's decorative border differs. NetherstormArena verified against a real EotS log.
+const INSETS = {
+  NetherstormArena: { x0:0, y0:0, x1:1, y1:1 },
+  WarsongGulch:     { x0:0.16, y0:0.10, x1:0.84, y1:0.90 },  // estimate; refine with a real WSG track
+};
+const INSET = INSETS[TRACK.map] || { x0:0, y0:0, x1:1, y1:1 };
 
 // ---- mock fallback so the prototype is visible without a real log ----
 function mockTrack() {

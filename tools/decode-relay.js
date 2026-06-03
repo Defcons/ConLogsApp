@@ -115,15 +115,16 @@ const jsOut = process.argv[3];
 if (jsOut) {
     if (!snaps.length) { console.log(`(no positions decoded — not writing ${jsOut})`); }
     else {
-        const t0ms = snaps[0].tMs;
         const mapCount = {};
         snaps.forEach(s => { mapCount[s.map] = (mapCount[s.map] || 0) + 1; });
         const map = Object.keys(mapCount).sort((a, b) => mapCount[b] - mapCount[a])[0] || 'WarsongGulch';
+        const onMap = snaps.filter(s => s.map === map);   // drop pre-game / off-map snapshots
+        const t0ms = onMap[0].tMs;
         const track = {
             map,
             classMap,
             names,
-            snapshots: snaps.map(s => ({ t: s.tMs - t0ms, units: s.entries.map(e => ({ g: e.guid, x: e.x, y: e.y })) })),
+            snapshots: onMap.map(s => ({ t: s.tMs - t0ms, units: s.entries.map(e => ({ g: e.guid, x: e.x, y: e.y })) })),
         };
         fs.writeFileSync(jsOut, 'window.TRACK = ' + JSON.stringify(track) + ';\n');
         console.log(`wrote ${jsOut}  (map=${map}, ${track.snapshots.length} snapshots, ${Object.keys(classMap).length} players classed)`);
