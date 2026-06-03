@@ -320,13 +320,78 @@ local function dumpDB()
     out("Full data is in WTF/.../SavedVariables/ConLogs.lua — send me that file.")
 end
 
+-- Does PE's custom client expose ANY API that returns another unit's position?
+-- (Stock 3.3.5 + PE have no UnitPosition; minimap blips are drawn in C, not Lua.)
+-- Run INSIDE a raid with others grouped — the key question is whether anything
+-- returns non-zero coords for `other`.
+local function cmdUnitPos()
+    out("=== position-API probe (run INSIDE a raid, others grouped) ===")
+    -- 1. scan _G for any function whose name hints at unit/world position
+    local found = {}
+    for k, v in pairs(_G) do
+        if type(k) == "string" and type(v) == "function" then
+            local lk = k:lower()
+            if lk:find("position", 1, true) or lk:find("worldloc", 1, true)
+               or lk:find("coord", 1, true) or lk:find("getxy", 1, true)
+               or lk:find("unitxy", 1, true) or lk:find("worldpos", 1, true) then
+                found[#found + 1] = k
+            end
+        end
+    end
+    table.sort(found)
+    out("position-ish global fns: " .. (#found > 0 and table.concat(found, ", ") or "(none)"))
+
+    -- 2. pick another grouped unit (not self)
+    local other
+    local raidN = GetNumRaidMembers() or 0
+    if raidN > 0 then
+        for i = 1, raidN do local u = "raid" .. i
+            if UnitExists(u) and not UnitIsUnit(u, "player") then other = u; break end end
+    else
+        for i = 1, (GetNumPartyMembers() or 0) do local u = "party" .. i
+            if UnitExists(u) then other = u; break end end
+    end
+    local _, instType = IsInInstance()
+    out(("zone=%s instanceType=%s otherUnit=%s"):format(
+        GetRealZoneText() or "?", tostring(instType),
+        other and (UnitName(other) .. "/" .. other) or "(none in group)"))
+
+    -- 3. call candidate APIs on self + the other unit; report raw returns
+    local function callfn(fn, u)
+        local f = _G[fn]
+        if type(f) ~= "function" then return "n/a" end
+        local r = { pcall(f, u) }
+        if not r[1] then return "error" end
+        local vals = {}
+        for i = 2, #r do vals[#vals + 1] = tostring(r[i]) end
+        return "(" .. table.concat(vals, ", ") .. ")"
+    end
+    local cands = { "UnitPosition", "GetUnitPosition", "GetUnitWorldPosition",
+        "UnitWorldPosition", "GetPlayerWorldPosition", "GetUnitMapPosition", "GetPlayerMapPosition" }
+    local results = {}
+    for _, fn in ipairs(cands) do
+        local sr, orr = callfn(fn, "player"), other and callfn(fn, other) or "n/a"
+        out(("  %-22s self=%s other=%s"):format(fn, sr, orr))
+        results[fn] = { self = sr, other = orr }
+    end
+
+    ConLogsSpikeDB = ConLogsSpikeDB or {}
+    ConLogsSpikeDB.unitPosProbe = {
+        when = date and date("%Y-%m-%d %H:%M:%S") or time(),
+        zone = GetRealZoneText() or "?", instanceType = instType,
+        positionFns = found, results = results,
+    }
+    out("Stored. KEY: does ANY fn return non-zero coords for 'other' inside the raid?")
+end
+
 local function spikeHelp()
     out("Phase-2 feasibility probe (debug). Sub-commands:")
-    out("  /epogarmory spike pos        — probe positions for your group")
-    out("  /epogarmory spike relay      — relay landing test (then fail a cast)")
-    out("  /epogarmory spike size       — max-payload test (then fail a cast)")
-    out("  /epogarmory spike relaystop  — stop the active test + restore globals")
-    out("  /epogarmory spike dump       — show stored results")
+    out("  /conlogs spike pos        — probe positions for your group")
+    out("  /conlogs spike relay      — relay landing test (then fail a cast)")
+    out("  /conlogs spike size       — max-payload test (then fail a cast)")
+    out("  /conlogs spike unitpos    — probe for any API that reads OTHER units' positions")
+    out("  /conlogs spike relaystop  — stop the active test + restore globals")
+    out("  /conlogs spike dump       — show stored results")
 end
 
 -- Wrap the existing /epogarmory handler (same idiom ConLogsUI uses). Loads last
@@ -340,6 +405,7 @@ SlashCmdList["CONLOGS"] = function(msg)
         if sub == "pos" then probePositions()
         elseif sub == "relay" then relayStart()
         elseif sub == "size" then sizeStart()
+        elseif sub == "unitpos" then cmdUnitPos()
         elseif sub == "relaystop" or sub == "stop" then testStop()
         elseif sub == "dump" then dumpDB()
         else spikeHelp() end
