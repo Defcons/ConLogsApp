@@ -73,12 +73,15 @@ console.log(`\nmatched ${matched} chunk lines; CI sets=${Object.keys(ci).length}
 
 console.log('=== GEAR / TALENTS (CI) ===');
 let ciOk = 0, ciBad = 0;
+const classMap = {}, names = {};   // keyed by short guid (matches TS entries)
 for (const key of Object.keys(ci)) {
     const raw = reassemble(ci[key]);
     if (!raw) { ciBad++; console.log(`  [incomplete] ${key} (have ${Object.keys(ci[key].parts).length}/${ci[key].total})`); continue; }
     try {
         const p = parseCI(raw);
         ciOk++;
+        classMap[ci[key].id] = (p.class || '').toUpperCase();
+        names[ci[key].id] = p.name || ci[key].id;
         console.log(`  ${p.name || '?'}  ${p.class || '?'} L${p.level || '?'}  spec=${p.spec}  gear=${p.gearItems}/19  talents=${p.hasTalentRanks} stats=${p.hasCharStats}`);
     } catch (e) { ciBad++; console.log(`  [parse error] ${key}: ${e.message}`); }
 }
@@ -106,3 +109,23 @@ if (snaps.length) {
     first.entries.slice(0, 5).forEach(e => console.log(`    ${e.guid}  (${e.x}, ${e.y})`));
 }
 console.log('');
+
+// ---- optional: write track.js for replay.html  (node decode-relay.js <log> track.js) ----
+const jsOut = process.argv[3];
+if (jsOut) {
+    if (!snaps.length) { console.log(`(no positions decoded — not writing ${jsOut})`); }
+    else {
+        const t0ms = snaps[0].tMs;
+        const mapCount = {};
+        snaps.forEach(s => { mapCount[s.map] = (mapCount[s.map] || 0) + 1; });
+        const map = Object.keys(mapCount).sort((a, b) => mapCount[b] - mapCount[a])[0] || 'WarsongGulch';
+        const track = {
+            map,
+            classMap,
+            names,
+            snapshots: snaps.map(s => ({ t: s.tMs - t0ms, units: s.entries.map(e => ({ g: e.guid, x: e.x, y: e.y })) })),
+        };
+        fs.writeFileSync(jsOut, 'window.TRACK = ' + JSON.stringify(track) + ';\n');
+        console.log(`wrote ${jsOut}  (map=${map}, ${track.snapshots.length} snapshots, ${Object.keys(classMap).length} players classed)`);
+    }
+}
