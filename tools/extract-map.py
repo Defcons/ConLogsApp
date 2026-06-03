@@ -9,22 +9,37 @@
 # Player coords from GetPlayerMapPosition are 0..1; the usable map area is the
 # top-left 1002x668 of the stitched 1024x768 image (standard WoW WorldMap layout).
 
-import sys, os, glob, struct, mpyq
+import sys, os, glob, re, struct, mpyq
 from PIL import Image
 
 DATA = r"C:\Private\Games\Ascension Launcher\resources\epoch_live\Data"
 MPQS = glob.glob(os.path.join(DATA, "*.MPQ")) + glob.glob(os.path.join(DATA, "enUS", "*.MPQ"))
+
+# Patch-override priority: custom letter-patches (patch-A..Z) win over numbered
+# patches, which win over base/locale. Higher = tried first, so a reskinned map
+# (e.g. Gillijim's Isle overriding NetherstormArena) beats the stock tiles.
+def _prio(name):
+    n = name.lower()
+    m = re.match(r"patch-([a-z])\.mpq", n)
+    if m: return 1000 + ord(m.group(1))
+    m = re.match(r"patch-(\d+)\.mpq", n)
+    if m: return 500 + int(m.group(1))
+    if "patch-enus" in n: return 460
+    if n == "patch.mpq": return 400
+    return 100
+
 ARCHIVES = []
 for m in MPQS:
-    try: ARCHIVES.append(mpyq.MPQArchive(m, listfile=False))
+    try: ARCHIVES.append((_prio(os.path.basename(m)), mpyq.MPQArchive(m, listfile=False)))
     except Exception: pass
+ARCHIVES.sort(key=lambda t: -t[0])
 
 def read_tile(name, level, tile):
     if level:
         path = "Interface\\WorldMap\\%s\\%s%d_%d.blp" % (name, name, level, tile)
     else:
         path = "Interface\\WorldMap\\%s\\%s%d.blp" % (name, name, tile)
-    for a in ARCHIVES:
+    for _p, a in ARCHIVES:
         try:
             d = a.read_file(path)
             if d: return d
