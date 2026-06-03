@@ -59,7 +59,7 @@ local DUMMY_NAME_PATTERN = "Training Dummy"
 --
 -- The marker fires via a SecureActionButtonTemplate that the user clicks.
 -- Addon-script CastSpellByName silently fails on Epoch (proven by the
--- 21:00 /epogtest run: GetSpellInfo='Fishing' resolved but no CLEU
+-- 21:00 /conlogstest run: GetSpellInfo='Fishing' resolved but no CLEU
 -- event after CastSpellByName call). The protection model requires a
 -- hardware event (button click / keypress on secure button) to elevate
 -- the call to a secure execution context. So the addon UI prompts the
@@ -142,7 +142,7 @@ local lastDummyHitTime   = 0            -- GetTime() of last player/pet damage o
 local stoppingStartTime  = nil          -- GetTime() when state entered "stopping" (for hard timeout)
 local fightTotalDamage   = 0            -- sum of damage from player+pet to dummy this fight
 local logFilename        = nil          -- expected combat-log filename, computed when LoggingCombat(true) fires
-local testMode           = false        -- Claude v1.7.1: /epogarmory testvalidate — short-circuit straight to "stopping" so user can click Validate without doing a full parse
+local testMode           = false        -- Claude v1.7.1: /conlogs testvalidate — short-circuit straight to "stopping" so user can click Validate without doing a full parse
 
 -- ----- AoE-dummy detection (epoglogs v0.86.6+ server rejection mirror) -----
 -- Server-side parser (js/parser.js ~140-158, ~1240) rejects any upload
@@ -598,7 +598,7 @@ local function FinishFight(reason)
             end
         else
             print("|cffffaa44ConLogs|r [testvalidate]: |cffff6666MARKER NOT VERIFIED|r — Validate was not clicked, or the cast produced no CLEU event.")
-            print("  |cffaaaaaa-|r if you didn't click Validate, run /epogarmory testvalidate again and click the green button before it times out.")
+            print("  |cffaaaaaa-|r if you didn't click Validate, run /conlogs testvalidate again and click the green button before it times out.")
             print("  |cffaaaaaa-|r if you DID click and still see this, the marker mechanism is broken on this client — report it.")
         end
         testMode = false
@@ -1237,7 +1237,7 @@ local function BuildFrame()
 end
 
 -- ============================================================================
--- Public toggle (called from /epogarmory dummy)
+-- Public toggle (called from /conlogs dummy)
 -- ============================================================================
 
 -- Re-anchor to the top-left of the screen every time the frame is shown,
@@ -1254,10 +1254,10 @@ end
 -- Lets the user verify whether CastSpellByName from addon code actually
 -- produces a combat log entry on Epoch. Bypasses the dummy-parse
 -- lifecycle entirely. Usage:
---   /epogtest Hearthstone         (default — 150ms then SpellStopCasting)
---   /epogtest Fishing             (instant fail, no stop needed)
---   /epogtest "Some Spell"        (any spell name)
---   /epogtest                     (defaults to Hearthstone)
+--   /conlogstest Hearthstone         (default — 150ms then SpellStopCasting)
+--   /conlogstest Fishing             (instant fail, no stop needed)
+--   /conlogstest "Some Spell"        (any spell name)
+--   /conlogstest                     (defaults to Hearthstone)
 -- Prints what was called, then waits up to 3s for a CLEU event with the
 -- spell name and reports whether it landed.
 
@@ -1354,7 +1354,7 @@ _G.ConLogsDummy_Toggle = function()
     end
 end
 
--- Claude v1.7.1: /epogarmory testvalidate — exercise the marker click
+-- Claude v1.7.1: /conlogs testvalidate — exercise the marker click
 -- round-trip without doing a full 1:30 dummy parse. Sets state to
 -- "stopping" with the validate button visible immediately. User clicks
 -- it; CLEU listens for SPELL_CAST_FAILED on Fishing/Basic Campfire; the
@@ -1580,12 +1580,12 @@ end)
 -- Slash command for isolation-testing the marker cast.
 -- ============================================================================
 -- Usage:
---   /epogtest                  (defaults to "Hearthstone" with auto-stop)
---   /epogtest hearth           (Hearthstone + 150ms SpellStopCasting)
---   /epogtest fish             (Fishing — no stop needed, fails instantly)
---   /epogtest mount            (Summon mount via name)
---   /epogtest "Some Spell"     (any spell name verbatim)
---   /epogtest +nostop fish     (Fishing without auto-stop)
+--   /conlogstest                  (defaults to "Hearthstone" with auto-stop)
+--   /conlogstest hearth           (Hearthstone + 150ms SpellStopCasting)
+--   /conlogstest fish             (Fishing — no stop needed, fails instantly)
+--   /conlogstest mount            (Summon mount via name)
+--   /conlogstest "Some Spell"     (any spell name verbatim)
+--   /conlogstest +nostop fish     (Fishing without auto-stop)
 SLASH_CONLOGSTEST1 = "/conlogstest"
 SLASH_CONLOGSTEST2 = "/epogtest"
 SlashCmdList["CONLOGSTEST"] = function(msg)

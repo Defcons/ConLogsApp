@@ -14,12 +14,12 @@
     3. MAX PAYLOAD — how many chars survive the combat-log writer intact (sets our
        chunk size for gear/talents/positions)?
 
-  Commands (hidden sub-commands of the existing /epogarmory slash):
-    /epogarmory spike pos        — probe positions for your whole group, print + store
-    /epogarmory spike relay      — relay landing test (then fail a cast)
-    /epogarmory spike size       — max-payload test (then fail a cast)
-    /epogarmory spike relaystop  — stop the active test, restore globals
-    /epogarmory spike dump       — print stored results
+  Commands (hidden sub-commands of the existing /conlogs slash):
+    /conlogs spike pos        — probe positions for your whole group, print + store
+    /conlogs spike relay      — relay landing test (then fail a cast)
+    /conlogs spike size       — max-payload test (then fail a cast)
+    /conlogs spike relaystop  — stop the active test, restore globals
+    /conlogs spike dump       — print stored results
   Results persist to ConLogsSpikeDB (saved inside SavedVariables/ConLogs.lua).
 =========================================================================== ]]--
 
@@ -266,7 +266,7 @@ relayFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 relayFrame:RegisterEvent("PLAYER_LOGOUT")
 
 local function relayStart()
-    if testActive then out("A spike test is already running — /epogarmory spike relaystop first."); return end
+    if testActive then out("A spike test is already running — /conlogs spike relaystop first."); return end
     installUISuppress()
     landedIndex, dumpsLeft, testMode = nil, 5, "relay"
     applyProbe(SENTINEL)
@@ -278,7 +278,7 @@ local function relayStart()
 end
 
 local function sizeStart()
-    if testActive then out("A spike test is already running — /epogarmory spike relaystop first."); return end
+    if testActive then out("A spike test is already running — /conlogs spike relaystop first."); return end
     installUISuppress()
     sizeBest, testMode = nil, "size"
     applyProbe(buildSizeProbe(1200))  -- 1200 > Ascension's ~1023 cap, so PE's cutoff shows up
@@ -309,14 +309,14 @@ local function dumpDB()
         out(("positions: %d/%d mapped, zone=%s, instType=%s, UnitPosition=%s (at %s)"):format(
             pp.unitsMapped or 0, pp.unitsTotal or 0, tostring(pp.zone),
             tostring(pp.instanceType), tostring(pp.unitPositionAvailable), tostring(pp.when)))
-    else out("positions: (none — run /epogarmory spike pos)") end
+    else out("positions: (none — run /conlogs spike pos)") end
     local rl = ConLogsSpikeDB.relayLanded
     if rl then good(("relay: LANDED at arg index %d (at %s)"):format(rl.argIndex, tostring(rl.when)))
-    else out("relay: (no landing recorded — run /epogarmory spike relay)") end
+    else out("relay: (no landing recorded — run /conlogs spike relay)") end
     local sp = ConLogsSpikeDB.sizeProbe
     if sp then good(("size: CLEU kept up to <<%d>> (%d chars, arg %d) (at %s)"):format(
         sp.cleuMarker, sp.cleuFieldLen, sp.argIndex, tostring(sp.when)))
-    else out("size: (no size probe yet — run /epogarmory spike size)") end
+    else out("size: (no size probe yet — run /conlogs spike size)") end
     out("Full data is in WTF/.../SavedVariables/ConLogs.lua — send me that file.")
 end
 
@@ -394,7 +394,7 @@ local function spikeHelp()
     out("  /conlogs spike dump       — show stored results")
 end
 
--- Wrap the existing /epogarmory handler (same idiom ConLogsUI uses). Loads last
+-- Wrap the existing /conlogs handler (same idiom ConLogsUI uses). Loads last
 -- in the .toc, so origHandler is the full existing chain; non-spike msgs pass through.
 local origHandler = SlashCmdList["CONLOGS"]
 SlashCmdList["CONLOGS"] = function(msg)

@@ -1,6 +1,6 @@
 -- ConLogsUI.lua
 -- in-game UI for ConLogsDB:
---   * Paperdoll inspect frame for a single stored player (/epogarmory show)
+--   * Paperdoll inspect frame for a single stored player (/conlogs show)
 --   * Browser frame with search-filtered list of all stored players
 --   * Minimap button that toggles the browser
 --
@@ -262,7 +262,7 @@ StaticPopupDialogs["CONLOGS_CONFIRM_DELETE"] = {
 }
 
 -- Confirmation popup when clicking a Scanner row in the browser. Triggers
--- /epogarmory syncfrom <name> with the default 7-day window. Peers' 1h
+-- /conlogs syncfrom <name> with the default 7-day window. Peers' 1h
 -- per-requester cooldown prevents accidental spam.
 StaticPopupDialogs["CONLOGS_CONFIRM_SYNC"] = {
     text = "Request a sync from %s?\n\nThey'll replay their last 7 days of scans over guild chat. Drain takes ~20 minutes.",
@@ -1923,7 +1923,7 @@ local function BuildBrowser()
     f.emptyHint:SetPoint("TOP", scroll, "TOP", 0, -40)
     f.emptyHint:SetWidth(260)
     f.emptyHint:SetJustifyH("CENTER")
-    f.emptyHint:SetText("No players stored yet.\n\n|cffaaaaaaJoin a group in a dungeon or raid — this client will inspect groupmates and store their gear here. Or type|r |cffffaa44/epogarmory show <name>|r |cffaaaaaaif you've scanned someone already.|r")
+    f.emptyHint:SetText("No players stored yet.\n\n|cffaaaaaaJoin a group in a dungeon or raid — this client will inspect groupmates and store their gear here. Or type|r |cffffaa44/conlogs show <name>|r |cffaaaaaaif you've scanned someone already.|r")
     f.emptyHint:Hide()
 
     -- Pick an age-tinted color for a given scanTime. Green = fresh (<1h),
@@ -2114,7 +2114,7 @@ local function BuildBrowser()
     -- Unreachable peers still appear in the Scanners list (leaderboard
     -- value) but render dim and aren't clickable.
     -- v0.43: Scanners view keys can be MAIN NAMES (configured by the peer
-    -- via /epogarmory main), not just character names. If the main name
+    -- via /conlogs main), not just character names. If the main name
     -- doesn't itself match a reachable character, look up the peer's
     -- last-broadcasting character via peerInfo.lastCharName and check that.
     local function BuildReachableSet()
@@ -2271,7 +2271,7 @@ local function BuildBrowser()
     f._refreshList = Update -- Claude v0.48: lets the class-filter dropdown refresh
 
     -- emptyHint text varies by mode — stash both and switch on toggle.
-    local EMPTY_HINT_PLAYERS  = "No players stored yet.\n\n|cffaaaaaaJoin a group in a dungeon or raid — this client will inspect groupmates and store their gear here. Or type|r |cffffaa44/epogarmory show <name>|r |cffaaaaaaif you've scanned someone already.|r"
+    local EMPTY_HINT_PLAYERS  = "No players stored yet.\n\n|cffaaaaaaJoin a group in a dungeon or raid — this client will inspect groupmates and store their gear here. Or type|r |cffffaa44/conlogs show <name>|r |cffaaaaaaif you've scanned someone already.|r"
     local EMPTY_HINT_SCANNERS = "No scanners known yet.\n\n|cffaaaaaaOnce you and/or guildmates running the addon do some scans, this view will show who's contributing the most. Click a row to request a sync from them.|r"
 
     -- Toggle button cycles viewMode and re-renders. Also hides/shows the
@@ -2535,7 +2535,7 @@ local function BuildMinimapButton()
         add("ConLogs", nil, true)
         add("Open Armory",  function() ToggleBrowser() end)
         -- Claude (v1.7.9): direct entry points to the two parse frames
-        -- so users don't need to remember /epogarmory dummy / dungeon.
+        -- so users don't need to remember /conlogs dummy / dungeon.
         -- Falls through to the slash command if the module global isn't
         -- loaded (defensive — module files might not have parsed if a
         -- Lua error halted them).
@@ -2643,7 +2643,7 @@ SlashCmdList["CONLOGS"] = function(msg)
     if lcmd == "show" or lcmd == "inspect" then
         local name = (arg and arg ~= "") and arg or (UnitName("target") or "")
         if name == "" then
-            print("|cffffaa44ConLogs|r: usage — /epogarmory show <name>  (or target a player first)")
+            print("|cffffaa44ConLogs|r: usage — /conlogs show <name>  (or target a player first)")
             return
         end
         local player = FindPlayer(name)

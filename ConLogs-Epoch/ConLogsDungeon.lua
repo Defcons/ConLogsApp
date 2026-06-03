@@ -532,7 +532,7 @@ local function OnEnterDungeon(dungeonKey)
     -- in the background but DO NOT auto-open the frame and DO NOT start
     -- the visible timer. Rationale: raids are long, the frame doesn't
     -- need to be in the way for normal play. /combatlog runs invisibly;
-    -- user can /epogarmory dungeon manually to see boss/logging status.
+    -- user can /conlogs dungeon manually to see boss/logging status.
     --
     -- We DO still set currentDungeon + dungeonStartTime so:
     --   - boss kill CLEU tracking still works (Onyxia's death timestamp)
@@ -586,7 +586,7 @@ local function OnEnterDungeon(dungeonKey)
             print(string.format("  Instance: |cffffd200%s|r", dungeonKey))
             print(string.format("  Log file: |cffaaaaaa%s|r", expectedFile))
             print("  |cff888888Will auto-stop when you leave the raid.|r")
-            print("  |cff888888/epogarmory raidlog off  to disable for future raids|r")
+            print("  |cff888888/conlogs raidlog off  to disable for future raids|r")
             print("|cffffaa44=======================================|r")
         end
         return
@@ -615,7 +615,7 @@ local function OnLeaveDungeon()
     --
     -- Keep the frame visible briefly so the user can see the final
     -- state before resetting. (Actual reset happens on next dungeon
-    -- entry, or on /epogarmory dungeon toggle.)
+    -- entry, or on /conlogs dungeon toggle.)
     if frame and frame.UpdateUI then frame.UpdateUI() end
 end
 
@@ -1228,7 +1228,7 @@ end
 -- Claude v1.7.3: diagnostic dump for when the auto-open isn't firing.
 -- Tells us exactly what GetInstanceInfo returns, whether the name is
 -- in the DUNGEONS table, and current module state. Wired to
--- /epogarmory dungeondebug.
+-- /conlogs dungeondebug.
 _G.ConLogsDungeon_Debug = function()
     print("|cffffaa44ConLogs|r [dungeon-debug] dumping detection state:")
     if IsInInstance then

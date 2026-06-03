@@ -12,8 +12,10 @@
   chunk header). No UnitPosition / LibDeflate on this client, so payloads are the
   addon's existing `^`-delimited wire string, base64'd (no compression yet).
 
-  DEFAULT ON — runs for every user, so any /combatlog automatically embeds the data.
-  Disable per-user with `/conlogs relay off` (sets ConLogsDB.config.relayEnabled=false).
+  Gear/talents (CI) DEFAULT ON — any /combatlog auto-embeds them. Position telemetry
+  (TS) DEFAULT OFF — on PE it only yields useful data in battlegrounds (instances don't
+  expose other players' positions), so it's opt-in: `/conlogs relay pos on`. Disable the
+  whole relay with `/conlogs relay off`.
   NOTE: overwriting the fail-reason globals taints the secure environment; the taint/
   UIErrors suppression below keeps that invisible, but harden before a public release.
   Commands: /conlogs relay on | off | status | test
@@ -131,6 +133,13 @@ local function relayEnabled()
     -- (relayEnabled == false) disables it; nil/true both mean on.
     if ConLogsDB and ConLogsDB.config and ConLogsDB.config.relayEnabled == false then return false end
     return true
+end
+-- DEFAULT OFF: position telemetry. On PE it only yields useful data in battlegrounds —
+-- PvE instances return only the logger's own position (a continent-map fallback), since
+-- GetPlayerMapPosition can't read other players inside instances and PE has no
+-- UnitPosition. So it's opt-in: `/conlogs relay pos on`.
+local function positionsEnabled()
+    return (ConLogsDB and ConLogsDB.config and ConLogsDB.config.relayPositions == true) and true or false
 end
 local function shouldBeActive()
     if not (relayEnabled() or testForce) then return false end
@@ -317,7 +326,7 @@ end)
 -- Position snapshot ticker: every TELEMETRY_INTERVAL while active, enqueue a TS chunk.
 local tsAccum = 0
 frame:SetScript("OnUpdate", function(self, elapsed)
-    if not active then return end
+    if not active or not positionsEnabled() then return end
     tsAccum = tsAccum + (elapsed or 0)
     if tsAccum < TELEMETRY_INTERVAL then return end
     tsAccum = 0
@@ -337,31 +346,44 @@ local function out(s) print("|cff66ccff[ConLogs relay]|r " .. tostring(s)) end
 
 local function cmdRelay(sub)
     sub = (sub or ""):lower()
+    local action, val = sub:match("^(%S*)%s*(.*)$")
     ConLogsDB = ConLogsDB or {}; ConLogsDB.config = ConLogsDB.config or {}
-    if sub == "on" then
+    if action == "on" then
         ConLogsDB.config.relayEnabled = true
-        out("enabled. Active while logging (/combatlog) + in an instance + in combat.")
+        out("gear/talents relay enabled. Active while logging (/combatlog) + in an instance/BG + in combat.")
         reevaluate()
-    elseif sub == "off" then
+    elseif action == "off" then
         ConLogsDB.config.relayEnabled = false
         testForce = false
         active = false
         restoreGlobals()
-        out("disabled + globals restored.")
-    elseif sub == "test" then
+        out("relay disabled + globals restored.")
+    elseif action == "pos" or action == "positions" then
+        if val == "on" then
+            ConLogsDB.config.relayPositions = true
+            out(("position telemetry ON — snapshots every %ds. (Only useful in battlegrounds; PvE instances don't expose other players' positions on PE.)"):format(TELEMETRY_INTERVAL))
+        elseif val == "off" then
+            ConLogsDB.config.relayPositions = false
+            out("position telemetry OFF.")
+        else
+            out("position telemetry is " .. (positionsEnabled() and "ON" or "OFF (default)") .. ". Use: /conlogs relay pos on|off")
+        end
+    elseif action == "test" then
         testForce = true
         installSuppress()
         active = true
         local n = enqueueGroupCI(true)
-        out(("test mode ON — queued %d gear chunk(s); positions now stream every %ds while active."):format(n, TELEMETRY_INTERVAL))
-        out("Make sure /combatlog is on, then fail casts (abilities on cooldown). Search the log for [[CL_CI_ (gear) and [[CL_TS_ (positions). /conlogs relay off to stop.")
-    elseif sub == "status" then
+        out(("test mode ON — queued %d gear chunk(s)."):format(n))
+        out("Make sure /combatlog is on, then fail casts (on cooldown). Search the log for [[CL_CI_ (gear)"
+            .. (positionsEnabled() and " and [[CL_TS_ (positions)" or "; enable positions first with /conlogs relay pos on")
+            .. ". /conlogs relay off to stop.")
+    elseif action == "status" then
         local _, instType = IsInInstance()
-        out(("enabled=%s active=%s queued=%d logging=%s instance=%s testForce=%s"):format(
-            tostring(relayEnabled()), tostring(active), #queue,
+        out(("relay=%s positions=%s active=%s queued=%d logging=%s instance=%s testForce=%s"):format(
+            tostring(relayEnabled()), tostring(positionsEnabled()), tostring(active), #queue,
             tostring(LoggingCombat and LoggingCombat() or false), tostring(instType), tostring(testForce)))
     else
-        out("usage: /conlogs relay on | off | test | status")
+        out("usage: /conlogs relay on | off | pos on|off | test | status")
     end
 end
 

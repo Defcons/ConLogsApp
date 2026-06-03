@@ -68,7 +68,7 @@ local INSPECT_INTERVAL      = 2.5
 --
 -- v0.51: tightened from 2.0s → 0.5s. The original 2.0 was set when the
 -- only outbound traffic was rare organic inspect broadcasts (no urgency).
--- /epogarmory syncfrom changed that — users actively wait on bulk transfers
+-- /conlogs syncfrom changed that — users actively wait on bulk transfers
 -- of up to 200 sets, and 2.0s stagger pushed full-sync time to ~27 min.
 --
 -- Math at 0.5s with ~225 B per wire message: ~450 B/s sustained, well
@@ -315,7 +315,7 @@ local realityAuraHintShown = false
 
 -- Admin sync protocol (v0.35): a targeted peer can request another peer's
 -- recent stored scans for bulk-catch-up. Hidden slash command:
---   /epogarmory syncfrom <playerName> [days]
+--   /conlogs syncfrom <playerName> [days]
 -- Receiver broadcasts a SYNCREQ; the named target replays their stored
 -- set.rawPayload blobs back through the normal outQueue. Other guildmates
 -- ingest the replays too (free benefit — their DBs also catch up).
@@ -344,11 +344,11 @@ local SYNC_GLOBAL_COOLDOWN = 900 -- 15 min between any sync responses
 local lastSyncResponseAt   = 0   -- any-peer global timestamp of last response
 
 -- Claude (v1.5.1): auto-sync. Background catch-up from reachable peers
--- without the user typing /epogarmory syncfrom <name>. Picks one new peer
+-- without the user typing /conlogs syncfrom <name>. Picks one new peer
 -- every AUTO_SYNC_TICK_INTERVAL, respects SYNC_MAX_CONCURRENT, applies a
 -- 24h per-peer cooldown so we don't drain the same person over and over.
 -- The cooldown is persisted in ConLogsDB.peerInfo[name].lastSyncedFrom
--- so it survives /reload and re-login. Disabled via /epogarmory autosync off.
+-- so it survives /reload and re-login. Disabled via /conlogs autosync off.
 local AUTO_SYNC_PEER_COOLDOWN  = 24 * 3600 -- once per peer per day
 local AUTO_SYNC_TICK_INTERVAL  = 5 * 60    -- at most one new auto-sync every 5 min
 local AUTO_SYNC_MIN_DBSIZE     = 10        -- skip peers with tiny DBs (not worth bandwidth)
@@ -2030,7 +2030,7 @@ local function Ingest(payload, sender)
         group = "pvp"
         -- Claude (v1.5.3): log the PvP routing decision so users can verify
         -- the gate is firing for Insignia-equipped scans. Toggle via
-        -- /epogarmory debug.
+        -- /conlogs debug.
         dprint(string.format("[route] %s → sets[\"pvp\"] (PvP trinket detected in slot 13/14)",
             entry.name or "?"))
     else
@@ -2075,7 +2075,7 @@ local function Ingest(payload, sender)
         zone       = entry.zone,
         scannedBy  = scannedBy,
         -- v0.35: stash the raw wire payload so an admin running
-        -- /epogarmory syncfrom <us> can replay it verbatim without
+        -- /conlogs syncfrom <us> can replay it verbatim without
         -- having to reconstruct the wire format from structured fields.
         -- Keeps the sync protocol drift-proof as BuildPayload evolves.
         rawPayload = payload,
@@ -2198,7 +2198,7 @@ end
 -- v0.47: Peer refresh ping. Asks every guildmate running the addon to
 -- announce their identity + dbSize so the Scanners leaderboard refreshes
 -- without having to wait for organic gear-scan broadcasts. Triggered by
--- the "Refresh Peers" button in the Scanners view (and /epogarmory
+-- the "Refresh Peers" button in the Scanners view (and /conlogs
 -- refreshpeers). Returns true on send; false + reason string on cooldown.
 local function BroadcastPeerPing()
     local nowT = time()
@@ -2532,7 +2532,7 @@ local function ScanRoster()
         -- Only nag users who've NEVER had the aura this session. If they
         -- had it earlier, they obviously know about the system.
         if hasGroup and not realityAuraHintShown and not everSawRealityAura then
-            print("|cffffaa44ConLogs|r: |cffff9966Reality Recalibrators|r aura not active — auto-inspect of groupmates is paused. Get the aura to scan their true gear (Ascension's transmog hides it otherwise). |cff888888Type /epogarmory aura to recheck.|r")
+            print("|cffffaa44ConLogs|r: |cffff9966Reality Recalibrators|r aura not active — auto-inspect of groupmates is paused. Get the aura to scan their true gear (Ascension's transmog hides it otherwise). |cff888888Type /conlogs aura to recheck.|r")
             realityAuraHintShown = true
         elseif hasGroup then
             dprint("[roster] skipped — Reality Recalibrators aura not active")
@@ -2908,7 +2908,7 @@ end
 -- ---------------- Sync initiation (v1.5.1: shared by manual + auto) ----------------
 
 -- Claude (v1.5.1): the sync-start logic was originally inlined in the
--- /epogarmory syncfrom slash handler. Extracted so auto-sync can reuse
+-- /conlogs syncfrom slash handler. Extracted so auto-sync can reuse
 -- the same wire path. Returns (ok, info, extra1, extra2):
 --   ok=true  → info=etaSeconds, extra1=channels, extra2=estimatedSets
 --   ok=false → info=reason ("active"/"capped"/"nochannel"), extra1=remaining-secs (for "active") or nil
@@ -3273,7 +3273,7 @@ f:SetScript("OnEvent", function(self, event, ...)
         end
 
         -- v0.43: track every character that's logged into this account so
-        -- /epogarmory main can validate against the list. SavedVariables is
+        -- /conlogs main can validate against the list. SavedVariables is
         -- account-scoped, so this set accumulates across alts naturally.
         ConLogsDB.knownChars  = ConLogsDB.knownChars  or {}
         local me = UnitName("player")
@@ -3286,7 +3286,7 @@ f:SetScript("OnEvent", function(self, event, ...)
             ConLogsDB.config.acceptSync = true
         end
         -- Claude (v1.5.1): auto-sync default-on. Background catch-up from
-        -- reachable peers. Toggle via /epogarmory autosync on|off.
+        -- reachable peers. Toggle via /conlogs autosync on|off.
         if ConLogsDB.config.autoSync == nil then
             ConLogsDB.config.autoSync = true
         end
@@ -3301,14 +3301,14 @@ f:SetScript("OnEvent", function(self, event, ...)
         --
         -- v0.45: auto-default mainName to the FIRST L60 character to log in.
         -- Most users want consolidation; auto-defaulting on the first L60
-        -- saves them from having to discover and run /epogarmory main. Once
+        -- saves them from having to discover and run /conlogs main. Once
         -- set, it sticks (account-wide via SavedVariables) — subsequent
         -- logins on different characters don't change it.
         if not ConLogsDB.config.mainName then
             local lvl = UnitLevel("player") or 0
             if me and me ~= "" and lvl >= MIN_STORE_LEVEL then
                 ConLogsDB.config.mainName = me
-                print(string.format("|cffffaa44ConLogs|r: auto-set main identity to |cff00ff66%s|r (first L60 to log in). Change with /epogarmory main.",
+                print(string.format("|cffffaa44ConLogs|r: auto-set main identity to |cff00ff66%s|r (first L60 to log in). Change with /conlogs main.",
                     me))
             end
         end
@@ -3518,25 +3518,25 @@ end
 
 local function ShowHelp()
     print("|cffffaa44ConLogs|r commands:")
-    print("  /epogarmory show <name>   — open paperdoll for a stored player (or target + /epogarmory show)")
-    print("  /epogarmory browse        — open the searchable armory browser")
-    print("  /epogarmory status        — queue / broadcast / storage state")
-    print("  /epogarmory debug         — toggle verbose chat logging")
-    print("  /epogarmory list          — print every stored player")
-    print("  /epogarmory wipe          — clear stored players (keeps config)")
-    print("  /epogarmory cache         — show item-info cache size")
-    print("  /epogarmory cachebuild    — fill the cache from all stored players' gear (names/quality/ilvl)")
-    print("  /epogarmory cachewipe     — clear the item-info cache")
-    print("  /epogarmory main [name]   — set/show your main-character identity (consolidates alts in the mesh)")
-    print("  /epogarmory merge <newname> <alias1> [alias2] ... — locally re-attribute scans from peer aliases to one canonical name")
-    print("  /epogarmory refreshpeers  — ping guildmates for fresh identity + DB-size info (Scanners-view leaderboard)")
-    print("  /epogarmory autosync [on|off|status] — background catch-up sync from reachable peers (default: on, 24h per-peer cooldown)")
-    print("  /epogarmory dummy         — toggle the Training Dummy parse-validator frame (auto-opens when targeting a dummy in a city)")
-    print("  /epogarmory testvalidate  — jump straight to the Validate button to test the marker mechanism (no full 1:30 fight needed)")
-    print("  /epogarmory dungeon       — toggle the Dungeon speedrun status frame (auto-opens when entering a tracked dungeon)")
-    print("  /epogarmory raidlog [on|off|status] — auto-start /combatlog on raid entry (default: on; raids tracked: Onyxia's Lair)")
-    print("  /epogarmory aura          — check if Reality Recalibrators aura is active (gates auto-inspect of groupmates)")
-    print("  /epogarmory dump <name>   — diagnostic dump of every layer (itemstring, GetItemInfo, GetItemStats, cache) for each slot of a stored player")
+    print("  /conlogs show <name>   — open paperdoll for a stored player (or target + /conlogs show)")
+    print("  /conlogs browse        — open the searchable armory browser")
+    print("  /conlogs status        — queue / broadcast / storage state")
+    print("  /conlogs debug         — toggle verbose chat logging")
+    print("  /conlogs list          — print every stored player")
+    print("  /conlogs wipe          — clear stored players (keeps config)")
+    print("  /conlogs cache         — show item-info cache size")
+    print("  /conlogs cachebuild    — fill the cache from all stored players' gear (names/quality/ilvl)")
+    print("  /conlogs cachewipe     — clear the item-info cache")
+    print("  /conlogs main [name]   — set/show your main-character identity (consolidates alts in the mesh)")
+    print("  /conlogs merge <newname> <alias1> [alias2] ... — locally re-attribute scans from peer aliases to one canonical name")
+    print("  /conlogs refreshpeers  — ping guildmates for fresh identity + DB-size info (Scanners-view leaderboard)")
+    print("  /conlogs autosync [on|off|status] — background catch-up sync from reachable peers (default: on, 24h per-peer cooldown)")
+    print("  /conlogs dummy         — toggle the Training Dummy parse-validator frame (auto-opens when targeting a dummy in a city)")
+    print("  /conlogs testvalidate  — jump straight to the Validate button to test the marker mechanism (no full 1:30 fight needed)")
+    print("  /conlogs dungeon       — toggle the Dungeon speedrun status frame (auto-opens when entering a tracked dungeon)")
+    print("  /conlogs raidlog [on|off|status] — auto-start /combatlog on raid entry (default: on; raids tracked: Onyxia's Lair)")
+    print("  /conlogs aura          — check if Reality Recalibrators aura is active (gates auto-inspect of groupmates)")
+    print("  /conlogs dump <name>   — diagnostic dump of every layer (itemstring, GetItemInfo, GetItemStats, cache) for each slot of a stored player")
     print("|cff888888  Source + releases: github.com/Defcons/ConLogsApp|r")
     -- dumpspec left in place but not advertised — internal diagnostic.
 end
@@ -3570,7 +3570,7 @@ SlashCmdList["CONLOGS"] = function(msg)
             CountCache(), CountPending()))
     elseif msg == "cachebuild" then
         local tried, hit, pended = CacheBuildAll()
-        print(string.format("|cffffaa44ConLogs|r cachebuild: %d items scanned, %d already known, %d queued for fetch (check /epogarmory cache in ~15s)",
+        print(string.format("|cffffaa44ConLogs|r cachebuild: %d items scanned, %d already known, %d queued for fetch (check /conlogs cache in ~15s)",
             tried, hit, pended))
     elseif msg == "cachewipe" then
         ConLogsItemCacheDB = {}
@@ -3607,7 +3607,7 @@ SlashCmdList["CONLOGS"] = function(msg)
         -- known-affected player and share the output to investigate.
         local nameArg = msg:match("^dump%s+(.+)$")
         if not nameArg or nameArg == "" then
-            print("|cffffaa44ConLogs|r: usage — /epogarmory dump <playerName>")
+            print("|cffffaa44ConLogs|r: usage — /conlogs dump <playerName>")
             return
         end
         nameArg = nameArg:gsub("^%s+", ""):gsub("%s+$", "")
@@ -3845,7 +3845,7 @@ SlashCmdList["CONLOGS"] = function(msg)
             print(string.format("|cffffaa44ConLogs|r raidlog: %s",
                 enabled and "|cff00ff00ON|r" or "|cffff0000OFF|r"))
             print("  When ON, /combatlog starts automatically the moment you enter a raid instance (currently: Onyxia's Lair).")
-            print("  Toggle: /epogarmory raidlog on  |  /epogarmory raidlog off")
+            print("  Toggle: /conlogs raidlog on  |  /conlogs raidlog off")
         elseif arg == "on" or arg == "true" or arg == "1" then
             ConLogsDB.config.raidAutoLog = true
             print("|cffffaa44ConLogs|r raidlog: |cff00ff00ON|r - /combatlog will auto-start on raid entry.")
@@ -3897,7 +3897,7 @@ SlashCmdList["CONLOGS"] = function(msg)
             ConLogsDB.config.autoSync = false
             print("|cffffaa44ConLogs|r autosync: |cffff0000OFF|r")
         else
-            print("|cffffaa44ConLogs|r: usage — /epogarmory autosync [on|off|status]")
+            print("|cffffaa44ConLogs|r: usage — /conlogs autosync [on|off|status]")
         end
     elseif msg == "refreshpeers" or msg == "refresh" then
         -- v0.47: ask everyone in guild/group "give me your latest info".
@@ -3916,15 +3916,15 @@ SlashCmdList["CONLOGS"] = function(msg)
         -- Hidden admin command: request another peer to replay their recent
         -- stored scans. v0.37: extended to party + raid + guild channels.
         -- Usage:
-        --   /epogarmory syncfrom <playerName>         (default: last 7 days)
-        --   /epogarmory syncfrom <playerName> 30      (last 30 days)
-        --   /epogarmory syncfrom <playerName> 0       (everything the peer has)
+        --   /conlogs syncfrom <playerName>         (default: last 7 days)
+        --   /conlogs syncfrom <playerName> 30      (last 30 days)
+        --   /conlogs syncfrom <playerName> 0       (everything the peer has)
         -- Capped at SYNC_MAX_CONCURRENT (3) simultaneous active syncs so the
         -- inbound data stream stays manageable.
         local argStr = msg:sub(10) -- everything after "syncfrom "
         local name, daysStr = argStr:match("^%s*(%S+)%s*(%S*)%s*$")
         if not name or name == "" then
-            print("|cffffaa44ConLogs|r: usage — /epogarmory syncfrom <playerName> [days]")
+            print("|cffffaa44ConLogs|r: usage — /conlogs syncfrom <playerName> [days]")
             return
         end
         -- Canonical name casing (peer compares UnitName("player") == name exactly)
@@ -3989,7 +3989,7 @@ SlashCmdList["CONLOGS"] = function(msg)
                     me))
             end
             print("|cff888888  Your known characters:|r " .. table.concat(knownList(), ", "))
-            print("|cff888888  Set:|r /epogarmory main <character>   |cff888888|   Clear:|r /epogarmory main clear")
+            print("|cff888888  Set:|r /conlogs main <character>   |cff888888|   Clear:|r /conlogs main clear")
         elseif arg == "clear" or arg == "none" then
             local oldMain = ConLogsDB.config.mainName
             ConLogsDB.config.mainName = nil
@@ -4081,8 +4081,8 @@ SlashCmdList["CONLOGS"] = function(msg)
             args[#args + 1] = word
         end
         if #args < 2 then
-            print("|cffffaa44ConLogs|r: usage — /epogarmory merge <newname> <alias1> [alias2] ...")
-            print("|cff888888  Example:|r /epogarmory merge Yippie Yiippee Yippee")
+            print("|cffffaa44ConLogs|r: usage — /conlogs merge <newname> <alias1> [alias2] ...")
+            print("|cff888888  Example:|r /conlogs merge Yippie Yiippee Yippee")
             print("|cff888888  Locally rewrites scannedBy + peerInfo from aliases into <newname>. Other guildies still see the original names until they run merge too.|r")
             return
         end
@@ -4139,7 +4139,7 @@ SlashCmdList["CONLOGS"] = function(msg)
         ConLogsDB.config = ConLogsDB.config or {}
         if msg == "syncoff" then
             ConLogsDB.config.acceptSync = false
-            print("|cffffaa44ConLogs|r: sync-response |cffff6666OFF|r — will refuse incoming SYNCREQ. /epogarmory syncon to re-enable.")
+            print("|cffffaa44ConLogs|r: sync-response |cffff6666OFF|r — will refuse incoming SYNCREQ. /conlogs syncon to re-enable.")
         else
             ConLogsDB.config.acceptSync = true
             print("|cffffaa44ConLogs|r: sync-response |cff00ff66ON|r — accepting incoming SYNCREQ again.")
@@ -4153,8 +4153,8 @@ SlashCmdList["CONLOGS"] = function(msg)
         -- Lets us see exactly which keys Ascension's client returns for a
         -- problem item (e.g. items with percent-based custom stats that might
         -- or might not be in the standard ITEM_MOD_* enum). Usage:
-        --   /epogarmory dumpstats        → all 19 slots
-        --   /epogarmory dumpstats 10     → just hands
+        --   /conlogs dumpstats        → all 19 slots
+        --   /conlogs dumpstats 10     → just hands
         local arg = msg:match("^dumpstats%s+(%d+)")
         local target = tonumber(arg)
         local slots = target and { target } or {1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19} -- skip 4=shirt
