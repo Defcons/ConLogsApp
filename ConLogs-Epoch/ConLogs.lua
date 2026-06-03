@@ -57,7 +57,7 @@ local PREFIX = "EpogArmory"
 -- ============================================================================
 local PROTO = "1"
 local ADDON_VERSION = GetAddOnMetadata(ADDON, "Version") or "0"
-local RELEASES_URL = "https://github.com/Defcons/epogarmory-addon/releases/"
+local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
 local INSPECT_COOLDOWN      = 900
@@ -3537,7 +3537,7 @@ local function ShowHelp()
     print("  /epogarmory raidlog [on|off|status] — auto-start /combatlog on raid entry (default: on; raids tracked: Onyxia's Lair)")
     print("  /epogarmory aura          — check if Reality Recalibrators aura is active (gates auto-inspect of groupmates)")
     print("  /epogarmory dump <name>   — diagnostic dump of every layer (itemstring, GetItemInfo, GetItemStats, cache) for each slot of a stored player")
-    print("|cff888888  Source + releases: github.com/Defcons/epogarmory-addon|r")
+    print("|cff888888  Source + releases: github.com/Defcons/ConLogsApp|r")
     -- dumpspec left in place but not advertised — internal diagnostic.
 end
 
