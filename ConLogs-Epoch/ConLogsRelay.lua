@@ -12,10 +12,14 @@
   chunk header). No UnitPosition / LibDeflate on this client, so payloads are the
   addon's existing `^`-delimited wire string, base64'd (no compression yet).
 
-  Gear/talents (CI) DEFAULT ON — any /combatlog auto-embeds them. Position telemetry
-  (TS) DEFAULT OFF — on PE it only yields useful data in battlegrounds (instances don't
-  expose other players' positions), so it's opt-in: `/conlogs relay pos on`. Disable the
-  whole relay with `/conlogs relay off`.
+  Gear/talents (CI) DEFAULT ON — any /combatlog auto-embeds them. Pre-pull buffs (BU)
+  DEFAULT ON — a snapshot of self + own-pet auras taken at each combat start, so the log
+  records flasks/food/blessings/etc. that were applied BEFORE the fight (the combat log
+  has no aura event for those, so they'd otherwise be invisible). Each meshed client
+  contributes its own complete buff list. Position telemetry (TS) DEFAULT OFF — on PE it
+  only yields useful data in battlegrounds (instances don't expose other players'
+  positions), so it's opt-in: `/conlogs relay pos on`. Disable the whole relay with
+  `/conlogs relay off`.
   NOTE: overwriting the fail-reason globals taints the secure environment; the taint/
   UIErrors suppression below keeps that invisible, but harden before a public release.
   Commands: /conlogs relay on | off | status | test
@@ -24,6 +28,7 @@
 local PREFIX_FAMILY = "[[CL_"   -- landed-evidence family prefix (all our chunk kinds share it)
 local CI_PREFIX     = "[[CL_CI_v1_"
 local TS_PREFIX     = "[[CL_TS_v1_"   -- telemetry snapshot (positions)
+local BU_PREFIX     = "[[CL_BU_v1_"   -- buff snapshot (pre-pull auras: self + own pet)
 local TELEMETRY_INTERVAL = 2.0        -- seconds between position snapshots
 local CHUNK_BODY    = 850       -- base64 chars per chunk (field cap ~1023, header ~46)
 local QUEUE_MAX     = 400       -- ring cap
@@ -291,6 +296,57 @@ local function enqueueTS()
 end
 
 --==========================================================================--
+-- buff snapshot (BU) producer — capture self + own-pet auras at combat start.
+-- The combat log emits no SPELL_AURA_APPLIED for buffs applied BEFORE the fight
+-- (flask/food/blessings cast in town), so the parser can't see them. Snapshotting
+-- here lets the server inject synthetic APPLIED events at fight start.
+-- Self/own-pet only: UnitAura is 100% complete for your own units regardless of
+-- range. Other raiders are range-limited on PE (pending the spike `buffs` probe) —
+-- the mesh covers them instead, since every ConLogs user relays their own list.
+-- Payload: BU|<getTimeMs>|<unixSec>|<guidHex>=<spellId>~<name>,<spellId>~<name>|<guidHex>=...
+-- Delimiters |=,~ never occur in 3.3.5 buff names; the whole payload is base64'd anyway.
+--==========================================================================--
+local function readAuras(unit)
+    local list = {}
+    for i = 1, 40 do
+        local name, _, _, _, _, _, _, _, _, _, spellId = UnitAura(unit, i, "HELPFUL")
+        if not name then break end
+        list[#list + 1] = string.format("%s~%s", tostring(spellId or 0), name)
+    end
+    return list
+end
+
+local buffSnapId = 0
+local function captureBuffs()
+    if type(UnitAura) ~= "function" then return nil end
+    local blocks = {}
+    local function addUnit(u)
+        if not UnitExists(u) then return end
+        local auras = readAuras(u)
+        if #auras == 0 then return end
+        local g = (UnitGUID(u) or ""):gsub("^0x", "")
+        blocks[#blocks + 1] = string.format("%s=%s", g, table.concat(auras, ","))
+    end
+    addUnit("player")
+    addUnit("pet")
+    if #blocks == 0 then return nil end
+    return string.format("BU|%d|%d|%s", math.floor((GetTime() or 0) * 1000), time() or 0, table.concat(blocks, "|"))
+end
+
+local function enqueueBuffs()
+    local payload = captureBuffs()
+    if not payload then return 0 end
+    buffSnapId = buffSnapId + 1
+    local b64 = b64encode(payload)
+    local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
+    for i = 1, total do
+        local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
+        enqueue(string.format("%s%s_%d_%d/%d]]%s", BU_PREFIX, session, buffSnapId, i, total, piece))
+    end
+    return total
+end
+
+--==========================================================================--
 -- driver: on each of the player's SPELL_CAST_FAILED events
 --==========================================================================--
 local function onFailed(...)
@@ -322,7 +378,9 @@ frame:SetScript("OnEvent", function(self, event, ...)
         onFailed(...)
     elseif event == "PLAYER_REGEN_DISABLED" then
         reevaluate()
-        if active then enqueueGroupCI(false) end
+        -- Buffs are snapshotted EVERY pull (they change between fights, unlike gear
+        -- which is once-per-version). Self + own pet only — small (~1 chunk).
+        if active then enqueueGroupCI(false); enqueueBuffs() end
     elseif event == "PLAYER_REGEN_ENABLED" or event == "ZONE_CHANGED_NEW_AREA"
         or event == "PLAYER_ENTERING_WORLD" then
         reevaluate()
@@ -380,8 +438,9 @@ local function cmdRelay(sub)
         installSuppress()
         active = true
         local n = enqueueGroupCI(true)
-        out(("test mode ON — queued %d gear chunk(s)."):format(n))
-        out("Make sure /combatlog is on, then fail casts (on cooldown). Search the log for [[CL_CI_ (gear)"
+        local b = enqueueBuffs()
+        out(("test mode ON — queued %d gear chunk(s) + %d buff chunk(s)."):format(n, b))
+        out("Make sure /combatlog is on, then fail casts (on cooldown). Search the log for [[CL_CI_ (gear), [[CL_BU_ (buffs)"
             .. (positionsEnabled() and " and [[CL_TS_ (positions)" or "; enable positions first with /conlogs relay pos on")
             .. ". /conlogs relay off to stop.")
     elseif action == "status" then

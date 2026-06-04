@@ -18,6 +18,7 @@
     /conlogs spike pos        — probe positions for your whole group, print + store
     /conlogs spike relay      — relay landing test (then fail a cast)
     /conlogs spike size       — max-payload test (then fail a cast)
+    /conlogs spike buffs      — probe whether OTHER raiders' buffs are readable (range test)
     /conlogs spike relaystop  — stop the active test, restore globals
     /conlogs spike dump       — print stored results
   Results persist to ConLogsSpikeDB (saved inside SavedVariables/ConLogs.lua).
@@ -317,6 +318,11 @@ local function dumpDB()
     if sp then good(("size: CLEU kept up to <<%d>> (%d chars, arg %d) (at %s)"):format(
         sp.cleuMarker, sp.cleuFieldLen, sp.argIndex, tostring(sp.when)))
     else out("size: (no size probe yet — run /conlogs spike size)") end
+    local bp = ConLogsSpikeDB.buffProbe
+    if bp then good(("buffs: visible %d/%d have buffs; out-of-range %d/%d have buffs (UnitAura=%s) (at %s)"):format(
+        bp.visWith or 0, bp.visTotal or 0, bp.hidWith or 0, bp.hidTotal or 0,
+        tostring(bp.unitAuraAvailable), tostring(bp.when)))
+    else out("buffs: (no buff probe yet — run /conlogs spike buffs)") end
     out("Full data is in WTF/.../SavedVariables/ConLogs.lua — send me that file.")
 end
 
@@ -384,12 +390,79 @@ local function cmdUnitPos()
     out("Stored. KEY: does ANY fn return non-zero coords for 'other' inside the raid?")
 end
 
+-- BUFF VISIBILITY PROBE. Can the addon read OTHER raid members' (and their pets')
+-- auras, and does it depend on range? Self/own-pet are always complete; the open
+-- question is whether out-of-range raiders return buffs. The KEY output is the
+-- not-visible-with-buffs count: if out-of-range units always return 0 buffs, the
+-- "scan everyone" approach is range-bound and the per-client self-snapshot mesh is
+-- the real fix. Run INSIDE a raid, pre-pull, with people spread out.
+local function readAuraCount(unit)
+    if type(UnitAura) ~= "function" then return 0, {} end
+    local names = {}
+    for i = 1, 40 do
+        local name = UnitAura(unit, i, "HELPFUL")
+        if not name then break end
+        names[#names + 1] = name
+    end
+    return #names, names
+end
+
+local function cmdBuffs()
+    out("=== BUFF VISIBILITY PROBE (run INSIDE a raid, pre-pull, people spread out) ===")
+    local units = {}
+    local raidN = GetNumRaidMembers() or 0
+    if raidN > 0 then
+        for i = 1, raidN do units[#units + 1] = "raid" .. i; units[#units + 1] = "raidpet" .. i end
+    else
+        units[#units + 1] = "player"; units[#units + 1] = "pet"
+        for i = 1, (GetNumPartyMembers() or 0) do units[#units + 1] = "party" .. i; units[#units + 1] = "partypet" .. i end
+    end
+
+    local _, instType = IsInInstance()
+    local rows = {}
+    local visTotal, visWith, hidTotal, hidWith = 0, 0, 0, 0
+    for _, u in ipairs(units) do
+        if UnitExists(u) then
+            local vis  = UnitIsVisible(u) and true or false
+            local isSelf = UnitIsUnit(u, "player") or UnitIsUnit(u, "pet")
+            local cnt, names = readAuraCount(u)
+            if vis then visTotal = visTotal + 1; if cnt > 0 then visWith = visWith + 1 end
+            else hidTotal = hidTotal + 1; if cnt > 0 then hidWith = hidWith + 1 end end
+            rows[#rows + 1] = { unit = u, name = UnitName(u) or "?", visible = vis, self = isSelf, count = cnt, names = names }
+        end
+    end
+
+    out(("zone=%s instanceType=%s units=%d"):format(GetRealZoneText() or "?", tostring(instType), #rows))
+    for _, r in ipairs(rows) do
+        out(("  %-9s %-12s vis=%s%s buffs=%d"):format(
+            r.unit, r.name, r.visible and "T" or "F", r.self and " (self)" or "", r.count))
+    end
+    good(("visible units with buffs:     %d/%d"):format(visWith, visTotal))
+    if hidTotal > 0 then
+        if hidWith > 0 then good(("NOT-visible units with buffs: %d/%d  → out-of-range scanning WORKS"):format(hidWith, hidTotal))
+        else bad(("NOT-visible units with buffs: 0/%d  → out-of-range returns nothing; rely on the self-snapshot mesh"):format(hidTotal)) end
+    else
+        out("(no out-of-range units this run — re-run with the raid spread out to test range dependence)")
+    end
+
+    ConLogsSpikeDB = ConLogsSpikeDB or {}
+    ConLogsSpikeDB.buffProbe = {
+        when = date and date("%Y-%m-%d %H:%M:%S") or time(),
+        zone = GetRealZoneText() or "?", instanceType = instType,
+        unitAuraAvailable = (type(UnitAura) == "function"),
+        visTotal = visTotal, visWith = visWith, hidTotal = hidTotal, hidWith = hidWith,
+        rows = rows,
+    }
+    out("Stored to ConLogsSpikeDB.buffProbe (reload/logout to flush the file).")
+end
+
 local function spikeHelp()
     out("Phase-2 feasibility probe (debug). Sub-commands:")
     out("  /conlogs spike pos        — probe positions for your group")
     out("  /conlogs spike relay      — relay landing test (then fail a cast)")
     out("  /conlogs spike size       — max-payload test (then fail a cast)")
     out("  /conlogs spike unitpos    — probe for any API that reads OTHER units' positions")
+    out("  /conlogs spike buffs      — probe whether OTHER raiders' buffs are readable (range test)")
     out("  /conlogs spike relaystop  — stop the active test + restore globals")
     out("  /conlogs spike dump       — show stored results")
 end
@@ -406,6 +479,7 @@ SlashCmdList["CONLOGS"] = function(msg)
         elseif sub == "relay" then relayStart()
         elseif sub == "size" then sizeStart()
         elseif sub == "unitpos" then cmdUnitPos()
+        elseif sub == "buffs" then cmdBuffs()
         elseif sub == "relaystop" or sub == "stop" then testStop()
         elseif sub == "dump" then dumpDB()
         else spikeHelp() end
