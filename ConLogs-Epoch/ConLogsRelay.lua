@@ -296,13 +296,24 @@ local function enqueueTS()
 end
 
 --==========================================================================--
--- buff snapshot (BU) producer — capture self + own-pet auras at combat start.
+-- buff snapshot (BU) producer — capture group members' auras at combat start.
 -- The combat log emits no SPELL_AURA_APPLIED for buffs applied BEFORE the fight
 -- (flask/food/blessings cast in town), so the parser can't see them. Snapshotting
 -- here lets the server inject synthetic APPLIED events at fight start.
--- Self/own-pet only: UnitAura is 100% complete for your own units regardless of
--- range. Other raiders are range-limited on PE (pending the spike `buffs` probe) —
--- the mesh covers them instead, since every ConLogs user relays their own list.
+--
+-- We scan the WHOLE group (self, pets, every raid/party member). Self + own pet are
+-- always complete; OTHER raiders are range-limited on PE — out-of-range UnitAura
+-- typically returns nothing, so those units just produce empty blocks and are
+-- skipped (no harm). We relay them speculatively anyway: if PE happens to expose
+-- in-range raiders' auras, the data's already in the log — and the spike `buffs`
+-- probe + the relayed [[CL_BU_ lines together confirm exactly how much landed,
+-- without waiting for a second raid. The self-snapshot mesh remains the guaranteed
+-- path (every ConLogs user relays their own complete list).
+--
+-- Per-unit dedup: a unit's auras are only relayed when its set CHANGES (pre-pull
+-- buffs are static across pulls, so after the first pull this is near-zero). The
+-- server uses the latest snapshot before each fight start, so unchanged = carry
+-- forward. Keeps per-pull cost tiny while still catching rebuffs/expiries.
 -- Payload: BU|<getTimeMs>|<unixSec>|<guidHex>=<spellId>~<name>,<spellId>~<name>|<guidHex>=...
 -- Delimiters |=,~ never occur in 3.3.5 buff names; the whole payload is base64'd anyway.
 --==========================================================================--
@@ -316,25 +327,44 @@ local function readAuras(unit)
     return list
 end
 
-local buffSnapId = 0
-local function captureBuffs()
-    if type(UnitAura) ~= "function" then return nil end
-    local blocks = {}
-    local function addUnit(u)
-        if not UnitExists(u) then return end
-        local auras = readAuras(u)
-        if #auras == 0 then return end
-        local g = (UnitGUID(u) or ""):gsub("^0x", "")
-        blocks[#blocks + 1] = string.format("%s=%s", g, table.concat(auras, ","))
+local function buffUnitTokens()
+    local units = { "player", "pet" }
+    local raidN = GetNumRaidMembers() or 0
+    if raidN > 0 then
+        for i = 1, raidN do units[#units + 1] = "raid" .. i; units[#units + 1] = "raidpet" .. i end
+    else
+        for i = 1, (GetNumPartyMembers() or 0) do units[#units + 1] = "party" .. i; units[#units + 1] = "partypet" .. i end
     end
-    addUnit("player")
-    addUnit("pet")
+    return units
+end
+
+local buffSnapId = 0
+local relayedBuffs = {}   -- guidHex -> last relayed aura-list string (dedup: skip unchanged)
+local function captureBuffs(force)
+    if type(UnitAura) ~= "function" then return nil end
+    local blocks, seen = {}, {}
+    for _, u in ipairs(buffUnitTokens()) do
+        if UnitExists(u) then
+            local g = (UnitGUID(u) or ""):gsub("^0x", "")
+            if g ~= "" and not seen[g] then
+                seen[g] = true
+                local auras = readAuras(u)
+                if #auras > 0 then
+                    local listStr = table.concat(auras, ",")
+                    if force or relayedBuffs[g] ~= listStr then
+                        relayedBuffs[g] = listStr
+                        blocks[#blocks + 1] = string.format("%s=%s", g, listStr)
+                    end
+                end
+            end
+        end
+    end
     if #blocks == 0 then return nil end
     return string.format("BU|%d|%d|%s", math.floor((GetTime() or 0) * 1000), time() or 0, table.concat(blocks, "|"))
 end
 
-local function enqueueBuffs()
-    local payload = captureBuffs()
+local function enqueueBuffs(force)
+    local payload = captureBuffs(force)
     if not payload then return 0 end
     buffSnapId = buffSnapId + 1
     local b64 = b64encode(payload)
@@ -378,9 +408,10 @@ frame:SetScript("OnEvent", function(self, event, ...)
         onFailed(...)
     elseif event == "PLAYER_REGEN_DISABLED" then
         reevaluate()
-        -- Buffs are snapshotted EVERY pull (they change between fights, unlike gear
-        -- which is once-per-version). Self + own pet only — small (~1 chunk).
-        if active then enqueueGroupCI(false); enqueueBuffs() end
+        -- Snapshot buffs at each pull; per-unit dedup means only changed sets relay
+        -- (first pull captures the raid, later pulls are near-zero unless someone
+        -- rebuffs). Gear stays once-per-version via enqueueGroupCI.
+        if active then enqueueGroupCI(false); enqueueBuffs(false) end
     elseif event == "PLAYER_REGEN_ENABLED" or event == "ZONE_CHANGED_NEW_AREA"
         or event == "PLAYER_ENTERING_WORLD" then
         reevaluate()
@@ -438,7 +469,7 @@ local function cmdRelay(sub)
         installSuppress()
         active = true
         local n = enqueueGroupCI(true)
-        local b = enqueueBuffs()
+        local b = enqueueBuffs(true)
         out(("test mode ON — queued %d gear chunk(s) + %d buff chunk(s)."):format(n, b))
         out("Make sure /combatlog is on, then fail casts (on cooldown). Search the log for [[CL_CI_ (gear), [[CL_BU_ (buffs)"
             .. (positionsEnabled() and " and [[CL_TS_ (positions)" or "; enable positions first with /conlogs relay pos on")
