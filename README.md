@@ -22,3 +22,10 @@ Client-side apps for the **ConLogs** logging platform (the web app lives in the 
   (the website ingest accepts the legacy `EpogArmory*` names too).
 - `ConLogsSpike.lua` is a temporary debug diagnostic (`/conlogs spike …`) for Phase-2
   feasibility — not for release; remove before a public build.
+
+## License
+
+[GNU General Public License v3.0 or later](LICENSE) — Copyright © 2026 Defcon.
+
+Copyleft: you are free to use, study, modify, and redistribute this code, but any distributed
+derivative must also be released under the GPLv3 with source available.

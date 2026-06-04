@@ -1,4 +1,11 @@
 -- ConLogs.lua
+--
+-- ConLogs-Epoch — Copyright (C) 2026 Defcon
+-- Licensed under the GNU General Public License v3.0 or later.
+-- This program is free software: you can redistribute it and/or modify it
+-- under the terms of the GPL as published by the Free Software Foundation.
+-- It comes with ABSOLUTELY NO WARRANTY. See the LICENSE file for details.
+--
 -- single-addon mesh gear inspector. Every client runs the same code:
 -- scans self + groupmates in dungeons/raids, broadcasts chunked gear on the
 -- "EpogArmory" addon-message prefix, receives other clients' broadcasts,
