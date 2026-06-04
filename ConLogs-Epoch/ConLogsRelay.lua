@@ -28,7 +28,6 @@ local TELEMETRY_INTERVAL = 2.0        -- seconds between position snapshots
 local CHUNK_BODY    = 850       -- base64 chars per chunk (field cap ~1023, header ~46)
 local QUEUE_MAX     = 400       -- ring cap
 local CHUNK_TTL     = 600       -- seconds a chunk waits before TTL-evict
-local CI_REENQUEUE_S = 120      -- don't re-enqueue group CI more often than this
 local FAILEDTYPE_ARG = 12       -- spike-confirmed CLEU arg index of failedType on PE
 
 -- Broad SPELL_FAILED_* set (proven, most-observed first). The more we cover, the more
@@ -173,7 +172,7 @@ local function freshestRaw(p)
             best, bestTime = set.rawPayload, (set.scanTime or 0)
         end
     end
-    return best
+    return best, bestTime
 end
 
 local function groupGUIDs()
@@ -199,17 +198,25 @@ local function enqueueCI(guid, raw)
     return total
 end
 
-local lastCIAt = 0
+-- Relay each player's gear ONCE per version: enqueue a player's CI only when first
+-- seen this session, or when their stored snapshot changed (scanTime bumped — e.g.
+-- a respec/regear got re-scanned). The relay queue holds chunks until they land
+-- (TTL), so a single enqueue is reliable — no periodic re-spam (which just bloated
+-- the combat log). `force` (relay test) ignores the version check and re-sends all.
+local relayedVersion = {}   -- guid -> scanTime of the gear-version already relayed this session
 local function enqueueGroupCI(force)
-    local now = time() or 0
-    if not force and (now - lastCIAt) < CI_REENQUEUE_S then return 0 end
-    lastCIAt = now
     ConLogsDB = ConLogsDB or {}
-    local players = (ConLogsDB.players) or {}
+    local players = ConLogsDB.players or {}
     local n = 0
     for _, guid in ipairs(groupGUIDs()) do
-        local raw = freshestRaw(players[guid])
-        if raw then n = n + enqueueCI(guid, raw) end
+        local raw, st = freshestRaw(players[guid])
+        if raw then
+            st = st or 0
+            if force or st > (relayedVersion[guid] or -1) then
+                n = n + enqueueCI(guid, raw)
+                relayedVersion[guid] = st
+            end
+        end
     end
     return n
 end
