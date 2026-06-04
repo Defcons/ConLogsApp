@@ -30,6 +30,7 @@ local CI_PREFIX     = "[[CL_CI_v1_"
 local TS_PREFIX     = "[[CL_TS_v1_"   -- telemetry snapshot (positions)
 local BU_PREFIX     = "[[CL_BU_v1_"   -- buff snapshot (pre-pull auras: self + own pet)
 local TELEMETRY_INTERVAL = 2.0        -- seconds between position snapshots
+local BUFF_POLL_INTERVAL = 3.0        -- seconds between buff-aura polls (catches juju/totem up/down edges)
 local CHUNK_BODY    = 850       -- base64 chars per chunk (field cap ~1023, header ~46)
 local QUEUE_MAX     = 400       -- ring cap
 local CHUNK_TTL     = 600       -- seconds a chunk waits before TTL-evict
@@ -296,10 +297,17 @@ local function enqueueTS()
 end
 
 --==========================================================================--
--- buff snapshot (BU) producer — capture group members' auras at combat start.
--- The combat log emits no SPELL_AURA_APPLIED for buffs applied BEFORE the fight
--- (flask/food/blessings cast in town), so the parser can't see them. Snapshotting
--- here lets the server inject synthetic APPLIED events at fight start.
+-- buff snapshot (BU) producer — capture group members' auras for buffs the combat
+-- log can't show. Two blind spots this fills:
+--   1. Pre-pull buffs (flask/food/blessings cast in town): applied before logging,
+--      so no SPELL_AURA_APPLIED — the pull-time snapshot records them.
+--   2. PE buffs that emit NO aura events at all for the whole fight (observed:
+--      "Juju" elixirs, totem buffs): the log never sees them up OR down, so a single
+--      snapshot can't give uptime. The OnUpdate poll re-scans on an interval and
+--      relays a unit only when its aura-set CHANGES, so the server gets the up/down
+--      EDGES and reconstructs each window (uptime = sum of present intervals).
+-- Both feed the same BU stream; the server injects synthetic APPLIED at the first
+-- snapshot a buff appears in, and REMOVED at the snapshot it disappears from.
 --
 -- We scan the WHOLE group (self, pets, every raid/party member). Self + own pet are
 -- always complete; OTHER raiders are range-limited on PE — out-of-range UnitAura
@@ -348,13 +356,18 @@ local function captureBuffs(force)
             local g = (UnitGUID(u) or ""):gsub("^0x", "")
             if g ~= "" and not seen[g] then
                 seen[g] = true
-                local auras = readAuras(u)
-                if #auras > 0 then
-                    local listStr = table.concat(auras, ",")
-                    if force or relayedBuffs[g] ~= listStr then
-                        relayedBuffs[g] = listStr
-                        blocks[#blocks + 1] = string.format("%s=%s", g, listStr)
-                    end
+                local listStr = table.concat(readAuras(u), ",")   -- "" when no readable buffs
+                local prev = relayedBuffs[g]
+                -- Relay a block when this unit's aura-set CHANGED. A transition to empty
+                -- ("g=") tells the server the unit's tracked buffs all dropped (closes
+                -- open windows). Skip units that have never had buffs (prev==nil & empty)
+                -- so out-of-range/buffless units don't spam empty blocks. force (test)
+                -- re-sends present sets only.
+                if force then
+                    if listStr ~= "" then relayedBuffs[g] = listStr; blocks[#blocks + 1] = g .. "=" .. listStr end
+                elseif not (listStr == "" and prev == nil) and listStr ~= prev then
+                    relayedBuffs[g] = listStr
+                    blocks[#blocks + 1] = g .. "=" .. listStr
                 end
             end
         end
@@ -419,14 +432,27 @@ frame:SetScript("OnEvent", function(self, event, ...)
         if active then restoreGlobals() end
     end
 end)
--- Position snapshot ticker: every TELEMETRY_INTERVAL while active, enqueue a TS chunk.
-local tsAccum = 0
+-- Tickers (only while active = logging + in instance + in combat):
+--  • Buff poll every BUFF_POLL_INTERVAL — re-scan auras and relay any unit whose set
+--    changed. This is what captures uptime for buffs the combat log NEVER emits events
+--    for (jujus, totem buffs on PE): the server derives windows from the up/down edges.
+--    Dedup keeps it cheap — steady-state buffs relay zero extra chunks.
+--  • Position snapshot every TELEMETRY_INTERVAL — opt-in (BG-only usefulness on PE).
+local tsAccum, buffAccum = 0, 0
 frame:SetScript("OnUpdate", function(self, elapsed)
-    if not active or not positionsEnabled() then return end
-    tsAccum = tsAccum + (elapsed or 0)
-    if tsAccum < TELEMETRY_INTERVAL then return end
-    tsAccum = 0
-    enqueueTS()
+    if not active then return end
+    buffAccum = buffAccum + (elapsed or 0)
+    if buffAccum >= BUFF_POLL_INTERVAL then
+        buffAccum = 0
+        enqueueBuffs(false)
+    end
+    if positionsEnabled() then
+        tsAccum = tsAccum + (elapsed or 0)
+        if tsAccum >= TELEMETRY_INTERVAL then
+            tsAccum = 0
+            enqueueTS()
+        end
+    end
 end)
 frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 frame:RegisterEvent("PLAYER_REGEN_DISABLED")
