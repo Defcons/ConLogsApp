@@ -2572,6 +2572,17 @@ local function BuildMinimapButton()
     b:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
         GameTooltip:SetText("ConLogs")
+        -- Combat-logging status: the relay (gear/buffs/positions) only writes into
+        -- WoWCombatLog.txt while /combatlog is active, so surface it prominently at
+        -- the top — re-evaluated on every hover, so it's always current.
+        if LoggingCombat and LoggingCombat() then
+            GameTooltip:AddLine("Combat logging: ON", 0.4, 1, 0.4)
+        else
+            GameTooltip:AddLine("Combat logging: OFF", 1, 0.3, 0.3)
+            GameTooltip:AddLine("nothing is being recorded — type /combatlog", 1, 0.7, 0.4)
+            GameTooltip:AddLine("(auto-starts on raid entry)", 0.6, 0.6, 0.6)
+        end
+        GameTooltip:AddLine(" ")
         -- v1.2: prominent aura status line so users see at-a-glance whether
         -- auto-inspect is functional just by hovering the minimap button.
         local has = (_G.ConLogs and _G.ConLogs.HasRealityAura
