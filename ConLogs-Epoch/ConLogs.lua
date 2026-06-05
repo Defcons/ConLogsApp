@@ -1801,14 +1801,23 @@ end
 -- a 5-man dungeon of guildies otherwise gets every scan twice (once per
 -- channel). Failsafe: if guild roster isn't yet populated, returns false
 -- (we'll send on both channels — current behavior, no data loss).
+local _guildiesCache, _guildiesCacheAt, _guildiesCacheN = nil, 0, 0
 local function AllGroupAreGuildies()
     if not IsInGuild() then return false end
     local n = GetNumGuildMembers and GetNumGuildMembers() or 0
     if n == 0 then return false end -- roster not loaded yet → safe-fall to dual broadcast
-    local guildies = {}
-    for i = 1, n do
-        local name = GetGuildRosterInfo(i)
-        if name then guildies[name] = true end
+    -- Cache the guildies set briefly: building it is O(guildSize) and this runs from
+    -- PickChannels once per broadcast chunk, so rebuilding a 500-row roster table dozens
+    -- of times during a raid pull is a real hitch. Roster rarely changes → 30s TTL,
+    -- invalidated on member-count change.
+    local guildies = _guildiesCache
+    if not (guildies and (time() - _guildiesCacheAt) < 30 and _guildiesCacheN == n) then
+        guildies = {}
+        for i = 1, n do
+            local name = GetGuildRosterInfo(i)
+            if name then guildies[name] = true end
+        end
+        _guildiesCache, _guildiesCacheAt, _guildiesCacheN = guildies, time(), n
     end
     local me = UnitName("player")
     if me then guildies[me] = true end
