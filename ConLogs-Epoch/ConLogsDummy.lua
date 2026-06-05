@@ -143,6 +143,7 @@ local stoppingStartTime  = nil          -- GetTime() when state entered "stoppin
 local fightTotalDamage   = 0            -- sum of damage from player+pet to dummy this fight
 local logFilename        = nil          -- expected combat-log filename, computed when LoggingCombat(true) fires
 local testMode           = false        -- Claude v1.7.1: /conlogs testvalidate — short-circuit straight to "stopping" so user can click Validate without doing a full parse
+local dummyStartedLog    = false        -- ownership: true only when WE turned /combatlog on, so we never stop a log the user/another module already had running
 
 -- ----- AoE-dummy detection (epoglogs v0.86.6+ server rejection mirror) -----
 -- Server-side parser (js/parser.js ~140-158, ~1240) rejects any upload
@@ -487,7 +488,7 @@ local function SaveFightRecord()
         totalDamage    = floor(fightTotalDamage),
         dps            = floor(recordedDps + 0.5),
         logFilename    = logFilename,
-        addonVersion   = GetAddOnMetadata and GetAddOnMetadata("ConLogs", "Version") or "?",
+        addonVersion   = GetAddOnMetadata and GetAddOnMetadata("ConLogs-Epoch", "Version") or "?",
         -- AoE metadata (only populated when the fight actually hit
         -- multiple dummies AND we didn't skip the save above — i.e.
         -- the AoE-allowed-on-this-realm path). Lets epoglogs / offline
@@ -523,7 +524,14 @@ local function DoStartLogging()
 
     -- Initial aura check (T+0). If we start with junk auras already on,
     -- validThroughout flips false immediately and the marker won't emit.
-    if LoggingCombat then LoggingCombat(true) end
+    -- Don't hijack a /combatlog that's already running (user-started, or the raid
+    -- auto-log) — only start one if logging is off, and only stop one WE started.
+    if LoggingCombat and not LoggingCombat() then
+        LoggingCombat(true)
+        dummyStartedLog = true
+    else
+        dummyStartedLog = false
+    end
     -- Capture the expected combat-log filename. WoW's client opens the
     -- log file with a timestamp matching the moment /combatlog fires,
     -- formatted as "YYYY-MM-DD-HH.MM.SS WoWCombatLog.txt" on Epoch.
@@ -580,7 +588,8 @@ end
 -- only when non-nil — natural end passes nil to preserve the verdict.
 local function FinishFight(reason)
     if state ~= "logging" and state ~= "stopping" then return end
-    if LoggingCombat then LoggingCombat(false) end
+    if dummyStartedLog and LoggingCombat then LoggingCombat(false) end -- only stop a log we started
+    dummyStartedLog = false
     if reason and not invalidReasons[reason] then
         invalidReasons[reason] = true
         validThroughout = false
@@ -974,7 +983,8 @@ local function BuildFrame()
         elseif state == "logging" or state == "stopping" then
             -- Manual stop. No marker (if not already emitted), no verdict
             -- print — the user knows they cancelled intentionally.
-            if LoggingCombat then LoggingCombat(false) end
+            if dummyStartedLog and LoggingCombat then LoggingCombat(false) end -- only stop a log we started
+            dummyStartedLog = false
             SetState("idle")
         elseif state == "practice" then
             -- v1.7.10: stop practice early. No log to close, just freeze
@@ -1386,8 +1396,14 @@ _G.ConLogsDummy_TestValidate = function()
 
     -- Start /combatlog so the marker line actually lands in a file
     -- the user can inspect. Capture the filename the same way
-    -- DoStartLogging does.
-    if LoggingCombat then LoggingCombat(true) end
+    -- DoStartLogging does. Respect ownership so the test doesn't kill a
+    -- pre-existing log on finish.
+    if LoggingCombat and not LoggingCombat() then
+        LoggingCombat(true)
+        dummyStartedLog = true
+    else
+        dummyStartedLog = false
+    end
     logFilename = date("Logs/%Y-%m-%d-%H.%M.%S WoWCombatLog.txt")
 
     -- Open the frame and jump straight to "stopping" — that's the
