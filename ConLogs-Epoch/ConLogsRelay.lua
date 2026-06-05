@@ -18,8 +18,10 @@
   has no aura event for those, so they'd otherwise be invisible). Each meshed client
   contributes its own complete buff list. Position telemetry (TS) DEFAULT OFF — on PE it
   only yields useful data in battlegrounds (instances don't expose other players'
-  positions), so it's opt-in: `/conlogs relay pos on`. Disable the whole relay with
-  `/conlogs relay off`.
+  positions). Position telemetry (TS) DEFAULT OFF — for the replay map. Inside instances
+  each client can only read its OWN position, so it relays that and the server meshes all
+  addon-users' tracks together (a full-guild run covers everyone). Opt-in: `/conlogs relay
+  pos on`. Disable the whole relay with `/conlogs relay off`.
   NOTE: overwriting the fail-reason globals taints the secure environment; the taint/
   UIErrors suppression below keeps that invisible, but harden before a public release.
   Commands: /conlogs relay on | off | status | test
@@ -139,10 +141,13 @@ local function relayEnabled()
     if ConLogsDB and ConLogsDB.config and ConLogsDB.config.relayEnabled == false then return false end
     return true
 end
--- DEFAULT OFF: position telemetry. On PE it only yields useful data in battlegrounds —
--- PvE instances return only the logger's own position (a continent-map fallback), since
--- GetPlayerMapPosition can't read other players inside instances and PE has no
--- UnitPosition. So it's opt-in: `/conlogs relay pos on`.
+-- DEFAULT OFF: position telemetry (replay map). MESH-OF-SELF model: a client can only
+-- read its OWN position inside a PvE instance (GetPlayerMapPosition returns 0,0 for other
+-- units there, and PE has no UnitPosition), so each client relays just its own coords and
+-- the server stitches all addon-users' tracks into one replay — same pattern as the buff
+-- mesh. Works in any instance that has a real (per-floor) map; raids with no instance map
+-- (e.g. Onyxia) fall back to useless continent coords. In battlegrounds GetPlayerMapPosition
+-- DOES read everyone, so a single logger covers the whole BG. Opt-in: `/conlogs relay pos on`.
 local function positionsEnabled()
     return (ConLogsDB and ConLogsDB.config and ConLogsDB.config.relayPositions == true) and true or false
 end
@@ -483,7 +488,7 @@ local function cmdRelay(sub)
     elseif action == "pos" or action == "positions" then
         if val == "on" then
             ConLogsDB.config.relayPositions = true
-            out(("position telemetry ON — snapshots every %ds. (Only useful in battlegrounds; PvE instances don't expose other players' positions on PE.)"):format(TELEMETRY_INTERVAL))
+            out(("position telemetry ON — snapshots every %ds while in combat. Relays YOUR position (instances only expose self); the server meshes everyone's tracks into the replay. Needs a real instance map — verify with /conlogs spike pos."):format(TELEMETRY_INTERVAL))
         elseif val == "off" then
             ConLogsDB.config.relayPositions = false
             out("position telemetry OFF.")
