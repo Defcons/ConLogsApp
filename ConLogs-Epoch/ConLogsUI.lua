@@ -2365,7 +2365,13 @@ local function BuildBrowser()
             Update()
         end
     end)
-    search:SetScript("OnTextChanged", Update)
+    -- Debounce search: re-sorting + re-rendering the whole list on every keystroke is
+    -- O(n log n) per char on a large DB. Mark dirty and let the OnUpdate flush after a
+    -- short idle (~0.15s — imperceptible) instead.
+    search:SetScript("OnTextChanged", function()
+        f._searchDirty = true
+        f._searchAcc   = 0
+    end)
     f:SetScript("OnShow", function(self)
         ApplySavedPosition(self)
         -- Claude v0.48: ensure Players-mode UI elements start visible (default
@@ -2388,6 +2394,15 @@ local function BuildBrowser()
     -- v1.2: also refreshes the aura status banner so it tracks gain/loss
     -- of the Reality Recalibrators aura while the Browser is open.
     f:SetScript("OnUpdate", function(self, elapsed)
+        -- Debounced search flush (see OnTextChanged): render once typing settles.
+        if self._searchDirty then
+            self._searchAcc = (self._searchAcc or 0) + elapsed
+            if self._searchAcc >= 0.15 then
+                self._searchDirty = false
+                self._searchAcc   = 0
+                Update()
+            end
+        end
         self._tickAcc = (self._tickAcc or 0) + elapsed
         if self._tickAcc < 30 then return end
         self._tickAcc = 0
