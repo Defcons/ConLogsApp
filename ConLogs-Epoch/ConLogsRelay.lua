@@ -551,7 +551,11 @@ end)
 --  • Buff poll every BUFF_POLL_INTERVAL (logging client only) — re-scan auras and relay
 --    any unit whose set changed; captures uptime for buffs the log emits no events for
 --    (jujus, totems) via the up/down edges. Dedup keeps steady-state at zero chunks.
-local tsAccum, buffAccum = 0, 0
+-- Seed the position accumulator with a random phase so clients in a big raid don't
+-- all broadcast on the same 2s boundary (desyncs the addon-channel pulses; each
+-- client still sends once per interval).
+local tsAccum  = (math.random and (math.random() * TELEMETRY_INTERVAL)) or 0
+local buffAccum = 0
 frame:SetScript("OnUpdate", function(self, elapsed)
     if positionsEnabled() then
         tsAccum = tsAccum + (elapsed or 0)
