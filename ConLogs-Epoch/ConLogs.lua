@@ -92,6 +92,8 @@ local MIN_STORE_LEVEL       = 60
 -- CheckFullSet gate (defined near ItemStringFromLink), which requires every
 -- "useful" slot rather than a numeric threshold.
 local ASSEMBLY_TIMEOUT      = 60
+local MAX_REASM_CHUNKS      = 64   -- reject framing claiming more chunks than this (anti-DoS)
+local MAX_REASM_KEYS        = 200  -- cap concurrent reassembly buffers; evict oldest beyond this
 -- v0.34: reduced from 24h to 4h. AddUnit only ever fires for groupmates
 -- (called from ScanRoster's party/raid iteration), so this window controls
 -- how often we re-inspect teammates to catch spec / gear / PvP-trinket swaps
@@ -917,6 +919,82 @@ local function HasFreshScan(guid)
     if not ConLogsDB or not ConLogsDB.lastScanned then return false end
     local t = ConLogsDB.lastScanned[guid]
     return t and (time() - t) < SCAN_FRESH_WINDOW
+end
+
+-- ---------------- Stored-data pruning ----------------
+-- 3.3.5 has a hard SavedVariables serialization limit ("block too big"): once a
+-- single saved table grows past it the WHOLE variable silently fails to write and
+-- all accumulated data is lost. ConLogsDB.players (each set also stashes the full
+-- rawPayload wire string) and ConLogsItemCacheDB otherwise grow without bound, so
+-- prune both at login to stay well under the ceiling.
+local PLAYER_RETAIN_DAYS    = 45    -- drop player records whose newest set is older than this
+local PLAYER_MAX_RECORDS    = 4000  -- hard cap; drop the oldest beyond this
+local ITEMCACHE_RETAIN_DAYS = 60    -- drop item-cache entries not refreshed in this long
+
+local function newestSetTime(rec)
+    local newest = 0
+    if rec and rec.sets then
+        for _, s in pairs(rec.sets) do
+            local st = s.scanTime or 0
+            if st > newest then newest = st end
+        end
+    end
+    return newest
+end
+
+local function PruneStoredData()
+    ConLogsDB = ConLogsDB or {}
+    ConLogsDB.players     = ConLogsDB.players or {}
+    ConLogsDB.lastScanned = ConLogsDB.lastScanned or {}
+    local nowT = time()
+    local prunedP, prunedI = 0, 0
+
+    -- 1. age-prune player records (newest set older than the retain window)
+    local playerCut = nowT - PLAYER_RETAIN_DAYS * 86400
+    for guid, rec in pairs(ConLogsDB.players) do
+        if newestSetTime(rec) < playerCut then
+            ConLogsDB.players[guid]     = nil
+            ConLogsDB.lastScanned[guid] = nil
+            prunedP = prunedP + 1
+        end
+    end
+
+    -- 2. count-cap: if still over the cap, drop the oldest records first
+    local count = 0
+    for _ in pairs(ConLogsDB.players) do count = count + 1 end
+    if count > PLAYER_MAX_RECORDS then
+        local arr = {}
+        for guid, rec in pairs(ConLogsDB.players) do
+            arr[#arr + 1] = { guid = guid, t = newestSetTime(rec) }
+        end
+        table.sort(arr, function(a, b) return a.t < b.t end) -- oldest first
+        for i = 1, (count - PLAYER_MAX_RECORDS) do
+            ConLogsDB.players[arr[i].guid]     = nil
+            ConLogsDB.lastScanned[arr[i].guid] = nil
+            prunedP = prunedP + 1
+        end
+    end
+
+    -- 3. drop orphan lastScanned entries (no matching player record)
+    for guid in pairs(ConLogsDB.lastScanned) do
+        if not ConLogsDB.players[guid] then ConLogsDB.lastScanned[guid] = nil end
+    end
+
+    -- 4. age-prune the item cache by last-refresh timestamp (also clears the
+    --    verify-retry stubs, which never carry a .ts)
+    if ConLogsItemCacheDB then
+        local itemCut = nowT - ITEMCACHE_RETAIN_DAYS * 86400
+        for id, e in pairs(ConLogsItemCacheDB) do
+            if type(e) == "table" and (e.ts or 0) < itemCut then
+                ConLogsItemCacheDB[id] = nil
+                prunedI = prunedI + 1
+            end
+        end
+    end
+
+    if prunedP > 0 or prunedI > 0 then
+        dprint(string.format("[prune] removed %d stale player record(s) + %d item-cache entr(ies)", prunedP, prunedI))
+    end
 end
 
 -- ---------------- Item-info cache ----------------
@@ -2241,8 +2319,10 @@ local function HandlePeerPing(payload, sender, channel)
     local tag, requester = strsplit("^", payload)
     if tag ~= "PEERPING" then return end
     requester = requester or sender or "?"
-    -- Per-requester cooldown
-    local last = lastPeerPongTo[requester] or 0
+    -- Per-SENDER cooldown (authenticated CHAT_MSG_ADDON sender, not the spoofable
+    -- wire `requester`, so rotating that field can't bypass the cooldown).
+    local cdKey = sender or requester
+    local last = lastPeerPongTo[cdKey] or 0
     if (time() - last) < PEER_RESPONSE_COOLDOWN then
         dprint(string.format("[peerping] decline %s — cooldown (%ds since last pong)",
             requester, time() - last))
@@ -2261,7 +2341,7 @@ local function HandlePeerPing(payload, sender, channel)
     local body = string.format("%s^1^1^PEERPONG^%s^%d^%s^%s",
         msgID, identity, dbSize, ADDON_VERSION, me)
     outQueue[#outQueue + 1] = { ch = channel, body = body }
-    lastPeerPongTo[requester] = time()
+    lastPeerPongTo[cdKey] = time()
     dprint(string.format("[peerping] replied to %s on %s (dbSize=%d, identity=%s)",
         requester, channel, dbSize, identity))
 end
@@ -2368,8 +2448,11 @@ local function HandleSyncRequest(payload, sender, channel)
             requester or "?", (time() - lastSyncResponseAt) / 60))
         return
     end
-    -- Rate-limit per requester to prevent a single requester from looping.
-    local last = lastSyncResponseTo[requester or ""] or 0
+    -- Rate-limit per SENDER (the authenticated CHAT_MSG_ADDON sender, not the
+    -- spoofable wire `requester` — keying on requester let an attacker bypass this
+    -- cooldown by rotating the field on every message).
+    local cdKey = sender or requester or ""
+    local last = lastSyncResponseTo[cdKey] or 0
     if (time() - last) < SYNC_RESPONSE_COOLDOWN then
         dprint(string.format("[sync] decline %s — responded %.1fh ago (cooldown 1h)",
             requester or "?", (time() - last) / 3600))
@@ -2426,7 +2509,7 @@ local function HandleSyncRequest(payload, sender, channel)
             end
         end
     end
-    lastSyncResponseTo[requester or ""] = time()
+    lastSyncResponseTo[cdKey] = time()
     lastSyncResponseAt = time() -- v0.37: stamp global cooldown
     dprint(string.format("[sync] responding to %s (whisper to %s): queued %d, skipped %d (already fresh) since %s (max %d)",
         requester or "?", sender or "?", queued, skipped,
@@ -2448,10 +2531,24 @@ local function OnAddonMessage(prefix, body, channel, sender)
     local idx = tonumber(idx_s)
     local total = tonumber(total_s)
     if not msgID or not idx or not total or not data then return end
+    -- Bound untrusted framing: reject implausible chunk counts / out-of-range
+    -- indices so a crafted addon message can't wedge a huge never-completing
+    -- reassembly buffer (e.g. "chunk 1 of 9999999") or index a garbage slot.
+    if total < 1 or total > MAX_REASM_CHUNKS or idx < 1 or idx > total then return end
 
     local key = (sender or "?") .. "\001" .. msgID
     local asm = assembly[key]
     if not asm then
+        -- Cap concurrent reassembly buffers; evict the oldest if at the limit so a
+        -- peer rotating msgID every send can't grow `assembly` without bound. Only
+        -- runs on new-key creation (not per chunk), and the count is capped, so the
+        -- O(keys) scan here is cheap.
+        local n, oldestK, oldestT = 0, nil, nil
+        for k, v in pairs(assembly) do
+            n = n + 1
+            if not oldestT or v.firstSeen < oldestT then oldestK, oldestT = k, v.firstSeen end
+        end
+        if n >= MAX_REASM_KEYS and oldestK then assembly[oldestK] = nil end
         asm = { chunks = {}, total = total, firstSeen = now() }
         assembly[key] = asm
         dprint(string.format("[recv] new scan from %s (chunk %d/%d, expecting %d more)",
@@ -3340,6 +3437,7 @@ f:SetScript("OnEvent", function(self, event, ...)
         ConLogsItemCacheDB = ConLogsItemCacheDB or {}
         ConLogsTalentTreeDB = ConLogsTalentTreeDB or {} -- v1.3: per-class talent metadata
         MigratePlayers() -- wrap pre-v0.13 flat entries into sets[1]
+        PruneStoredData() -- cap ConLogsDB.players / lastScanned / item cache (block-too-big guard)
         RequestSelfScan(SELF_SCAN_LOGIN_DELAY) -- initial self-scan after talent data warms up
         versionPingAt = now() + VERSION_PING_DELAY -- one-shot version broadcast, 2min after login
         return
