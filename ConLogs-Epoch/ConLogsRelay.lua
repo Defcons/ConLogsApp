@@ -16,12 +16,12 @@
   DEFAULT ON — a snapshot of self + own-pet auras taken at each combat start, so the log
   records flasks/food/blessings/etc. that were applied BEFORE the fight (the combat log
   has no aura event for those, so they'd otherwise be invisible). Each meshed client
-  contributes its own complete buff list. Position telemetry (TS) DEFAULT OFF — on PE it
-  only yields useful data in battlegrounds (instances don't expose other players'
-  positions). Position telemetry (TS) DEFAULT OFF — for the replay map. Inside instances
-  each client can only read its OWN position, so it relays that and the server meshes all
-  addon-users' tracks together (a full-guild run covers everyone). Opt-in: `/conlogs relay
-  pos on`. Disable the whole relay with `/conlogs relay off`.
+  contributes its own complete buff list. Positions (TS) DEFAULT ON — for the replay map.
+  Each client broadcasts its OWN position over the mesh and the logging client relays the
+  whole group (inside instances you can't read other players' coords, so the mesh fills
+  them in; a battleground exposes everyone to one logger). A map-validity guard relays
+  NOTHING on continent fallbacks (e.g. Onyxia, no instance map), making default-on safe.
+  Disable positions with `/conlogs relay pos off`, or the whole relay with `relay off`.
   NOTE: overwriting the fail-reason globals taints the secure environment; the taint/
   UIErrors suppression below keeps that invisible, but harden before a public release.
   Commands: /conlogs relay on | off | status | test
@@ -149,7 +149,11 @@ end
 -- (e.g. Onyxia) fall back to useless continent coords. In battlegrounds GetPlayerMapPosition
 -- DOES read everyone, so a single logger covers the whole BG. Opt-in: `/conlogs relay pos on`.
 local function positionsEnabled()
-    return (ConLogsDB and ConLogsDB.config and ConLogsDB.config.relayPositions == true) and true or false
+    -- DEFAULT ON: the map-validity guard makes this safe — it only ever produces
+    -- data on a real instance/BG map, and stays silent on continent fallbacks.
+    -- Only an explicit `/conlogs relay pos off` disables it.
+    if ConLogsDB and ConLogsDB.config and ConLogsDB.config.relayPositions == false then return false end
+    return true
 end
 local function shouldBeActive()
     if not (relayEnabled() or testForce) then return false end
@@ -233,10 +237,35 @@ local function enqueueGroupCI(force)
 end
 
 --==========================================================================--
--- position telemetry (TS) producer — periodic raid position snapshots
--- Payload: TS|<getTimeMs>|<unixSec>|<guid>:<x>,<y>|<guid>:<x>,<y>|...
--- (no UnitPosition on PE → normalized GetPlayerMapPosition map_x/map_y only)
+-- position telemetry (TS) producer — replay map. MESH-OF-SELF for instances:
+-- a client can't read other players' coords inside a PvE instance, so every client
+-- BROADCASTS its own position over the addon-message mesh and the logging client
+-- aggregates self + all received peers into one snapshot. In a battleground
+-- GetPlayerMapPosition reads everyone directly, so a single logger covers it.
+--
+-- Map-validity guard: only relay when on a real (per-floor) instance/BG map. If the
+-- client falls back to a continent map (e.g. Onyxia, which has no instance map →
+-- "Kalimdor"), the coords are meaningless, so we relay NOTHING. This makes the
+-- default-on safe: it produces data only where a usable map exists.
+-- Payload: TS|<getTimeMs>|<unixSec>|<mapFile>|<guidHex>:<x>,<y>,<floor>|<guidHex>:...
 --==========================================================================--
+local POS_PREFIX  = "ConLogsPos"   -- DEDICATED addon-message prefix for the position mesh,
+                                   -- kept separate from the gear mesh's "EpogArmory" prefix
+                                   -- so position broadcasts never hit the gear reassembly path.
+local POS_TTL     = 5              -- seconds; drop peer positions older than this
+
+-- Continent/world maps that signal a fallback (NOT a usable replay map).
+local CONTINENT_MAPS = {
+    [""] = true, ["World"] = true, ["Cosmic"] = true, ["AzerothContinent"] = true,
+    ["Kalimdor"] = true, ["Azeroth"] = true, ["Expansion01"] = true, ["Northrend"] = true,
+}
+local function isReplayMap(mapFile)
+    return mapFile ~= nil and not CONTINENT_MAPS[mapFile]
+end
+
+-- peer positions received over the mesh: guidHex -> { x, y, floor, recvAt(GetTime) }
+local peerPos = {}
+
 local function round4(n)
     if type(n) ~= "number" then return 0 end
     return math.floor(n * 10000 + 0.5) / 10000
@@ -261,32 +290,76 @@ local function withCurrentZoneMap(fn)
     return unpack(r, 1, r.n)
 end
 
-local snapId = 0
-local function captureSnapshot()
-    local units = {}
+local function positionUnits()
+    local units = { "player" }
     local raidN = GetNumRaidMembers() or 0
     if raidN > 0 then for i = 1, raidN do units[#units + 1] = "raid" .. i end
-    else units[#units + 1] = "player"; for i = 1, (GetNumPartyMembers() or 0) do units[#units + 1] = "party" .. i end end
-    local parts = {}
-    local mapFile, level = "", 0
+    else for i = 1, (GetNumPartyMembers() or 0) do units[#units + 1] = "party" .. i end end
+    return units
+end
+
+-- Read self position + current map identity (under the map-set dance). Returns
+-- x, y, mapFile, floor — x/y nil when no usable position.
+local function readSelfPos()
+    local x, y, mapFile, floor
     withCurrentZoneMap(function()
-        -- map identity so the server knows which WorldMap background these 0-1
-        -- coords belong to (Naxx etc. normalize per wing/level).
         if type(GetMapInfo) == "function" then mapFile = GetMapInfo() or "" end
-        if type(GetCurrentMapDungeonLevel) == "function" then level = GetCurrentMapDungeonLevel() or 0 end
-        for _, u in ipairs(units) do
+        if type(GetCurrentMapDungeonLevel) == "function" then floor = GetCurrentMapDungeonLevel() or 0 end
+        if type(GetPlayerMapPosition) == "function" then x, y = GetPlayerMapPosition("player") end
+    end)
+    return x, y, mapFile or "", floor or 0
+end
+
+-- Broadcast our own position so the logging client can relay everyone's. Runs for
+-- EVERY client (logging or not) while in combat in an instance on a real map.
+-- BG doesn't need it (direct reads cover everyone there).
+local function broadcastSelfPos()
+    if not positionsEnabled() then return end
+    if not UnitAffectingCombat("player") then return end
+    local _, instType = IsInInstance()
+    if instType ~= "party" and instType ~= "raid" then return end
+    local x, y, mapFile, floor = readSelfPos()
+    if not isReplayMap(mapFile) then return end
+    if not (x and y and (x ~= 0 or y ~= 0)) then return end
+    local g = (UnitGUID("player") or ""):gsub("^0x", "")
+    if g == "" or type(SendAddonMessage) ~= "function" then return end
+    SendAddonMessage(POS_PREFIX,
+        string.format("POS^%s^%s^%s^%d", g, round4(x), round4(y), floor),
+        (instType == "raid") and "RAID" or "PARTY")
+end
+
+local snapId = 0
+local function captureSnapshot()
+    local nowT = GetTime() or 0
+    local merged = {}   -- guidHex -> "x,y,floor"
+    local mapFile, selfFloor = "", 0
+    withCurrentZoneMap(function()
+        if type(GetMapInfo) == "function" then mapFile = GetMapInfo() or "" end
+        if type(GetCurrentMapDungeonLevel) == "function" then selfFloor = GetCurrentMapDungeonLevel() or 0 end
+        -- Direct reads: a BG yields every unit; an instance yields only self.
+        for _, u in ipairs(positionUnits()) do
             if UnitExists(u) then
                 local x, y = GetPlayerMapPosition(u)
                 if x and y and (x ~= 0 or y ~= 0) then
                     local g = (UnitGUID(u) or ""):gsub("^0x", "")
-                    parts[#parts + 1] = string.format("%s:%s,%s", g, round4(x), round4(y))
+                    if g ~= "" then merged[g] = string.format("%s,%s,%d", round4(x), round4(y), selfFloor) end
                 end
             end
         end
     end)
+    -- Continent fallback (no usable instance map) → relay nothing.
+    if not isReplayMap(mapFile) then return nil end
+    -- Merge fresh peer broadcasts (other players in the instance); don't overwrite
+    -- a direct read (BG case), and honor TTL so stale dots drop out.
+    for g, p in pairs(peerPos) do
+        if (nowT - (p.recvAt or 0)) <= POS_TTL and not merged[g] then
+            merged[g] = string.format("%s,%s,%d", p.x, p.y, p.floor or 0)
+        end
+    end
+    local parts = {}
+    for g, v in pairs(merged) do parts[#parts + 1] = g .. ":" .. v end
     if #parts == 0 then return nil end
-    -- TS|<getTimeMs>|<unixSec>|<mapFile>|<dungeonLevel>|<guid>:<x>,<y>|...
-    return string.format("TS|%d|%d|%s|%d|%s", math.floor((GetTime() or 0) * 1000), time() or 0, tostring(mapFile), level, table.concat(parts, "|"))
+    return string.format("TS|%d|%d|%s|%s", math.floor(nowT * 1000), time() or 0, tostring(mapFile), table.concat(parts, "|"))
 end
 
 local function enqueueTS()
@@ -424,6 +497,15 @@ frame:SetScript("OnEvent", function(self, event, ...)
         if select(2, ...) ~= "SPELL_CAST_FAILED" then return end
         if select(3, ...) ~= UnitGUID("player") then return end
         onFailed(...)
+    elseif event == "CHAT_MSG_ADDON" then
+        -- position mesh receive: peers broadcast "POS^<guid>^<x>^<y>^<floor>"
+        local prefix, msg = ...
+        if prefix == POS_PREFIX and type(msg) == "string" and msg:sub(1, 4) == "POS^" then
+            local _, g, x, y, fl = strsplit("^", msg)
+            if g and x and y then
+                peerPos[g] = { x = tonumber(x) or 0, y = tonumber(y) or 0, floor = tonumber(fl) or 0, recvAt = GetTime() or 0 }
+            end
+        end
     elseif event == "PLAYER_REGEN_DISABLED" then
         reevaluate()
         -- Snapshot buffs at each pull; per-unit dedup means only changed sets relay
@@ -437,29 +519,35 @@ frame:SetScript("OnEvent", function(self, event, ...)
         if active then restoreGlobals() end
     end
 end)
--- Tickers (only while active = logging + in instance + in combat):
---  • Buff poll every BUFF_POLL_INTERVAL — re-scan auras and relay any unit whose set
---    changed. This is what captures uptime for buffs the combat log NEVER emits events
---    for (jujus, totem buffs on PE): the server derives windows from the up/down edges.
---    Dedup keeps it cheap — steady-state buffs relay zero extra chunks.
---  • Position snapshot every TELEMETRY_INTERVAL — opt-in (BG-only usefulness on PE).
+-- Tickers:
+--  • Position mesh every TELEMETRY_INTERVAL — EVERY client (logger or not) broadcasts
+--    its own position so the logging client can relay the whole group; the logger also
+--    relays the aggregated snapshot into its log. broadcastSelfPos guards internally on
+--    in-combat + instance + real map, so it's idle elsewhere. Runs outside the `active`
+--    gate because non-logging members still need to broadcast.
+--  • Buff poll every BUFF_POLL_INTERVAL (logging client only) — re-scan auras and relay
+--    any unit whose set changed; captures uptime for buffs the log emits no events for
+--    (jujus, totems) via the up/down edges. Dedup keeps steady-state at zero chunks.
 local tsAccum, buffAccum = 0, 0
 frame:SetScript("OnUpdate", function(self, elapsed)
-    if not active then return end
-    buffAccum = buffAccum + (elapsed or 0)
-    if buffAccum >= BUFF_POLL_INTERVAL then
-        buffAccum = 0
-        enqueueBuffs(false)
-    end
     if positionsEnabled() then
         tsAccum = tsAccum + (elapsed or 0)
         if tsAccum >= TELEMETRY_INTERVAL then
             tsAccum = 0
-            enqueueTS()
+            broadcastSelfPos()
+            if active then enqueueTS() end
+        end
+    end
+    if active then
+        buffAccum = buffAccum + (elapsed or 0)
+        if buffAccum >= BUFF_POLL_INTERVAL then
+            buffAccum = 0
+            enqueueBuffs(false)
         end
     end
 end)
 frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+frame:RegisterEvent("CHAT_MSG_ADDON")
 frame:RegisterEvent("PLAYER_REGEN_DISABLED")
 frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
@@ -488,12 +576,12 @@ local function cmdRelay(sub)
     elseif action == "pos" or action == "positions" then
         if val == "on" then
             ConLogsDB.config.relayPositions = true
-            out(("position telemetry ON — snapshots every %ds while in combat. Relays YOUR position (instances only expose self); the server meshes everyone's tracks into the replay. Needs a real instance map — verify with /conlogs spike pos."):format(TELEMETRY_INTERVAL))
+            out(("position telemetry ON (default) — every %ds in combat. Each client broadcasts its own position over the mesh; the logger relays the whole group into its log. Only on a real instance/BG map (continent fallbacks relay nothing). Verify with /conlogs spike pos."):format(TELEMETRY_INTERVAL))
         elseif val == "off" then
             ConLogsDB.config.relayPositions = false
-            out("position telemetry OFF.")
+            out("position telemetry OFF (won't broadcast or relay positions).")
         else
-            out("position telemetry is " .. (positionsEnabled() and "ON" or "OFF (default)") .. ". Use: /conlogs relay pos on|off")
+            out("position telemetry is " .. (positionsEnabled() and "ON (default)" or "OFF") .. ". Use: /conlogs relay pos on|off")
         end
     elseif action == "test" then
         testForce = true
