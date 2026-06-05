@@ -146,21 +146,21 @@ local FAIL_GLOBALS = {
 
 local testActive = false   -- a relay OR size probe is running
 local testMode   = nil     -- "relay" | "size"
-local origins    = {}
+-- Capture pristine SPELL_FAILED_* once at load and always restore to those (same
+-- hardening as ConLogsRelay) so a spike test can never leave a chunk/sentinel string
+-- stuck in the globals — even if it overlaps the relay.
+local PRISTINE   = {}
+for _, g in ipairs(FAIL_GLOBALS) do PRISTINE[g] = _G[g] end
 local landedIndex = nil
 local dumpsLeft  = 0
 local sizeBest   = nil     -- highest <<N>> marker seen in the CLEU field during a size probe
 
 local function applyProbe(str)
-    for _, g in ipairs(FAIL_GLOBALS) do
-        if origins[g] == nil then origins[g] = _G[g] end
-        _G[g] = str
-    end
+    for _, g in ipairs(FAIL_GLOBALS) do _G[g] = str end
 end
 
 local function restoreGlobals()
-    for g, v in pairs(origins) do _G[g] = v end
-    origins = {}
+    for _, g in ipairs(FAIL_GLOBALS) do _G[g] = PRISTINE[g] end
 end
 
 -- Suppress the red on-screen error text for any of our WCE_ probe strings.

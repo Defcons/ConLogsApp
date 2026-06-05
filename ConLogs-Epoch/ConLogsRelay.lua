@@ -101,20 +101,27 @@ end
 --==========================================================================--
 -- SPELL_FAILED_* hijack
 --==========================================================================--
-local origins = {}     -- [globalName] = original value (captured once)
+-- Capture the PRISTINE FrameXML SPELL_FAILED_* strings ONCE at file load, before any
+-- overwrite can happen. We always restore to these captured defaults — never to a
+-- value read at first-overwrite time, which could already be a chunk string (a missed
+-- restore, or the dev-only Spike probe). This makes "globals stuck showing chunk
+-- strings" impossible: every restore path returns the true defaults.
+local PRISTINE = {}
+for _, g in ipairs(FAIL_GLOBALS) do PRISTINE[g] = _G[g] end
+
+local dirty   = false  -- have we overwritten the globals since the last restore?
 local active  = false
 -- `pending` is forward-declared above the queue section (enqueue resyncs it).
 
 local function applyChunk(s)
-    for _, g in ipairs(FAIL_GLOBALS) do
-        if origins[g] == nil then origins[g] = _G[g] end
-        _G[g] = s
-    end
+    for _, g in ipairs(FAIL_GLOBALS) do _G[g] = s end
+    dirty = true
 end
 
 local function restoreGlobals()
-    for g, v in pairs(origins) do _G[g] = v end
-    origins = {}
+    -- Unconditionally restore the captured pristine defaults (idempotent).
+    for _, g in ipairs(FAIL_GLOBALS) do _G[g] = PRISTINE[g] end
+    dirty   = false
     pending = nil
 end
 
@@ -505,7 +512,7 @@ local function onFailed(...)
     local now = time() or 0
     while queue[1] and queue[1].exp <= now do table.remove(queue, 1); pending = nil end
     if not queue[1] then
-        if next(origins) then restoreGlobals() end  -- drained: revert so the last chunk can't re-land
+        if dirty then restoreGlobals() end  -- drained: revert so the last chunk can't re-land
         return
     end
     -- (Re-)apply the current head so the next failed cast carries it.
@@ -538,8 +545,12 @@ frame:SetScript("OnEvent", function(self, event, ...)
     elseif event == "PLAYER_REGEN_ENABLED" or event == "ZONE_CHANGED_NEW_AREA"
         or event == "PLAYER_ENTERING_WORLD" then
         reevaluate()
-    elseif event == "PLAYER_LOGOUT" then
-        if active then restoreGlobals() end
+    elseif event == "PLAYER_LOGOUT" or event == "PLAYER_LEAVING_WORLD" then
+        -- Restore unconditionally on every teardown path (logout, /reload, zoning out
+        -- mid-combat). restoreGlobals is idempotent, so the dropped `if active` guard
+        -- just guarantees the globals are never left holding a chunk string.
+        active = false
+        if dirty then restoreGlobals() end
     end
 end)
 -- Tickers:
@@ -580,6 +591,7 @@ frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("PLAYER_LOGOUT")
+frame:RegisterEvent("PLAYER_LEAVING_WORLD") -- extra teardown path: restore globals on zone-out
 
 --==========================================================================--
 -- slash: /conlogs relay <on|off|status|test>
