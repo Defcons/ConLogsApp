@@ -84,10 +84,18 @@ local session = string.format("%x", (time() or 0) % 0xffffffff)
 --==========================================================================--
 -- chunk queue (FIFO with TTL + ring cap)
 --==========================================================================--
-local queue = {}            -- array of { chunk = str, exp = unixSec }
-local function enqueue(chunk)
-    queue[#queue + 1] = { chunk = chunk, exp = (time() or 0) + CHUNK_TTL }
-    if #queue > QUEUE_MAX then table.remove(queue, 1) end
+local pending = nil   -- forward-declared (used by enqueue's resync); the chunk currently in the globals
+-- Queue entry: { chunk = str, exp = unixSec, onLand = fn|nil }. onLand fires only
+-- when the chunk is confirmed landed (see onFailed) — used to advance the dedup
+-- baseline AFTER the data reached the log, never on mere enqueue (so a chunk that's
+-- TTL-evicted/ring-dropped before landing gets re-offered instead of lost).
+local queue = {}
+local function enqueue(chunk, onLand)
+    queue[#queue + 1] = { chunk = chunk, exp = (time() or 0) + CHUNK_TTL, onLand = onLand }
+    if #queue > QUEUE_MAX then
+        table.remove(queue, 1) -- drop oldest, unrelayed → its onLand is intentionally NOT called
+        pending = nil          -- the evicted head may be the applied chunk; resync landed-tracking
+    end
 end
 
 --==========================================================================--
@@ -95,7 +103,7 @@ end
 --==========================================================================--
 local origins = {}     -- [globalName] = original value (captured once)
 local active  = false
-local pending = nil    -- the chunk currently sitting in the globals
+-- `pending` is forward-declared above the queue section (enqueue resyncs it).
 
 local function applyChunk(s)
     for _, g in ipairs(FAIL_GLOBALS) do
@@ -202,13 +210,16 @@ local function groupGUIDs()
     return out
 end
 
-local function enqueueCI(guid, raw)
+local function enqueueCI(guid, raw, onLand)
     local b64 = b64encode(raw)
     local short = tostring(guid):gsub("^0x", "")
     local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
     for i = 1, total do
         local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
-        enqueue(string.format("%s%s_%s_%d/%d]]%s", CI_PREFIX, session, short, i, total, piece))
+        -- Attach the dedup-commit to the LAST chunk so the baseline only advances
+        -- once the full payload has landed.
+        enqueue(string.format("%s%s_%s_%d/%d]]%s", CI_PREFIX, session, short, i, total, piece),
+            (i == total) and onLand or nil)
     end
     return total
 end
@@ -228,8 +239,11 @@ local function enqueueGroupCI(force)
         if raw then
             st = st or 0
             if force or st > (relayedVersion[guid] or -1) then
-                n = n + enqueueCI(guid, raw)
-                relayedVersion[guid] = st
+                -- Advance the per-guid baseline only when the CI chunk lands (onLand),
+                -- so a chunk dropped before landing is re-offered next pull. `guid`/`st`
+                -- are fresh per loop iteration, so the closure captures them correctly.
+                local g, sv = guid, st
+                n = n + enqueueCI(guid, raw, function() relayedVersion[g] = sv end)
             end
         end
     end
@@ -426,9 +440,12 @@ end
 
 local buffSnapId = 0
 local relayedBuffs = {}   -- guidHex -> last relayed aura-list string (dedup: skip unchanged)
+-- Returns payload, commit. The dedup baseline (relayedBuffs) is NOT updated here —
+-- the returned commit() applies it, and is only invoked once the chunk lands (so a
+-- dropped chunk re-offers its buffs next poll instead of being lost permanently).
 local function captureBuffs(force)
     if type(UnitAura) ~= "function" then return nil end
-    local blocks, seen = {}, {}
+    local blocks, seen, updates = {}, {}, {}
     for _, u in ipairs(buffUnitTokens()) do
         if UnitExists(u) then
             local g = (UnitGUID(u) or ""):gsub("^0x", "")
@@ -442,27 +459,31 @@ local function captureBuffs(force)
                 -- so out-of-range/buffless units don't spam empty blocks. force (test)
                 -- re-sends present sets only.
                 if force then
-                    if listStr ~= "" then relayedBuffs[g] = listStr; blocks[#blocks + 1] = g .. "=" .. listStr end
+                    if listStr ~= "" then updates[g] = listStr; blocks[#blocks + 1] = g .. "=" .. listStr end
                 elseif not (listStr == "" and prev == nil) and listStr ~= prev then
-                    relayedBuffs[g] = listStr
+                    updates[g] = listStr
                     blocks[#blocks + 1] = g .. "=" .. listStr
                 end
             end
         end
     end
     if #blocks == 0 then return nil end
-    return string.format("BU|%d|%d|%s", math.floor((GetTime() or 0) * 1000), time() or 0, table.concat(blocks, "|"))
+    local payload = string.format("BU|%d|%d|%s", math.floor((GetTime() or 0) * 1000), time() or 0, table.concat(blocks, "|"))
+    local commit = function() for g, v in pairs(updates) do relayedBuffs[g] = v end end
+    return payload, commit
 end
 
 local function enqueueBuffs(force)
-    local payload = captureBuffs(force)
+    local payload, commit = captureBuffs(force)
     if not payload then return 0 end
     buffSnapId = buffSnapId + 1
     local b64 = b64encode(payload)
     local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
     for i = 1, total do
         local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
-        enqueue(string.format("%s%s_%d_%d/%d]]%s", BU_PREFIX, session, buffSnapId, i, total, piece))
+        -- commit on the LAST chunk's landing only
+        enqueue(string.format("%s%s_%d_%d/%d]]%s", BU_PREFIX, session, buffSnapId, i, total, piece),
+            (i == total) and commit or nil)
     end
     return total
 end
@@ -475,10 +496,12 @@ local function onFailed(...)
     -- prefix, the previously-applied chunk made it into the log → drop it.
     local ft = select(FAILEDTYPE_ARG, ...)
     if pending and type(ft) == "string" and ft:sub(1, #PREFIX_FAMILY) == PREFIX_FAMILY then
-        table.remove(queue, 1)
+        local landed = table.remove(queue, 1)  -- this head is what just landed
         pending = nil
+        if landed and landed.onLand then landed.onLand() end  -- advance dedup baseline ONLY now
     end
-    -- TTL-evict stale heads.
+    -- TTL-evict stale heads (never landed → onLand intentionally NOT called, so the
+    -- data will be re-offered by the next snapshot instead of being lost).
     local now = time() or 0
     while queue[1] and queue[1].exp <= now do table.remove(queue, 1); pending = nil end
     if not queue[1] then
