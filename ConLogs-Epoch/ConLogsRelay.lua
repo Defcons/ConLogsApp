@@ -153,6 +153,22 @@ end
 -- scope: when may the relay be active?
 --==========================================================================--
 local testForce = false   -- set by /conlogs relay test for out-of-instance testing
+
+-- Claude (v2.2.3): zone-name overrides for zones that report the WRONG instance type
+-- from IsInInstance() on this client. Tol Barad comes back as a world/pvp zone, so the
+-- relay's instance gate (raid/party) and the loot gate (raid/party) never engage there
+-- even though it plays like an instanced encounter zone. Match by substring (plain text)
+-- so subzone variants like "Tol Barad Peninsula" still count. Treated as a party/raid
+-- instance for BOTH shouldBeActive (arm the relay) and lootCaptureOK (capture loot).
+local INSTANCE_ZONE_OVERRIDES = { "Tol Barad" }
+local function zoneOverrideActive()
+    local z = (GetRealZoneText and GetRealZoneText()) or (GetZoneText and GetZoneText()) or ""
+    if z == "" then return false end
+    for _, name in ipairs(INSTANCE_ZONE_OVERRIDES) do
+        if z:find(name, 1, true) then return true end
+    end
+    return false
+end
 local function relayEnabled()
     -- DEFAULT ON: the relay runs for every user (so any /combatlog automatically
     -- carries gear/talents/positions). Only an explicit `/conlogs relay off`
@@ -179,7 +195,7 @@ local function shouldBeActive()
     if not (LoggingCombat and LoggingCombat()) then return false end
     if testForce then return true end
     local _, instType = IsInInstance()
-    if instType ~= "raid" and instType ~= "party" and instType ~= "pvp" then return false end
+    if instType ~= "raid" and instType ~= "party" and instType ~= "pvp" and not zoneOverrideActive() then return false end
     -- Claude (v2.2.1): active for the WHOLE instance stay, not just while in combat.
     -- Loot is captured at the kill (out of combat) and queued; keeping the relay armed
     -- out of combat lets that chunk land on the next failed cast — critically for the
@@ -551,7 +567,8 @@ local lootNudged = false -- Claude (v2.2.1): throttle the out-of-combat "cast to
 local function lootCaptureOK()
     if not (LoggingCombat and LoggingCombat()) then return false end
     local _, instType = IsInInstance()
-    return instType == "raid" or instType == "party"
+    -- Claude (v2.2.3): zoneOverrideActive() lets mis-typed zones (Tol Barad) capture loot.
+    return instType == "raid" or instType == "party" or zoneOverrideActive()
 end
 local function captureLoot(msg)
     if type(msg) ~= "string" or not lootCaptureOK() then return end
