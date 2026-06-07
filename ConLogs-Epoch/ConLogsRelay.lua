@@ -2,10 +2,12 @@
   ConLogsRelay.lua — embed ConLogs gear/talent data into WoWCombatLog.txt via the
   SPELL_CAST_FAILED relay (a.k.a. CLEU hijack / "LegacyPlayers-style").
 
-  How it works: while logging + in an instance + in combat, the head chunk string is
-  written into the SPELL_FAILED_* global error strings. The next failed cast makes the
-  client write that string as the SPELL_CAST_FAILED `failedType` field into
-  WoWCombatLog.txt. The server reassembles the chunks from the uploaded log.
+  How it works: while logging + in an instance (in OR out of combat), the head chunk
+  string is written into the SPELL_FAILED_* global error strings. The next failed cast
+  makes the client write that string as the SPELL_CAST_FAILED `failedType` field into
+  WoWCombatLog.txt. The server reassembles the chunks from the uploaded log. (v2.2.1:
+  out-of-combat coverage is what lets LOOT looted after a kill — incl. the LAST boss,
+  after which there's no more combat — still land on a post-kill failed cast.)
 
   Spike-confirmed on the Project Epoch client (2026-06-03): the sentinel lands at CLEU
   arg index 12, and the failedType field carries ~1023 chars (~950 usable after the
@@ -178,7 +180,15 @@ local function shouldBeActive()
     if testForce then return true end
     local _, instType = IsInInstance()
     if instType ~= "raid" and instType ~= "party" and instType ~= "pvp" then return false end
-    return UnitAffectingCombat("player") and true or false
+    -- Claude (v2.2.1): active for the WHOLE instance stay, not just while in combat.
+    -- Loot is captured at the kill (out of combat) and queued; keeping the relay armed
+    -- out of combat lets that chunk land on the next failed cast — critically for the
+    -- LAST boss, after which there is no further combat to carry it. Combat-only
+    -- producers (positions/buffs) are gated on UnitAffectingCombat at their OnUpdate call
+    -- sites so they don't begin relaying out of combat. The globals are only overwritten
+    -- while chunks are queued (onFailed restores them the moment the queue drains), so the
+    -- out-of-combat taint window stays proportional to pending data — usually nil.
+    return true
 end
 
 local function reevaluate()
@@ -537,6 +547,7 @@ local QUALITY_BY_COLOR = {
 local lootBuf   = {}     -- array of "itemID^qty^quality^M/D HH:MM:SS"
 local lootAccum = 0
 local lootSeq   = 0
+local lootNudged = false -- Claude (v2.2.1): throttle the out-of-combat "cast to save loot" reminder to once per fight
 local function lootCaptureOK()
     if not (LoggingCombat and LoggingCombat()) then return false end
     local _, instType = IsInInstance()
@@ -555,12 +566,22 @@ end
 local function flushLoot()
     if #lootBuf == 0 then return end
     local b64 = b64encode(table.concat(lootBuf, "\n"))
+    local n = #lootBuf
     lootBuf = {}
     lootSeq = lootSeq + 1
     local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
     for i = 1, total do
         local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
         enqueue(string.format("%s%s_%d_%d/%d]]%s", LT_PREFIX, session, lootSeq, i, total, piece))
+    end
+    -- Claude (v2.2.1): if this was looted OUT of combat (the usual case, and the only one
+    -- at risk — e.g. after the last boss there's no further combat to carry the chunk),
+    -- remind the player once that any failed cast lands it. In combat we stay silent — the
+    -- ongoing fight's failed casts carry it immediately. Reset per fight (PLAYER_REGEN_DISABLED).
+    if not (UnitAffectingCombat and UnitAffectingCombat("player")) and not lootNudged then
+        lootNudged = true
+        print(string.format("|cff66ccff[ConLogs]|r logged %d loot drop%s - cast any spell before leaving the instance to save %s to your log (an ability on cooldown counts).",
+            n, n == 1 and "" or "s", n == 1 and "it" or "them"))
     end
 end
 
@@ -584,6 +605,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
         captureLoot((select(1, ...)))
     elseif event == "PLAYER_REGEN_DISABLED" then
         reevaluate()
+        lootNudged = false   -- Claude (v2.2.1): new fight → re-allow one post-kill loot reminder
         -- Snapshot buffs at each pull; per-unit dedup means only changed sets relay
         -- (first pull captures the raid, later pulls are near-zero unless someone
         -- rebuffs). Gear stays once-per-version via enqueueGroupCI.
@@ -619,10 +641,12 @@ frame:SetScript("OnUpdate", function(self, elapsed)
         if tsAccum >= TELEMETRY_INTERVAL then
             tsAccum = 0
             broadcastSelfPos()
-            if active then enqueueTS() end
+            -- Claude (v2.2.1): explicit in-combat gate (active is no longer combat-only).
+            if active and UnitAffectingCombat("player") then enqueueTS() end
         end
     end
-    if active then
+    -- Claude (v2.2.1): buffs poll only in combat (active alone now spans the instance stay).
+    if active and UnitAffectingCombat("player") then
         buffAccum = buffAccum + (elapsed or 0)
         if buffAccum >= BUFF_POLL_INTERVAL then
             buffAccum = 0
@@ -630,8 +654,9 @@ frame:SetScript("OnUpdate", function(self, elapsed)
         end
     end
     -- Loot flush runs outside the `active` gate (loot is usually looted out of
-    -- combat). The chunk queue holds the enqueued chunk until the relay can write
-    -- it (next in-combat window); each row carries its own capture timestamp.
+    -- combat). The chunk queue holds the enqueued chunk until the next failed cast
+    -- carries it (v2.2.1: in OR out of combat, as long as you're still in the
+    -- instance); each row carries its own capture timestamp for boss attribution.
     if #lootBuf > 0 then
         lootAccum = lootAccum + (elapsed or 0)
         if lootAccum >= LOOT_FLUSH_DELAY then lootAccum = 0; flushLoot() end
