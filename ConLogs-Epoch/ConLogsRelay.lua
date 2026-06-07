@@ -617,7 +617,8 @@ local function flushLoot()
     -- at risk — e.g. after the last boss there's no further combat to carry the chunk),
     -- remind the player once that any failed cast lands it. In combat we stay silent — the
     -- ongoing fight's failed casts carry it immediately. Reset per fight (PLAYER_REGEN_DISABLED).
-    if runComplete and not (UnitAffectingCombat and UnitAffectingCombat("player")) and not lootNudged then
+    if runComplete and (LoggingCombat and LoggingCombat())
+        and not (UnitAffectingCombat and UnitAffectingCombat("player")) and not lootNudged then
         lootNudged = true
         print(string.format("|cff66ccff[ConLogs]|r logged %d loot drop%s - cast any spell before leaving the instance to save %s to your log (an ability on cooldown counts).",
             n, n == 1 and "" or "s", n == 1 and "it" or "them"))
