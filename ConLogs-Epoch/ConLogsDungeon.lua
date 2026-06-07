@@ -155,10 +155,19 @@ local DUNGEONS = {
                     -- No common first word — manual name retained.
                     { name = "Skeletons/Cadavers", mobs = {"Skeletal Berserker","Mangled Cadaver","Skeletal Guardian","Ravaged Cadaver"}, required = 25 },
                     { mobs = {"Plague Ghoul"},                                                                required = 6 },
-                    { mobs = {"Patchwerk Horror"},                                                            required = 1 },
+                    -- v2.1.2: "Patchwerk Horror" -> "Patchwork Horror". The real
+                    -- Epoch CLEU destName is "Patchwork"; the old "Patchwerk"
+                    -- spelling never matched, so this 1-of-1 bucket stayed at 0/1
+                    -- and blocked a full Strat-Live clear. Lockstep with the
+                    -- epoglogs server fix (db.js, v0.99.6).
+                    { mobs = {"Patchwork Horror"},                                                            required = 1 },
                     -- Crimson melee/caster collide on auto; manual disambiguation kept
                     -- (semantic split is more useful than a "(1)/(2)" numeric suffix).
-                    { name = "Crimson melee",      mobs = {"Crimson Gallant","Crimson Guardsman","Crimson Initiate","Crimson Conjurer"},  required = 14 },
+                    -- v2.1.2: "Crimson Conjurer" -> "Crimson Conjuror". Real Epoch
+                    -- destName is "Conjuror"; the typo silently dropped Conjuror
+                    -- kills from this bucket (undercount). Lockstep with epoglogs
+                    -- server fix (db.js, v0.99.6).
+                    { name = "Crimson melee",      mobs = {"Crimson Gallant","Crimson Guardsman","Crimson Initiate","Crimson Conjuror"},  required = 14 },
                     { name = "Crimson caster",     mobs = {"Crimson Sorcerer","Crimson Battle Mage","Crimson Monk"},                      required = 6 },
                 },
             },
@@ -171,7 +180,14 @@ local DUNGEONS = {
                     "Maleki the Pallid",
                     "Baroness Anastari",
                     "Ramstein the Gorger",
-                    "Lord Aurius Rivendare",
+                    -- v2.1.2: "Lord Aurius Rivendare" -> "Baron Rivendare". The
+                    -- final boss logs as "Baron Rivendare" (the actual 3.3.5
+                    -- destName) on Epoch, NOT the vanilla-lore "Lord Aurius
+                    -- Rivendare". He dies inside the add-pack, but the addon
+                    -- credits bosses purely by UNIT_DIED destName match, so the
+                    -- corrected string is all that's needed. Lockstep with the
+                    -- epoglogs server fix (db.js, v0.99.5).
+                    "Baron Rivendare",
                 },
                 trash = {
                     { name = "Skeletons/Cadavers", mobs = {"Skeletal Berserker","Mangled Cadaver","Skeletal Guardian","Ravaged Cadaver"}, required = 8 },
