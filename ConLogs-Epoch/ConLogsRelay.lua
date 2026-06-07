@@ -31,6 +31,8 @@ local PREFIX_FAMILY = "[[CL_"   -- landed-evidence family prefix (all our chunk 
 local CI_PREFIX     = "[[CL_CI_v1_"
 local TS_PREFIX     = "[[CL_TS_v1_"   -- telemetry snapshot (positions)
 local BU_PREFIX     = "[[CL_BU_v1_"   -- buff snapshot (pre-pull auras: self + own pet)
+local LT_PREFIX     = "[[CL_LT_v1_"   -- loot drops (item id/qty/quality/timestamp per row)
+local LOOT_FLUSH_DELAY = 3.0          -- seconds to batch loot events into one chunk
 local TELEMETRY_INTERVAL = 2.0        -- seconds between position snapshots
 local BUFF_POLL_INTERVAL = 3.0        -- seconds between buff-aura polls (catches juju/totem up/down edges)
 local CHUNK_BODY    = 850       -- base64 chars per chunk (field cap ~1023, header ~46)
@@ -520,6 +522,48 @@ local function onFailed(...)
     pending = queue[1].chunk
 end
 
+--==========================================================================--
+-- loot producer (LT) — capture what dropped during a logged instance run via
+-- CHAT_MSG_LOOT, batch a few seconds of events into one chunk, enqueue. Quality
+-- is read from the item link's colour (no GetItemInfo dependency). Uncommon+ only.
+-- Timestamp is emitted in the SAME combat-log format (date "%m/%d %H:%M:%S") so the
+-- server can map each drop onto the fight timeline (boss attribution) — even though
+-- the chunk itself only relays at the next in-combat window. "What dropped" only:
+-- no looter name is captured (per site design).
+--==========================================================================--
+local QUALITY_BY_COLOR = {
+    ["1eff00"] = 2, ["0070dd"] = 3, ["a335ee"] = 4, ["ff8000"] = 5, ["e6cc80"] = 6, ["e5cc80"] = 6,
+}
+local lootBuf   = {}     -- array of "itemID^qty^quality^M/D HH:MM:SS"
+local lootAccum = 0
+local lootSeq   = 0
+local function lootCaptureOK()
+    if not (LoggingCombat and LoggingCombat()) then return false end
+    local _, instType = IsInInstance()
+    return instType == "raid" or instType == "party"
+end
+local function captureLoot(msg)
+    if type(msg) ~= "string" or not lootCaptureOK() then return end
+    local itemID = msg:match("|Hitem:(%d+)")
+    if not itemID then return end
+    local color   = msg:match("|cff(%x%x%x%x%x%x)|Hitem")
+    local quality = (color and QUALITY_BY_COLOR[color:lower()]) or 1
+    if quality < 2 then return end -- skip poor/common vendor trash
+    local qty = tonumber(msg:match("|h|rx(%d+)") or msg:match("x(%d+)%.?$") or "1") or 1
+    lootBuf[#lootBuf + 1] = string.format("%s^%d^%d^%s", itemID, qty, quality, date("%m/%d %H:%M:%S"))
+end
+local function flushLoot()
+    if #lootBuf == 0 then return end
+    local b64 = b64encode(table.concat(lootBuf, "\n"))
+    lootBuf = {}
+    lootSeq = lootSeq + 1
+    local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
+    for i = 1, total do
+        local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
+        enqueue(string.format("%s%s_%d_%d/%d]]%s", LT_PREFIX, session, lootSeq, i, total, piece))
+    end
+end
+
 local frame = CreateFrame("Frame")
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "COMBAT_LOG_EVENT_UNFILTERED" then
@@ -536,6 +580,8 @@ frame:SetScript("OnEvent", function(self, event, ...)
                 peerPos[g] = { x = tonumber(x) or 0, y = tonumber(y) or 0, floor = tonumber(fl) or 0, recvAt = GetTime() or 0 }
             end
         end
+    elseif event == "CHAT_MSG_LOOT" then
+        captureLoot((select(1, ...)))
     elseif event == "PLAYER_REGEN_DISABLED" then
         reevaluate()
         -- Snapshot buffs at each pull; per-unit dedup means only changed sets relay
@@ -583,9 +629,19 @@ frame:SetScript("OnUpdate", function(self, elapsed)
             enqueueBuffs(false)
         end
     end
+    -- Loot flush runs outside the `active` gate (loot is usually looted out of
+    -- combat). The chunk queue holds the enqueued chunk until the relay can write
+    -- it (next in-combat window); each row carries its own capture timestamp.
+    if #lootBuf > 0 then
+        lootAccum = lootAccum + (elapsed or 0)
+        if lootAccum >= LOOT_FLUSH_DELAY then lootAccum = 0; flushLoot() end
+    else
+        lootAccum = 0
+    end
 end)
 frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 frame:RegisterEvent("CHAT_MSG_ADDON")
+frame:RegisterEvent("CHAT_MSG_LOOT")
 frame:RegisterEvent("PLAYER_REGEN_DISABLED")
 frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
