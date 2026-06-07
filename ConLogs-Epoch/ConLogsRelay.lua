@@ -579,6 +579,13 @@ local lootBuf   = {}     -- array of "itemID^qty^quality^M/D HH:MM:SS"
 local lootAccum = 0
 local lootSeq   = 0
 local lootNudged = false -- Claude (v2.2.1): throttle the out-of-combat "cast to save loot" reminder to once per fight
+-- Set true by ConLogsDungeon (via _G.ConLogs_OnRunComplete) when ALL roster bosses are
+-- down — i.e. the last boss is dead and there may be no more combat to carry chunks.
+-- The loot reminder only fires when this is set, so it shows ONCE at end-of-run instead
+-- of after every trash pack. Reset on zone change (new run). Loot during the run still
+-- relays silently — ongoing combat carries those chunks.
+local runComplete = false
+_G.ConLogs_OnRunComplete = function() runComplete = true end
 local function lootCaptureOK()
     if not (LoggingCombat and LoggingCombat()) then return false end
     local _, instType = IsInInstance()
@@ -610,7 +617,7 @@ local function flushLoot()
     -- at risk — e.g. after the last boss there's no further combat to carry the chunk),
     -- remind the player once that any failed cast lands it. In combat we stay silent — the
     -- ongoing fight's failed casts carry it immediately. Reset per fight (PLAYER_REGEN_DISABLED).
-    if not (UnitAffectingCombat and UnitAffectingCombat("player")) and not lootNudged then
+    if runComplete and not (UnitAffectingCombat and UnitAffectingCombat("player")) and not lootNudged then
         lootNudged = true
         print(string.format("|cff66ccff[ConLogs]|r logged %d loot drop%s - cast any spell before leaving the instance to save %s to your log (an ability on cooldown counts).",
             n, n == 1 and "" or "s", n == 1 and "it" or "them"))
@@ -644,6 +651,10 @@ frame:SetScript("OnEvent", function(self, event, ...)
         if active then enqueueGroupCI(false); enqueueBuffs(false); enqueueVersion() end
     elseif event == "PLAYER_REGEN_ENABLED" or event == "ZONE_CHANGED_NEW_AREA"
         or event == "PLAYER_ENTERING_WORLD" then
+        -- New zone = new run → re-arm the end-of-run loot reminder. NOT on REGEN_ENABLED:
+        -- the last boss's loot flushes out of combat, so clearing on combat-end would
+        -- suppress the one reminder we actually want.
+        if event ~= "PLAYER_REGEN_ENABLED" then runComplete = false; lootNudged = false end
         reevaluate()
     elseif event == "PLAYER_LOGOUT" or event == "PLAYER_LEAVING_WORLD" then
         -- Restore unconditionally on every teardown path (logout, /reload, zoning out

@@ -667,6 +667,18 @@ local function OnBossKilled(bossName)
     print(string.format("|cffffaa44ConLogs|r: |cff66ff66boss down|r - %s", bossName))
 
     if frame and frame.UpdateUI then frame.UpdateUI() end
+
+    -- Signal the relay when ALL roster bosses are down (last boss killed), so its
+    -- "cast to save loot" reminder fires ONCE at end-of-run instead of per trash pack.
+    -- By the last kill the variant is resolved, so GetCurrentBosses is the real roster.
+    local bosses = GetCurrentBosses()
+    if #bosses > 0 then
+        local killed = 0
+        for _, b in ipairs(bosses) do if bossKillTimes[b] then killed = killed + 1 end end
+        if killed >= #bosses and _G.ConLogs_OnRunComplete then
+            _G.ConLogs_OnRunComplete()
+        end
+    end
 end
 
 -- ============================================================================
