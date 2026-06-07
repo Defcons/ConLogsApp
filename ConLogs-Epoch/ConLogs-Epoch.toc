@@ -3,7 +3,7 @@
 ## Notes: ConLogs for Project Epoch. Made by Defcon. Mesh-based gear inspector (formerly EpogArmory): every client scans groupmates in dungeons/raids, broadcasts gear via addon messages, and stores received broadcasts in ConLogsDB for upload to epoglogs.com.
 ## X-Credits: Made by Defcon
 ## Author: Defcon
-## Version: 2.3.2
+## Version: 2.4.0
 ## SavedVariables: ConLogsDB, ConLogsItemCacheDB, ConLogsTalentTreeDB, ConLogsSpikeDB
 
 ConLogs.lua
