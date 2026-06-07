@@ -34,6 +34,7 @@ local CI_PREFIX     = "[[CL_CI_v1_"
 local TS_PREFIX     = "[[CL_TS_v1_"   -- telemetry snapshot (positions)
 local BU_PREFIX     = "[[CL_BU_v1_"   -- buff snapshot (pre-pull auras: self + own pet)
 local LT_PREFIX     = "[[CL_LT_v1_"   -- loot drops (item id/qty/quality/timestamp per row)
+local VR_PREFIX     = "[[CL_VR_v1_"   -- addon version string (one tiny chunk per session)
 local LOOT_FLUSH_DELAY = 3.0          -- seconds to batch loot events into one chunk
 local TELEMETRY_INTERVAL = 2.0        -- seconds between position snapshots
 local BUFF_POLL_INTERVAL = 3.0        -- seconds between buff-aura polls (catches juju/totem up/down edges)
@@ -283,6 +284,20 @@ local function enqueueGroupCI(force)
         end
     end
     return n
+end
+
+-- Claude (v2.3.0): relay the addon's OWN version once per session, so the server can
+-- tell which addon build produced a log — and the website can nudge uploaders on an
+-- older-than-latest build to update for the most detailed parse. One tiny VR chunk
+-- (version string only); enqueued at the first pull alongside CI/buffs. Re-offered if
+-- it doesn't land (versionRelayed flips only on land); a rare duplicate is harmless
+-- (the server just re-reads the same version).
+local versionRelayed = false
+local function enqueueVersion()
+    if versionRelayed then return end
+    local ver = (GetAddOnMetadata and GetAddOnMetadata("ConLogs-Epoch", "Version")) or "0"
+    enqueue(string.format("%s%s_%d_%d/%d]]%s", VR_PREFIX, session, 1, 1, 1, b64encode(ver)),
+        function() versionRelayed = true end)
 end
 
 --==========================================================================--
@@ -626,7 +641,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
         -- Snapshot buffs at each pull; per-unit dedup means only changed sets relay
         -- (first pull captures the raid, later pulls are near-zero unless someone
         -- rebuffs). Gear stays once-per-version via enqueueGroupCI.
-        if active then enqueueGroupCI(false); enqueueBuffs(false) end
+        if active then enqueueGroupCI(false); enqueueBuffs(false); enqueueVersion() end
     elseif event == "PLAYER_REGEN_ENABLED" or event == "ZONE_CHANGED_NEW_AREA"
         or event == "PLAYER_ENTERING_WORLD" then
         reevaluate()
