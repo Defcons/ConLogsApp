@@ -592,6 +592,15 @@ local function lootCaptureOK()
     -- Claude (v2.2.3): zoneOverrideActive() lets mis-typed zones (Tol Barad) capture loot.
     return instType == "raid" or instType == "party" or zoneOverrideActive()
 end
+-- Claude (v2.3.2): de-spam loot capture. Project Epoch re-fires CHAT_MSG_LOOT for the
+-- SAME drop many times (observed ~7 identical events per item — visible as the in-game
+-- loot-message spam). Without dedup that produced 300+ rows from one Strat run (a single
+-- common item appeared 104×) and flooded the site's Loot tab. We collapse repeats of the
+-- same item+qty seen within LOOT_DEDUP_WINDOW seconds; the window resets on every hit, so
+-- a sustained spam burst stays collapsed while genuinely separate drops (spaced further
+-- apart) are still captured. Keyed on itemID^qty so a different stack size still counts.
+local LOOT_DEDUP_WINDOW = 5      -- seconds
+local lootSeen = {}             -- "itemID^qty" -> last GetTime() it was seen
 local function captureLoot(msg)
     if type(msg) ~= "string" or not lootCaptureOK() then return end
     local itemID = msg:match("|Hitem:(%d+)")
@@ -600,6 +609,12 @@ local function captureLoot(msg)
     local quality = (color and QUALITY_BY_COLOR[color:lower()]) or 1
     if quality < 2 then return end -- skip poor/common vendor trash
     local qty = tonumber(msg:match("|h|rx(%d+)") or msg:match("x(%d+)%.?$") or "1") or 1
+    -- de-spam: ignore a repeat of the same item+qty within the dedup window
+    local now  = GetTime() or 0
+    local key  = itemID .. "^" .. qty
+    local prev = lootSeen[key]
+    lootSeen[key] = now
+    if prev and (now - prev) < LOOT_DEDUP_WINDOW then return end
     lootBuf[#lootBuf + 1] = string.format("%s^%d^%d^%s", itemID, qty, quality, date("%m/%d %H:%M:%S"))
 end
 local function flushLoot()
