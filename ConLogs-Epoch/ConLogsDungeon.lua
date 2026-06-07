@@ -393,6 +393,12 @@ local function DetectDungeon()
     if instanceType ~= "party" and instanceType ~= "raid" then return nil end
     local name = GetInstanceInfo()
     if name and DUNGEONS[name] then return name end
+    -- Fallback: some PE instances report a PARENT-zone name via GetInstanceInfo
+    -- (confirmed: Baradin Hold → "Tol Barad") while GetRealZoneText gives the real
+    -- instance name. We're already confirmed inside a party/raid instance, so a
+    -- zone-name match against the roster is safe (no open-world false positive).
+    local zone = GetRealZoneText and GetRealZoneText()
+    if zone and zone ~= name and DUNGEONS[zone] then return zone end
     return nil
 end
 
