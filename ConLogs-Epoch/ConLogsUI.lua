@@ -2587,6 +2587,11 @@ local function BuildMinimapButton()
     b:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
         GameTooltip:SetText("ConLogs")
+        -- Claude (v2.2.2): show the installed addon version as a dim subtitle under the
+        -- title. Read from the .toc via GetAddOnMetadata so it always matches the release
+        -- (no hardcoding to drift out of sync on the next version bump).
+        local _ver = (GetAddOnMetadata and GetAddOnMetadata("ConLogs-Epoch", "Version")) or nil
+        if _ver then GameTooltip:AddLine("v" .. _ver, 0.6, 0.6, 0.6) end
         -- Combat-logging status: the relay (gear/buffs/positions) only writes into
         -- WoWCombatLog.txt while /combatlog is active, so surface it prominently at
         -- the top — re-evaluated on every hover, so it's always current.
