@@ -63,7 +63,12 @@ local PREFIX = "EpogArmory"
 --     touch. See CACHE_SCHEMA's own comment block for the schema version log.
 -- ============================================================================
 local PROTO = "1"
-local ADDON_VERSION = GetAddOnMetadata(ADDON, "Version") or "0"
+-- Runtime version. Hardcoded (NOT GetAddOnMetadata) on purpose: GetAddOnMetadata reads
+-- the .toc as cached at client LAUNCH and is NOT refreshed by /reload, so the minimap
+-- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
+-- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
+-- KEEP THIS IN SYNC with the .toc "## Version" on every release.
+local ADDON_VERSION = "2.4.0"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -3534,6 +3539,10 @@ end
 -- Public namespace — used by the UI for cross-file access to helpers that
 -- need to live in ConLogs.lua (for scoping / state reasons).
 _G.ConLogs = _G.ConLogs or {}
+
+-- Runtime version for the UI (minimap tooltip). Reflects the loaded build on every
+-- /reload, unlike GetAddOnMetadata which is cached at client launch.
+_G.ConLogs.VERSION = ADDON_VERSION
 
 -- v0.37: expose sync-state accessors for the UI's Scanners view.
 _G.ConLogs.IsPeerSyncActive = function(name)
