@@ -36,7 +36,7 @@ local BU_PREFIX     = "[[CL_BU_v1_"   -- buff snapshot (pre-pull auras: self + o
 local LT_PREFIX     = "[[CL_LT_v1_"   -- loot drops (item id/qty/quality/timestamp per row)
 local VR_PREFIX     = "[[CL_VR_v1_"   -- addon version string (one tiny chunk per session)
 local LOOT_FLUSH_DELAY = 3.0          -- seconds to batch loot events into one chunk
-local TELEMETRY_INTERVAL = 2.0        -- seconds between position snapshots
+local TELEMETRY_INTERVAL = 3.0        -- Claude (v2.5.1): 2.0 -> 3.0s between position snapshots (less per-tick overhead; POS_TTL=5 still covers it)
 local BUFF_POLL_INTERVAL = 3.0        -- seconds between buff-aura polls (catches juju/totem up/down edges)
 local CHUNK_BODY    = 850       -- base64 chars per chunk (field cap ~1023, header ~46)
 local QUEUE_MAX     = 400       -- ring cap
@@ -95,11 +95,29 @@ local pending = nil   -- forward-declared (used by enqueue's resync); the chunk 
 -- baseline AFTER the data reached the log, never on mere enqueue (so a chunk that's
 -- TTL-evicted/ring-dropped before landing gets re-offered instead of lost).
 local queue = {}
-local function enqueue(chunk, onLand)
-    queue[#queue + 1] = { chunk = chunk, exp = (time() or 0) + CHUNK_TTL, onLand = onLand }
+-- Claude (v2.5.1): priority lanes. The failed-cast budget is shared across ALL kinds
+-- (~9 chunks/min organic), so small high-value payloads must not starve behind a BU
+-- backlog. Lower number = drains first: VR (tiny, once) > LT (loot) > CI (gear) > BU
+-- (buff snapshots) > TS (positions). The queue stays ordered by prio (stable/FIFO within
+-- a lane). The in-flight head (index 1, already written to the globals) is NEVER displaced
+-- — the landed-evidence model in onFailed assumes queue[1] is what the next failed cast
+-- carries — so new chunks insert among positions 2..N only.
+local PRIO_VR, PRIO_LT, PRIO_CI, PRIO_BU, PRIO_TS = 0, 1, 2, 3, 4
+local function enqueue(chunk, onLand, prio)
+    prio = prio or PRIO_BU
+    local entry = { chunk = chunk, exp = (time() or 0) + CHUNK_TTL, onLand = onLand, prio = prio }
+    -- Insert before the first position >=2 holding a lower-priority (higher-number) chunk;
+    -- else append. Never touches index 1.
+    local at = #queue + 1
+    for i = 2, #queue do
+        if queue[i].prio > prio then at = i; break end
+    end
+    table.insert(queue, at, entry)
     if #queue > QUEUE_MAX then
-        table.remove(queue, 1) -- drop oldest, unrelayed → its onLand is intentionally NOT called
-        pending = nil          -- the evicted head may be the applied chunk; resync landed-tracking
+        -- Over cap: drop the LOWEST-priority newest chunk (the tail), protecting the
+        -- in-flight head and all higher-value chunks. Its onLand is intentionally NOT
+        -- called, so the data is simply re-offered by the next snapshot.
+        table.remove(queue)
     end
 end
 
@@ -255,7 +273,7 @@ local function enqueueCI(guid, raw, onLand)
         -- Attach the dedup-commit to the LAST chunk so the baseline only advances
         -- once the full payload has landed.
         enqueue(string.format("%s%s_%s_%d/%d]]%s", CI_PREFIX, session, short, i, total, piece),
-            (i == total) and onLand or nil)
+            (i == total) and onLand or nil, PRIO_CI)
     end
     return total
 end
@@ -297,7 +315,7 @@ local function enqueueVersion()
     if versionRelayed then return end
     local ver = (GetAddOnMetadata and GetAddOnMetadata("ConLogs-Epoch", "Version")) or "0"
     enqueue(string.format("%s%s_%d_%d/%d]]%s", VR_PREFIX, session, 1, 1, 1, b64encode(ver)),
-        function() versionRelayed = true end)
+        function() versionRelayed = true end, PRIO_VR)
 end
 
 --==========================================================================--
@@ -317,6 +335,15 @@ local POS_PREFIX  = "ConLogsPos"   -- DEDICATED addon-message prefix for the pos
                                    -- kept separate from the gear mesh's "EpogArmory" prefix
                                    -- so position broadcasts never hit the gear reassembly path.
 local POS_TTL     = 5              -- seconds; drop peer positions older than this
+-- Claude (v2.5.1) PERF: cache "this zone has no usable replay map" so the position
+-- producer stops doing the SetMapToCurrentZone "dance" every 2s. Inside every PvE raid/
+-- dungeon GetPlayerMapPosition("player") returns 0,0, so withCurrentZoneMap can't take its
+-- fast path and calls SetMapToCurrentZone + SetMapZoom each tick — only to read a continent
+-- fallback we then discard (TS stays empty). That world-map state mutation is engine-side
+-- expensive and recurs every 2s for EVERY addon user in combat (logger or not) → a real,
+-- raid-wide FPS hitch. With the cache we dance at most a couple of times per zone, then go
+-- silent. Re-armed on every zone change (see OnEvent ZONE_CHANGED_NEW_AREA/ENTERING_WORLD).
+local posMapUnusable = false
 
 -- Continent/world maps that signal a fallback (NOT a usable replay map).
 local CONTINENT_MAPS = {
@@ -383,7 +410,14 @@ local function broadcastSelfPos()
     local _, instType = IsInInstance()
     if instType ~= "party" and instType ~= "raid" then return end
     local x, y, mapFile, floor = readSelfPos()
-    if not isReplayMap(mapFile) then return end
+    if not isReplayMap(mapFile) then
+        -- Claude (v2.5.1): a non-empty continent name ("Kalimdor"…) is stable for the whole
+        -- instance → cache it so the OnUpdate gate stops the per-tick map dance. An empty
+        -- mapFile is the transient post-zone-in state; keep retrying until the real map
+        -- resolves (a few ticks at most), then cache.
+        if mapFile ~= "" then posMapUnusable = true end
+        return
+    end
     if not (x and y and (x ~= 0 or y ~= 0)) then return end
     local g = (UnitGUID("player") or ""):gsub("^0x", "")
     if g == "" or type(SendAddonMessage) ~= "function" then return end
@@ -434,7 +468,7 @@ local function enqueueTS()
     local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
     for i = 1, total do
         local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
-        enqueue(string.format("%s%s_%d_%d/%d]]%s", TS_PREFIX, session, snapId, i, total, piece))
+        enqueue(string.format("%s%s_%d_%d/%d]]%s", TS_PREFIX, session, snapId, i, total, piece), nil, PRIO_TS)
     end
 end
 
@@ -451,41 +485,71 @@ end
 -- Both feed the same BU stream; the server injects synthetic APPLIED at the first
 -- snapshot a buff appears in, and REMOVED at the snapshot it disappears from.
 --
--- We scan the WHOLE group (self, pets, every raid/party member). Self + own pet are
--- always complete; OTHER raiders are range-limited on PE — out-of-range UnitAura
--- typically returns nothing, so those units just produce empty blocks and are
--- skipped (no harm). We relay them speculatively anyway: if PE happens to expose
--- in-range raiders' auras, the data's already in the log — and the spike `buffs`
--- probe + the relayed [[CL_BU_ lines together confirm exactly how much landed,
--- without waiting for a second raid. The self-snapshot mesh remains the guaranteed
--- path (every ConLogs user relays their own complete list).
+-- Claude (v2.5.1): we scan SELF + own pet only (was whole-raid — see buffUnitTokens), and
+-- only the curated blind-spot allowlist (see readAuras). A whole-raid full-aura snapshot was
+-- 28-47 chunks and NEVER completed against the ~9 chunks/min failed-cast budget; self+pet
+-- curated is ~1 chunk and completes atomically. The MESH-OF-SELF gives per-player breadth:
+-- every ConLogs user relays their own buffs in their own log, and merged groups stitch them.
 --
--- Per-unit dedup: a unit's auras are only relayed when its set CHANGES (pre-pull
--- buffs are static across pulls, so after the first pull this is near-zero). The
--- server uses the latest snapshot before each fight start, so unchanged = carry
--- forward. Keeps per-pull cost tiny while still catching rebuffs/expiries.
--- Payload: BU|<getTimeMs>|<unixSec>|<guidHex>=<spellId>~<name>,<spellId>~<name>|<guidHex>=...
+-- Per-unit dedup: a unit's (allowlisted) aura set is relayed only when it CHANGES — the
+-- first pull captures the static pre-pull buffs, later polls relay just totem/juju up/down
+-- edges. The server carries an unchanged unit forward. Restricting to the stable allowlist is
+-- what keeps "changed" rare (volatile procs/forms are excluded, so they don't trigger re-sends).
+-- Payload: BU|<getTimeMs>|<unixSec>|<M/D HH:MM:SS>|<guidHex>=<spellId>~<name>,…|<guidHex>=…
 -- Delimiters |=,~ never occur in 3.3.5 buff names; the whole payload is base64'd anyway.
 --==========================================================================--
+-- Claude (v2.5.1): curated blind-spot allowlist. BU only needs the buffs the combat log
+-- CAN'T otherwise show — totems (emit NO aura events at all), jujus/flasks/food/elixirs
+-- (pre-pull, applied before /combatlog), world buffs, and the stable raid auras/blessings.
+-- Buffs that DO emit SPELL_AURA_APPLIED are tracked by the parser from real CLEU and are
+-- de-duped away server-side, so relaying them is wasted budget. Critically, this EXCLUDES
+-- volatile self-buffs (procs, combo abilities like Slice and Dice, shapeshift forms): their
+-- constant flicker would flip the per-unit dedup every poll and re-flood the queue — the
+-- exact failure that left BU at 0% completion. Substring match (case-sensitive 3.3.5 names)
+-- so new Epoch blessings/auras are caught without an ID table. Note: the totem AURA names
+-- ("Strength of Earth", "Grace of Air", "Mana Spring") contain no "Totem", so they're listed
+-- explicitly. Errs toward under-relaying (miss an unknown buff) over churn.
+local RELAY_BUFF_SUBSTRINGS = {
+    -- totem auras (the granted buff names — distinct from the "* Totem" object names)
+    "Totem", "Strength of Earth", "Grace of Air", "Mana Spring", "Stoneskin",
+    "Windfury", "Flametongue", "Frostbrand", "Healing Stream", "Mana Tide",
+    "Tranquil Air", "Grounding", "Wrath of Air",
+    -- blessings / paladin + hunter + druid auras
+    "Blessing", "Aura", "Sanctity", "Devotion", "Concentration", "Retribution",
+    "Trueshot", "Moonkin", "Leader of the Pack", "Ferocious",
+    -- raid-wide caster/healer/warrior buffs
+    "Gift of the Wild", "Mark of the Wild", "Prayer of", "Fortitude", "Spirit",
+    "Intellect", "Brilliance", "Shout", "Inspiration", "Unleashed Rage",
+    -- consumables / world buffs
+    "Flask", "Elixir", "Well Fed", "Juju", "Scroll", "Resistance", "Knowledge",
+}
+local function isRelayBuff(name)
+    if type(name) ~= "string" then return false end
+    for _, s in ipairs(RELAY_BUFF_SUBSTRINGS) do
+        if name:find(s, 1, true) then return true end
+    end
+    return false
+end
 local function readAuras(unit)
     local list = {}
     for i = 1, 40 do
         local name, _, _, _, _, _, _, _, _, _, spellId = UnitAura(unit, i, "HELPFUL")
         if not name then break end
-        list[#list + 1] = string.format("%s~%s", tostring(spellId or 0), name)
+        if isRelayBuff(name) then
+            list[#list + 1] = string.format("%s~%s", tostring(spellId or 0), name)
+        end
     end
     return list
 end
 
+-- Claude (v2.5.1): SELF + own pet ONLY. The whole-raid scan produced 28-47-chunk payloads
+-- that never completed (the failed-cast budget is ~9 chunks/min, and a fresh full-raid
+-- snapshot enqueued every 3s buried the queue). Self+pet curated is ~1 chunk and completes
+-- atomically. Per-player breadth comes from the MESH-OF-SELF — every ConLogs user relays
+-- their OWN buffs in their OWN log, and merged raid groups stitch the loggers together —
+-- so one log no longer has to (and never successfully did) carry the whole raid.
 local function buffUnitTokens()
-    local units = { "player", "pet" }
-    local raidN = GetNumRaidMembers() or 0
-    if raidN > 0 then
-        for i = 1, raidN do units[#units + 1] = "raid" .. i; units[#units + 1] = "raidpet" .. i end
-    else
-        for i = 1, (GetNumPartyMembers() or 0) do units[#units + 1] = "party" .. i; units[#units + 1] = "partypet" .. i end
-    end
-    return units
+    return { "player", "pet" }
 end
 
 local buffSnapId = 0
@@ -518,7 +582,12 @@ local function captureBuffs(force)
         end
     end
     if #blocks == 0 then return nil end
-    local payload = string.format("BU|%d|%d|%s", math.floor((GetTime() or 0) * 1000), time() or 0, table.concat(blocks, "|"))
+    -- Claude (v2.5.1): field 4 is a combat-log-format date stamp (same as LT). It lets the
+    -- server rebase this snapshot onto the fight timeline exactly (synth aura windows compare
+    -- to fight.startMs) instead of guessing from the failed-cast line that finally carried it.
+    -- The server tells label-vs-block apart by the '=' every block has and a date never does.
+    local payload = string.format("BU|%d|%d|%s|%s",
+        math.floor((GetTime() or 0) * 1000), time() or 0, date("%m/%d %H:%M:%S"), table.concat(blocks, "|"))
     local commit = function() for g, v in pairs(updates) do relayedBuffs[g] = v end end
     return payload, commit
 end
@@ -533,7 +602,7 @@ local function enqueueBuffs(force)
         local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
         -- commit on the LAST chunk's landing only
         enqueue(string.format("%s%s_%d_%d/%d]]%s", BU_PREFIX, session, buffSnapId, i, total, piece),
-            (i == total) and commit or nil)
+            (i == total) and commit or nil, PRIO_BU)
     end
     return total
 end
@@ -626,7 +695,7 @@ local function flushLoot()
     local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
     for i = 1, total do
         local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
-        enqueue(string.format("%s%s_%d_%d/%d]]%s", LT_PREFIX, session, lootSeq, i, total, piece))
+        enqueue(string.format("%s%s_%d_%d/%d]]%s", LT_PREFIX, session, lootSeq, i, total, piece), nil, PRIO_LT)
     end
     -- Claude (v2.2.1): if this was looted OUT of combat (the usual case, and the only one
     -- at risk — e.g. after the last boss there's no further combat to carry the chunk),
@@ -670,7 +739,9 @@ frame:SetScript("OnEvent", function(self, event, ...)
         -- New zone = new run → re-arm the end-of-run loot reminder. NOT on REGEN_ENABLED:
         -- the last boss's loot flushes out of combat, so clearing on combat-end would
         -- suppress the one reminder we actually want.
-        if event ~= "PLAYER_REGEN_ENABLED" then runComplete = false; lootNudged = false end
+        -- Claude (v2.5.1): re-arm the position map-usability probe on every real zone change
+        -- (a new instance may have a usable map; a continent may not).
+        if event ~= "PLAYER_REGEN_ENABLED" then runComplete = false; lootNudged = false; posMapUnusable = false end
         reevaluate()
     elseif event == "PLAYER_LOGOUT" or event == "PLAYER_LEAVING_WORLD" then
         -- Restore unconditionally on every teardown path (logout, /reload, zoning out
@@ -690,18 +761,23 @@ end)
 --    any unit whose set changed; captures uptime for buffs the log emits no events for
 --    (jujus, totems) via the up/down edges. Dedup keeps steady-state at zero chunks.
 -- Seed the position accumulator with a random phase so clients in a big raid don't
--- all broadcast on the same 2s boundary (desyncs the addon-channel pulses; each
--- client still sends once per interval).
+-- all broadcast on the same interval boundary (desyncs the addon-channel pulses; each
+-- client still sends once per TELEMETRY_INTERVAL).
 local tsAccum  = (math.random and (math.random() * TELEMETRY_INTERVAL)) or 0
 local buffAccum = 0
 frame:SetScript("OnUpdate", function(self, elapsed)
-    if positionsEnabled() then
+    -- Claude (v2.5.1) PERF: skip the entire position producer (incl. the SetMapToCurrentZone
+    -- dance) once this zone is known to have no usable replay map. broadcastSelfPos sets
+    -- posMapUnusable on the first failed read; it re-arms on zone change.
+    if positionsEnabled() and not posMapUnusable then
         tsAccum = tsAccum + (elapsed or 0)
         if tsAccum >= TELEMETRY_INTERVAL then
             tsAccum = 0
             broadcastSelfPos()
             -- Claude (v2.2.1): explicit in-combat gate (active is no longer combat-only).
-            if active and UnitAffectingCombat("player") then enqueueTS() end
+            -- Claude (v2.5.1): re-check posMapUnusable — broadcastSelfPos may have just set it
+            -- this tick, and enqueueTS→captureSnapshot would otherwise do its own map dance.
+            if active and not posMapUnusable and UnitAffectingCombat("player") then enqueueTS() end
         end
     end
     -- Claude (v2.2.1): buffs poll only in combat (active alone now spans the instance stay).
