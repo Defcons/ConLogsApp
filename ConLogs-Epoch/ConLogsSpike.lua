@@ -456,6 +456,45 @@ local function cmdBuffs()
     out("Stored to ConLogsSpikeDB.buffProbe (reload/logout to flush the file).")
 end
 
+-- AURA SEARCH. Scan everyone (self, raid/party, pets) for a HELPFUL aura whose name
+-- contains <query> (case-insensitive) and print who has it + time left. Use to check
+-- totem/stat buffs live, e.g. /conlogs spike aura strength | grace | earth | totem.
+local function cmdAura(query)
+    query = (query or ""):gsub("^%s+",""):gsub("%s+$",""):lower()
+    if query == "" then
+        out("usage: /conlogs spike aura <name substring>  e.g. strength | agility | grace | earth | totem")
+        return
+    end
+    if type(UnitAura) ~= "function" then bad("UnitAura not available on this client."); return end
+    local units = {}
+    local raidN = GetNumRaidMembers() or 0
+    if raidN > 0 then
+        for i = 1, raidN do units[#units + 1] = "raid" .. i; units[#units + 1] = "raidpet" .. i end
+    else
+        units[#units + 1] = "player"; units[#units + 1] = "pet"
+        for i = 1, (GetNumPartyMembers() or 0) do units[#units + 1] = "party" .. i; units[#units + 1] = "partypet" .. i end
+    end
+    out(("=== aura search: '%s' ==="):format(query))
+    local hits, withAura, scanned = 0, 0, 0
+    for _, u in ipairs(units) do
+        if UnitExists(u) then
+            scanned = scanned + 1
+            local found = false
+            for i = 1, 40 do
+                local name, _, _, _, _, _, expiration = UnitAura(u, i, "HELPFUL")
+                if not name then break end
+                if name:lower():find(query, 1, true) then
+                    local left = (expiration and expiration > 0) and math.floor(expiration - (GetTime() or 0)) or nil
+                    out(("  %-12s %s%s"):format(UnitName(u) or u, name, left and (" |cff888888("..left.."s)|r") or ""))
+                    hits = hits + 1; found = true
+                end
+            end
+            if found then withAura = withAura + 1 end
+        end
+    end
+    good(("%d match(es) on %d/%d units."):format(hits, withAura, scanned))
+end
+
 local function spikeHelp()
     out("Phase-2 feasibility probe (debug). Sub-commands:")
     out("  /conlogs spike pos        — probe positions for your group")
@@ -463,6 +502,7 @@ local function spikeHelp()
     out("  /conlogs spike size       — max-payload test (then fail a cast)")
     out("  /conlogs spike unitpos    — probe for any API that reads OTHER units' positions")
     out("  /conlogs spike buffs      — probe whether OTHER raiders' buffs are readable (range test)")
+    out("  /conlogs spike aura <txt> — who has a buff matching <txt> (e.g. strength, grace, earth)")
     out("  /conlogs spike relaystop  — stop the active test + restore globals")
     out("  /conlogs spike dump       — show stored results")
 end
@@ -480,6 +520,7 @@ SlashCmdList["CONLOGS"] = function(msg)
         elseif sub == "size" then sizeStart()
         elseif sub == "unitpos" then cmdUnitPos()
         elseif sub == "buffs" then cmdBuffs()
+        elseif sub == "aura" then cmdAura((arg or ""):match("^%S*%s+(.*)$"))
         elseif sub == "relaystop" or sub == "stop" then testStop()
         elseif sub == "dump" then dumpDB()
         else spikeHelp() end
