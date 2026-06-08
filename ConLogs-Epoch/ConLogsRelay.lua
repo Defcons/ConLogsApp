@@ -24,6 +24,10 @@
   them in; a battleground exposes everyone to one logger). A map-validity guard relays
   NOTHING on continent fallbacks (e.g. Onyxia, no instance map), making default-on safe.
   Disable positions with `/conlogs relay pos off`, or the whole relay with `relay off`.
+  Pet->owner (PO) DEFAULT ON — a tiny snapshot of each group member's pet GUID -> owner,
+  read straight from UnitGUID (the 3.3.5 combat log has no owner link for warlock demons /
+  hunter pets), so the server attributes pets by exact GUID instead of guessing (which
+  cross-matched two warlocks' pets). Re-emitted on pet/roster change; dedup keeps it cheap.
   NOTE: overwriting the fail-reason globals taints the secure environment; the taint/
   UIErrors suppression below keeps that invisible, but harden before a public release.
   Commands: /conlogs relay on | off | status | test
@@ -35,6 +39,7 @@ local TS_PREFIX     = "[[CL_TS_v1_"   -- telemetry snapshot (positions)
 local BU_PREFIX     = "[[CL_BU_v1_"   -- buff snapshot (pre-pull auras: self + own pet)
 local LT_PREFIX     = "[[CL_LT_v1_"   -- loot drops (item id/qty/quality/timestamp per row)
 local VR_PREFIX     = "[[CL_VR_v1_"   -- addon version string (one tiny chunk per session)
+local PO_PREFIX     = "[[CL_PO_v1_"   -- pet->owner (deterministic UnitGUID scan; petGUID^owner^ownerGUID rows)
 local LOOT_FLUSH_DELAY = 3.0          -- seconds to batch loot events into one chunk
 local TELEMETRY_INTERVAL = 3.0        -- Claude (v2.5.1): 2.0 -> 3.0s between position snapshots (less per-tick overhead; POS_TTL=5 still covers it)
 local BUFF_POLL_INTERVAL = 3.0        -- seconds between buff-aura polls (catches juju/totem up/down edges)
@@ -97,12 +102,14 @@ local pending = nil   -- forward-declared (used by enqueue's resync); the chunk 
 local queue = {}
 -- Claude (v2.5.1): priority lanes. The failed-cast budget is shared across ALL kinds
 -- (~9 chunks/min organic), so small high-value payloads must not starve behind a BU
--- backlog. Lower number = drains first: VR (tiny, once) > LT (loot) > CI (gear) > BU
--- (buff snapshots) > TS (positions). The queue stays ordered by prio (stable/FIFO within
--- a lane). The in-flight head (index 1, already written to the globals) is NEVER displaced
--- — the landed-evidence model in onFailed assumes queue[1] is what the next failed cast
--- carries — so new chunks insert among positions 2..N only.
-local PRIO_VR, PRIO_LT, PRIO_CI, PRIO_BU, PRIO_TS = 0, 1, 2, 3, 4
+-- backlog. Lower number = drains first: VR (tiny, once) > PO (pet->owner, tiny, fixes
+-- attribution) > LT (loot) > CI (gear) > BU (buff snapshots) > TS (positions). The queue
+-- stays ordered by prio (stable/FIFO within a lane). The in-flight head (index 1, already
+-- written to the globals) is NEVER displaced — the landed-evidence model in onFailed assumes
+-- queue[1] is what the next failed cast carries — so new chunks insert among positions 2..N only.
+-- Claude (v2.6.0): PO added at priority 1 (just under VR) — one tiny chunk per snapshot whose
+-- correctness payoff (deterministic pet->owner) is high, so it must not wait behind loot/gear.
+local PRIO_VR, PRIO_PO, PRIO_LT, PRIO_CI, PRIO_BU, PRIO_TS = 0, 1, 2, 3, 4, 5
 local function enqueue(chunk, onLand, prio)
     prio = prio or PRIO_BU
     local entry = { chunk = chunk, exp = (time() or 0) + CHUNK_TTL, onLand = onLand, prio = prio }
@@ -316,6 +323,78 @@ local function enqueueVersion()
     local ver = (GetAddOnMetadata and GetAddOnMetadata("ConLogs-Epoch", "Version")) or "0"
     enqueue(string.format("%s%s_%d_%d/%d]]%s", VR_PREFIX, session, 1, 1, 1, b64encode(ver)),
         function() versionRelayed = true end, PRIO_VR)
+end
+
+--==========================================================================--
+-- pet->owner producer (PO) — Claude (v2.6.0). DETERMINISTIC in-game pet ownership.
+-- The 3.3.5 combat log gives NO owner link for permanent pets (warlock demons, hunter
+-- pets) — only totems fire an owner-stamped SPELL_SUMMON — so when two warlocks/hunters
+-- act together the server can't tell whose pet is whose and falls back to co-activity
+-- heuristics that SWAP them (real bug: two warlocks' succubus/felguard cross-matched).
+-- Here we read UnitGUID on each group member's pet (self "pet", "raidpetN"/"partypetN")
+-- and relay petGUID->owner so the server attributes by EXACT GUID, overriding its
+-- name-keyed pet DB + every heuristic. A handful of pets => ONE tiny chunk (unlike the
+-- whole-raid BU snapshots that never completed), so it lands reliably.
+--
+-- MESH-OF-SELF: a logger reads its groupmates' pet GUIDs directly (the owner needs no
+-- addon), but a pet that's out of range/phase may read nil — so we re-scan on UNIT_PET
+-- (summon/dismiss/resummon) + roster change, and coverage fills in as pets come into range.
+--
+-- ONCE PER PET: a pet GUID's owner is immutable and the server applies it across the WHOLE
+-- log, so each GUID only needs to LAND once. relayedPO tracks per-GUID landed state — a pet
+-- already landed is never re-sent, and we only ever relay GUIDs not yet confirmed. So the
+-- first pull lands every current pet, a resummon lands just its (new) GUID, a pet dropping
+-- out of range relays NOTHING (it's already landed), and steady-state is zero. A chunk that
+-- doesn't land leaves its GUIDs un-marked, so the next trigger re-offers exactly those.
+-- Payload: "\n"-joined rows "<petGuidHex>^<ownerName>^<ownerGuidHex>" (0x stripped).
+--==========================================================================--
+local relayedPO = {}    -- petGuidHex -> true once that pet's row has LANDED (truly once per pet)
+local poSeq = 0
+-- Collect pet->owner rows for pets NOT yet landed (or ALL, when force=true for the relay
+-- test). Returns the body + the list of pet GUIDs it contains, so onLand marks exactly those.
+local function capturePetOwners(force)
+    local rows, guids, seen = {}, {}, {}
+    local function addPair(ownerUnit, petUnit)
+        if not (UnitExists(ownerUnit) and UnitExists(petUnit)) then return end
+        local pg, og = UnitGUID(petUnit), UnitGUID(ownerUnit)
+        if not (pg and og) or pg == og then return end
+        local pgh = tostring(pg):gsub("^0x", "")
+        if pgh == "" or seen[pgh] then return end
+        if not force and relayedPO[pgh] then return end   -- already landed → never re-relay
+        local oname = UnitName(ownerUnit)
+        if not oname or oname == "" or oname == "Unknown" then return end
+        seen[pgh] = true
+        guids[#guids + 1] = pgh
+        rows[#rows + 1] = string.format("%s^%s^%s", pgh, oname, (tostring(og):gsub("^0x", "")))
+    end
+    addPair("player", "pet")
+    local raidN = GetNumRaidMembers() or 0
+    if raidN > 0 then
+        for i = 1, raidN do addPair("raid" .. i, "raidpet" .. i) end
+    else
+        for i = 1, (GetNumPartyMembers() or 0) do addPair("party" .. i, "partypet" .. i) end
+    end
+    if #rows == 0 then return nil end
+    return table.concat(rows, "\n"), guids
+end
+
+-- Enqueue any pet->owner pairs not yet landed (force re-sends all current pets, for the relay
+-- test). The onLand closure marks exactly the GUIDs in THIS chunk as landed, so they're never
+-- re-relayed; a dropped chunk leaves them un-marked and the next trigger re-offers them.
+-- Almost always 1 tiny chunk (a raid has a handful of pets; usually just the deltas).
+local function enqueuePetOwners(force)
+    local body, guids = capturePetOwners(force)
+    if not body then return 0 end
+    poSeq = poSeq + 1
+    local landed = guids
+    local b64 = b64encode(body)
+    local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
+    for i = 1, total do
+        local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
+        enqueue(string.format("%s%s_%d_%d/%d]]%s", PO_PREFIX, session, poSeq, i, total, piece),
+            (i == total) and function() for _, g in ipairs(landed) do relayedPO[g] = true end end or nil, PRIO_PO)
+    end
+    return total
 end
 
 --==========================================================================--
@@ -732,8 +811,14 @@ frame:SetScript("OnEvent", function(self, event, ...)
         lootNudged = false   -- Claude (v2.2.1): new fight → re-allow one post-kill loot reminder
         -- Snapshot buffs at each pull; per-unit dedup means only changed sets relay
         -- (first pull captures the raid, later pulls are near-zero unless someone
-        -- rebuffs). Gear stays once-per-version via enqueueGroupCI.
-        if active then enqueueGroupCI(false); enqueueBuffs(false); enqueueVersion() end
+        -- rebuffs). Gear stays once-per-version via enqueueGroupCI. Claude (v2.6.0):
+        -- pet->owner snapshot too (deterministic attribution; dedup keeps it cheap).
+        if active then enqueueGroupCI(false); enqueueBuffs(false); enqueueVersion(); enqueuePetOwners(false) end
+    elseif event == "UNIT_PET" or event == "RAID_ROSTER_UPDATE" or event == "PARTY_MEMBERS_CHANGED" then
+        -- Claude (v2.6.0): a pet was summoned/dismissed/resummoned (new GUID) or the roster
+        -- changed (a member's pet may now be readable, or a new petN slot appeared) — re-scan
+        -- and relay if the pet->owner set changed. Dedup (relayedPO) drops no-op re-emits.
+        if active then enqueuePetOwners(false) end
     elseif event == "PLAYER_REGEN_ENABLED" or event == "ZONE_CHANGED_NEW_AREA"
         or event == "PLAYER_ENTERING_WORLD" then
         -- New zone = new run → re-arm the end-of-run loot reminder. NOT on REGEN_ENABLED:
@@ -808,6 +893,9 @@ frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("PLAYER_LOGOUT")
 frame:RegisterEvent("PLAYER_LEAVING_WORLD") -- extra teardown path: restore globals on zone-out
+frame:RegisterEvent("UNIT_PET")             -- Claude (v2.6.0): pet summon/dismiss/resummon → re-relay PO
+frame:RegisterEvent("RAID_ROSTER_UPDATE")   -- Claude (v2.6.0): roster change → a member's pet may now be readable
+frame:RegisterEvent("PARTY_MEMBERS_CHANGED") -- Claude (v2.6.0): party variant of the above
 
 --==========================================================================--
 -- slash: /conlogs relay <on|off|status|test>
@@ -844,8 +932,9 @@ local function cmdRelay(sub)
         active = true
         local n = enqueueGroupCI(true)
         local b = enqueueBuffs(true)
-        out(("test mode ON — queued %d gear chunk(s) + %d buff chunk(s)."):format(n, b))
-        out("Make sure /combatlog is on, then fail casts (on cooldown). Search the log for [[CL_CI_ (gear), [[CL_BU_ (buffs)"
+        local po = enqueuePetOwners(true)   -- Claude (v2.6.0): force a pet->owner snapshot too
+        out(("test mode ON — queued %d gear chunk(s) + %d buff chunk(s) + %d pet-owner chunk(s)."):format(n, b, po))
+        out("Make sure /combatlog is on, then fail casts (on cooldown). Search the log for [[CL_CI_ (gear), [[CL_BU_ (buffs), [[CL_PO_ (pet-owner)"
             .. (positionsEnabled() and " and [[CL_TS_ (positions)" or "; enable positions first with /conlogs relay pos on")
             .. ". /conlogs relay off to stop.")
     elseif action == "status" then
