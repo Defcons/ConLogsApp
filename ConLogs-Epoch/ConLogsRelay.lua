@@ -64,6 +64,9 @@ local FAIL_GLOBALS = {
     "SPELL_FAILED_MOVING", "SPELL_FAILED_NOT_HERE", "SPELL_FAILED_ONLY_STEALTHED",
     "SPELL_FAILED_LOW_CASTLEVEL", "SPELL_FAILED_MOREPOWERFULSPELLACTIVE",
     "SPELL_FAILED_TOO_MANY_OF_ITEM", "SPELL_FAILED_CANT_CAST_ON_TAPPED",
+    -- Claude (v2.7.0): carries the end-of-raid loot-flush button's `/cast Fishing` failure
+    -- ("Must have a Fishing Pole equipped") so one click can flush the queue out of combat.
+    "SPELL_FAILED_EQUIPPED_ITEM_CLASS",
 }
 
 --==========================================================================--
@@ -271,15 +274,30 @@ local function groupGUIDs()
     return out
 end
 
+-- Claude (v2.7.x) PERF: cache the base64-chunked CI per guid. enqueueGroupCI re-offers an
+-- un-landed player's CI at EVERY combat start — relayedVersion only advances when a chunk
+-- LANDS (on a failed cast, ~9/min), so a raid kept re-running the pure-Lua base64 (math.pow
+-- per byte) over its WHOLE roster's gear on every single pull = the per-combat-start FPS
+-- freeze players reported. We cache by payload string, so every re-offer after the first is a
+-- no-op lookup. Delivery semantics are unchanged (still re-offered until it lands, dedup on
+-- the last chunk's onLand) — only the wasted re-encoding is gone.
+local _ciB64Cache = {}   -- guid -> { raw = <payload>, pieces = { <b64 chunk strings> } }
 local function enqueueCI(guid, raw, onLand)
-    local b64 = b64encode(raw)
     local short = tostring(guid):gsub("^0x", "")
-    local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
+    local c = _ciB64Cache[guid]
+    if not (c and c.raw == raw) then
+        local b64 = b64encode(raw)
+        local pieces = {}
+        local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
+        for i = 1, total do pieces[i] = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY) end
+        c = { raw = raw, pieces = pieces }
+        _ciB64Cache[guid] = c
+    end
+    local total = #c.pieces
     for i = 1, total do
-        local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
         -- Attach the dedup-commit to the LAST chunk so the baseline only advances
         -- once the full payload has landed.
-        enqueue(string.format("%s%s_%s_%d/%d]]%s", CI_PREFIX, session, short, i, total, piece),
+        enqueue(string.format("%s%s_%s_%d/%d]]%s", CI_PREFIX, session, short, i, total, c.pieces[i]),
             (i == total) and onLand or nil, PRIO_CI)
     end
     return total
@@ -719,6 +737,13 @@ end
 -- server can map each drop onto the fight timeline (boss attribution) — even though
 -- the chunk itself only relays at the next in-combat window. "What dropped" only:
 -- no looter name is captured (per site design).
+--
+-- SCOPE (Claude v2.7.0): CHAT_MSG_LOOT only fires for loot the LOCAL player sees, so a
+-- single client captures only what it personally looted/saw. For the fullest raid-wide
+-- loot record the MASTER LOOTER should run ConLogs; otherwise merged group logs stitch
+-- together whatever each addon-equipped raider saw. Either way, drops looted after the
+-- LAST boss now flush via the user-clicked Save Loot prompt below (Epoch can't fire a
+-- carrier cast from addon code, so a hardware-event click is the only out-of-combat path).
 --==========================================================================--
 local QUALITY_BY_COLOR = {
     ["1eff00"] = 2, ["0070dd"] = 3, ["a335ee"] = 4, ["ff8000"] = 5, ["e6cc80"] = 6, ["e5cc80"] = 6,
@@ -726,6 +751,7 @@ local QUALITY_BY_COLOR = {
 local lootBuf   = {}     -- array of "itemID^qty^quality^M/D HH:MM:SS"
 local lootAccum = 0
 local lootSeq   = 0
+local lootRowsPending = 0 -- Claude (v2.7.0): loot rows enqueued but not yet LANDED — drives the end-of-raid flush prompt count
 local lootNudged = false -- Claude (v2.2.1): throttle the out-of-combat "cast to save loot" reminder to once per fight
 -- Set true by ConLogsDungeon (via _G.ConLogs_OnRunComplete) when ALL roster bosses are
 -- down — i.e. the last boss is dead and there may be no more combat to carry chunks.
@@ -771,21 +797,144 @@ local function flushLoot()
     local n = #lootBuf
     lootBuf = {}
     lootSeq = lootSeq + 1
+    lootRowsPending = lootRowsPending + n   -- Claude (v2.7.0): count unsaved drops for the flush prompt
     local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
     for i = 1, total do
         local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
-        enqueue(string.format("%s%s_%d_%d/%d]]%s", LT_PREFIX, session, lootSeq, i, total, piece), nil, PRIO_LT)
+        -- Claude (v2.7.0): decrement the unsaved-drops counter when this flush's LAST chunk
+        -- LANDS, so the end-of-raid prompt reflects what's actually reached the log.
+        enqueue(string.format("%s%s_%d_%d/%d]]%s", LT_PREFIX, session, lootSeq, i, total, piece),
+            (i == total) and function() lootRowsPending = math.max(0, lootRowsPending - n) end or nil, PRIO_LT)
     end
     -- Claude (v2.2.1): if this was looted OUT of combat (the usual case, and the only one
     -- at risk — e.g. after the last boss there's no further combat to carry the chunk),
-    -- remind the player once that any failed cast lands it. In combat we stay silent — the
+    -- remind the player once. Claude (v2.7.0): the on-screen Save Loot button (built below) is
+    -- now the reliable carrier; this chat line just points at it. In combat we stay silent — the
     -- ongoing fight's failed casts carry it immediately. Reset per fight (PLAYER_REGEN_DISABLED).
     if runComplete and (LoggingCombat and LoggingCombat())
         and not (UnitAffectingCombat and UnitAffectingCombat("player")) and not lootNudged then
         lootNudged = true
-        print(string.format("|cff66ccff[ConLogs]|r logged %d loot drop%s - cast any spell before leaving the instance to save %s to your log (an ability on cooldown counts).",
+        print(string.format("|cff66ccff[ConLogs]|r logged %d loot drop%s - click the on-screen Save Loot button (or cast any spell before leaving) to save %s to your log.",
             n, n == 1 and "" or "s", n == 1 and "it" or "them"))
     end
+end
+
+--==========================================================================--
+-- end-of-raid loot flush prompt — Claude (v2.7.0)
+-- The relay's carrier is the player's NEXT failed cast. After the last boss dies the raid
+-- loots the corpse and combat ends — there are no more (failed) casts — so the queued LT
+-- loot chunk can never flush and is lost when the player stops logging or leaves. Project
+-- Epoch blocks addon-script casts (CastSpellByName from code writes NO combat-log line —
+-- proven in ConLogsDummy.lua), so the addon can't fire its own carrier. The fix mirrors the
+-- dummy validate button: a SecureActionButton the user CLICKS. The click is the hardware
+-- event Epoch's protection model requires; its macro (`/cast Fishing`, which fails instantly
+-- with "Must have a Fishing Pole equipped" → SPELL_FAILED_EQUIPPED_ITEM_CLASS, now in
+-- FAIL_GLOBALS) produces a SPELL_CAST_FAILED that carries the pending chunk. One fail per
+-- click; the prompt stays up (showing drops left) until the LT queue drains, then hides.
+-- GATED ON runComplete — ConLogsDungeon fires _G.ConLogs_OnRunComplete() when the LAST boss
+-- of the instance's roster is dead, so the prompt ONLY appears at end-of-raid, never mid-fight
+-- (no popup in the middle of the screen during a raid). Loot dropped earlier in the run is
+-- already saved — the fight's own failed casts carried it — so only the final boss's drops are
+-- ever at risk, and that's exactly when this fires. (Roster lives in ConLogsDungeon's DUNGEONS
+-- table; an instance not in it never sets runComplete, so the prompt won't fire there yet.)
+--==========================================================================--
+local FLUSH_GRACE  = 6          -- seconds out of combat before the prompt appears (skip brief between-pull lulls)
+local lastCombatEnd = 0         -- GetTime() of the last PLAYER_REGEN_ENABLED
+local flushFrame, flushBtn, flushLabel, flushSub
+local flushForce   = false      -- /conlogs relay flush — force the prompt up for testing
+local flushAttrSet = false      -- secure macrotext attribute applied yet? (SetAttribute is combat-blocked)
+local updateFlushPrompt         -- forward decl (the button's PostClick + the OnUpdate ticker close over it)
+
+local function ltPending()
+    local n = 0
+    for i = 1, #queue do if queue[i].prio == PRIO_LT then n = n + 1 end end
+    return n
+end
+
+local function buildFlushFrame()
+    if flushFrame then return end
+    -- Build + Show ONCE, always out of combat (updateFlushPrompt only reaches here on the
+    -- show path, which is gated out-of-combat). Visibility is then driven by SetAlpha, never
+    -- Show/Hide: toggling a frame that holds a SECURE child is protected during combat
+    -- lockdown, but SetAlpha is not (same trick the dummy validate button uses).
+    local f = CreateFrame("Frame", "ConLogsLootFlushFrame", UIParent)
+    f:SetWidth(290); f:SetHeight(94)
+    f:SetPoint("TOP", UIParent, "TOP", 0, -140)
+    f:SetFrameStrata("HIGH")
+    f:SetBackdrop({
+        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true, tileSize = 32, edgeSize = 24,
+        insets = { left = 8, right = 8, top = 8, bottom = 8 },
+    })
+    f:SetMovable(true); f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+
+    flushLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    flushLabel:SetPoint("TOP", 0, -12); flushLabel:SetWidth(266); flushLabel:SetJustifyH("CENTER")
+
+    flushSub = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    flushSub:SetPoint("TOP", flushLabel, "BOTTOM", 0, -3); flushSub:SetWidth(266); flushSub:SetJustifyH("CENTER")
+    flushSub:SetText("Click to save it to your combat log")
+
+    flushBtn = CreateFrame("Button", "ConLogsLootFlushButton", f,
+        "SecureActionButtonTemplate,UIPanelButtonTemplate")
+    flushBtn:SetWidth(200); flushBtn:SetHeight(26)
+    flushBtn:SetPoint("BOTTOM", 0, 12)
+    flushBtn:SetText("Save loot to log")
+    flushBtn:RegisterForClicks("AnyUp")
+    -- PostClick is INSECURE, runs right after the secure `/cast` fires: refresh the count.
+    flushBtn:SetScript("PostClick", function() if updateFlushPrompt then updateFlushPrompt() end end)
+
+    flushFrame = f
+    f:Show()
+    f:SetAlpha(0)   -- start invisible; updateFlushPrompt drives the alpha 0/1
+end
+
+local function ensureFlushAttr()
+    if flushAttrSet then return true end
+    if InCombatLockdown and InCombatLockdown() then return false end   -- SetAttribute is blocked in combat
+    flushBtn:SetAttribute("type", "macro")
+    flushBtn:SetAttribute("macrotext", "/cast Fishing")   -- no pole → instant SPELL_CAST_FAILED carrier
+    flushAttrSet = true
+    return true
+end
+
+updateFlushPrompt = function()
+    local lt = ltPending()
+    if lt == 0 then lootRowsPending = 0 end   -- reconcile: the chunks all landed or TTL-evicted
+
+    local show
+    if flushForce then
+        show = true
+    else
+        -- runComplete = the instance's LAST roster boss is dead (set via _G.ConLogs_OnRunComplete).
+        -- This is the gate that keeps the prompt out of mid-raid: it can't show until the raid is
+        -- done. Then: loot still unsaved, out of combat, and a short settle grace after the kill.
+        show = active and runComplete and lt > 0
+            and not (UnitAffectingCombat and UnitAffectingCombat("player"))
+            and ((GetTime() or 0) - lastCombatEnd) >= FLUSH_GRACE
+    end
+
+    if not show then
+        if flushFrame then flushFrame:SetAlpha(0) end
+        return
+    end
+
+    buildFlushFrame()
+    if not ensureFlushAttr() then return end   -- still in combat lockdown — retry next tick
+    -- Prime the carrier: put queue[1] into the SPELL_FAILED_* globals NOW so the user's FIRST
+    -- click LANDS a chunk. (Otherwise onFailed would only APPLY it on that fail and the chunk
+    -- wouldn't ride out until the *next* fail — i.e. the user would have to click twice.)
+    if queue[1] and pending ~= queue[1].chunk then
+        applyChunk(queue[1].chunk); pending = queue[1].chunk
+    end
+    local drops = (lootRowsPending > 0) and lootRowsPending or lt
+    flushLabel:SetText(string.format("|cff66ccffConLogs|r  %d loot drop%s not yet saved",
+        drops, drops == 1 and "" or "s"))
+    flushFrame:SetAlpha(1)
 end
 
 local frame = CreateFrame("Frame")
@@ -826,13 +975,20 @@ frame:SetScript("OnEvent", function(self, event, ...)
         -- suppress the one reminder we actually want.
         -- Claude (v2.5.1): re-arm the position map-usability probe on every real zone change
         -- (a new instance may have a usable map; a continent may not).
-        if event ~= "PLAYER_REGEN_ENABLED" then runComplete = false; lootNudged = false; posMapUnusable = false end
+        if event == "PLAYER_REGEN_ENABLED" then
+            lastCombatEnd = GetTime() or 0   -- Claude (v2.7.0): start the out-of-combat grace before the loot prompt appears
+        else
+            runComplete = false; lootNudged = false; posMapUnusable = false
+            lootRowsPending = 0; flushForce = false   -- Claude (v2.7.0): new run → clear stale loot-prompt state
+            if flushFrame then flushFrame:SetAlpha(0) end
+        end
         reevaluate()
     elseif event == "PLAYER_LOGOUT" or event == "PLAYER_LEAVING_WORLD" then
         -- Restore unconditionally on every teardown path (logout, /reload, zoning out
         -- mid-combat). restoreGlobals is idempotent, so the dropped `if active` guard
         -- just guarantees the globals are never left holding a chunk string.
         active = false
+        flushForce = false; if flushFrame then flushFrame:SetAlpha(0) end   -- Claude (v2.7.0): drop the loot prompt on teardown
         if dirty then restoreGlobals() end
     end
 end)
@@ -850,6 +1006,7 @@ end)
 -- client still sends once per TELEMETRY_INTERVAL).
 local tsAccum  = (math.random and (math.random() * TELEMETRY_INTERVAL)) or 0
 local buffAccum = 0
+local flushAccum = 0   -- Claude (v2.7.0): throttle the end-of-raid loot-flush prompt re-eval
 frame:SetScript("OnUpdate", function(self, elapsed)
     -- Claude (v2.5.1) PERF: skip the entire position producer (incl. the SetMapToCurrentZone
     -- dance) once this zone is known to have no usable replay map. broadcastSelfPos sets
@@ -883,6 +1040,9 @@ frame:SetScript("OnUpdate", function(self, elapsed)
     else
         lootAccum = 0
     end
+    -- Claude (v2.7.0): re-evaluate the end-of-raid loot-flush prompt (throttled).
+    flushAccum = flushAccum + (elapsed or 0)
+    if flushAccum >= 0.5 then flushAccum = 0; updateFlushPrompt() end
 end)
 frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 frame:RegisterEvent("CHAT_MSG_ADDON")
@@ -914,6 +1074,7 @@ local function cmdRelay(sub)
         ConLogsDB.config.relayEnabled = false
         testForce = false
         active = false
+        flushForce = false; if flushFrame then flushFrame:SetAlpha(0) end   -- Claude (v2.7.0): hide the loot prompt too
         restoreGlobals()
         out("relay disabled + globals restored.")
     elseif action == "pos" or action == "positions" then
@@ -937,13 +1098,26 @@ local function cmdRelay(sub)
         out("Make sure /combatlog is on, then fail casts (on cooldown). Search the log for [[CL_CI_ (gear), [[CL_BU_ (buffs), [[CL_PO_ (pet-owner)"
             .. (positionsEnabled() and " and [[CL_TS_ (positions)" or "; enable positions first with /conlogs relay pos on")
             .. ". /conlogs relay off to stop.")
+    elseif action == "flush" then
+        -- Claude (v2.7.0): force the end-of-raid loot prompt visible to test the click→carrier
+        -- path without a real raid. Pair with `/conlogs relay test` (queues chunks), keep
+        -- /combatlog on and stand out of combat, then click the button (or fail a cast).
+        flushForce = not flushForce
+        if flushForce then
+            buildFlushFrame()
+            updateFlushPrompt()
+            out(("loot-flush prompt FORCED visible (test). Pending loot chunks: %d. With /combatlog on + out of combat, click the on-screen Save Loot button (or fail a cast) to drain. Run /conlogs relay flush again to hide."):format(ltPending()))
+        else
+            if flushFrame then flushFrame:SetAlpha(0) end
+            out("loot-flush prompt force-hidden. It still auto-shows after the last boss when loot is pending out of combat.")
+        end
     elseif action == "status" then
         local _, instType = IsInInstance()
-        out(("relay=%s positions=%s active=%s queued=%d logging=%s instance=%s testForce=%s"):format(
-            tostring(relayEnabled()), tostring(positionsEnabled()), tostring(active), #queue,
+        out(("relay=%s positions=%s active=%s queued=%d (loot %d, drops %d) logging=%s instance=%s testForce=%s"):format(
+            tostring(relayEnabled()), tostring(positionsEnabled()), tostring(active), #queue, ltPending(), lootRowsPending,
             tostring(LoggingCombat and LoggingCombat() or false), tostring(instType), tostring(testForce)))
     else
-        out("usage: /conlogs relay on | off | pos on|off | test | status")
+        out("usage: /conlogs relay on | off | pos on|off | test | flush | status")
     end
 end
 
