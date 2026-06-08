@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "2.4.0"
+local ADDON_VERSION = "2.5.0"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -1482,16 +1482,28 @@ local function CapturePlayerStats(unit)
     local out = {}
     -- Effective stat (index 2 of UnitStat) matches what the Character pane
     -- shows in the white "Strength: 74" line — base + items + buffs + talents.
-    local _, str = UnitStat(unit, 1)
-    local _, agi = UnitStat(unit, 2)
-    local _, sta = UnitStat(unit, 3)
-    local _, intel = UnitStat(unit, 4)
-    local _, spi = UnitStat(unit, 5)
+    -- Index 1 (base) is the UNBUFFED value: base race+class + gear + permanent
+    -- talents/enchants/gems, EXCLUDING temporary auras (Blessing of Kings,
+    -- Mark of the Wild, food, flasks). UnitStat returns (base, stat, pos, neg).
+    local bstr, str = UnitStat(unit, 1)
+    local bagi, agi = UnitStat(unit, 2)
+    local bsta, sta = UnitStat(unit, 3)
+    local bint, intel = UnitStat(unit, 4)
+    local bspi, spi = UnitStat(unit, 5)
     out.str = str or 0
     out.agi = agi or 0
     out.sta = sta or 0
     out.int = intel or 0
     out.spi = spi or 0
+    -- Claude (v2.5.0): unbuffed base primaries. Subtracting equipped-item
+    -- stats from these server-side yields the pure race+class base stats —
+    -- the data the epoch-sim simulators need to validate RACE_BASE_STATS for
+    -- every race/class combo. Buff-free, so no need to reverse +%stat auras.
+    out.bstr = bstr or 0
+    out.bagi = bagi or 0
+    out.bsta = bsta or 0
+    out.bint = bint or 0
+    out.bspi = bspi or 0
     -- Effective armor (index 2) includes base+items+buffs (e.g., Inner Fire).
     local _, effArmor = UnitArmor(unit)
     out.armor = effArmor or 0
@@ -1578,6 +1590,9 @@ local STATS_KEY_ORDER = {
     "mHa","rHa","sHa",
     "exp","dod","par","blk","res","arp","def",
     "sp","hp","mp5",
+    -- Claude (v2.5.0): unbuffed base primaries (UnitStat index 1), appended
+    -- per the never-reorder rule. Old receivers ignore unknown keys.
+    "bstr","bagi","bsta","bint","bspi",
 }
 local function EncodeCharStats(stats)
     if not stats then return "" end
@@ -1781,6 +1796,13 @@ local function BuildPayload(unit, guid)
     -- power, mp5) are skipped server-side and the UI falls back to
     -- derived-from-rating sums on the receive side.
     parts[#parts + 1] = EncodeCharStats(CapturePlayerStats(unit))
+    -- Claude (v2.5.0): wire position 44 — locale-independent race token from
+    -- UnitRace's 2nd return ("Human"/"Dwarf"/"Scourge"/"BloodElf"/…). Works on
+    -- inspected units too. Paired with the unbuffed base stats in field 43
+    -- (bstr…bspi), it lets the server derive race+class base stats per combo.
+    -- Append-only: pre-v2.5 receivers ignore the trailing field.
+    local _, raceFile = UnitRace(unit)
+    parts[#parts + 1] = raceFile or ""
     -- v1.3: capture talent metadata locally for this class (name, icon,
     -- tier, column, maxRank per talent). Stored in ConLogsTalentTreeDB.
     -- Doesn't go on the wire — it's bulky and stable per-class. Each
@@ -2022,6 +2044,12 @@ local function ParsePayload(payload)
     if t[43] and t[43] ~= "" then
         entry.charStats = ParseCharStats(t[43])
     end
+    -- Claude (v2.5.0): wire position 44 — locale-independent race token.
+    -- Stored top-level on the player record so the website/sims can group
+    -- base-stat samples by race/class combo. Absent on pre-v2.5 payloads.
+    if t[44] and t[44] ~= "" then
+        entry.race = t[44]
+    end
     if entry.name == "" or entry.guid == "" then return nil end
     return entry
 end
@@ -2165,6 +2193,7 @@ local function Ingest(payload, sender)
     existing.realm = entry.realm
     existing.class = entry.class
     existing.level = entry.level
+    if entry.race then existing.race = entry.race end -- Claude (v2.5.0): race/class combo key
     if entry.tabNames then existing.tabNames = entry.tabNames end -- v0.17+
     if entry.tabIcons then existing.tabIcons = entry.tabIcons end -- v0.18+
     existing.sets[group] = {
