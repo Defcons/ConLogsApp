@@ -1291,7 +1291,11 @@ _testWatchFrame:Hide()
 local _testWatchStart = 0
 local _testWatchSpellName = ""
 local _testWatchSeen = false
-_testWatchFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+-- Claude (perf): do NOT register at file load. This diagnostic only matters during the
+-- brief /conlogstest window, but a load-time registration fires its OnEvent (a 10-arg
+-- vararg unpack) on EVERY combat event for the whole session — including the entire raid,
+-- separately from the main dummy handler. We register in ConLogsDummy_TestCast and
+-- unregister when the 3s watch window closes (OnUpdate below), so it costs nothing otherwise.
 _testWatchFrame:SetScript("OnEvent", function(self, event, ...)
     if event ~= "COMBAT_LOG_EVENT_UNFILTERED" then return end
     local _, subevent, _, _, sourceFlags, _, _, _, spellID, spellName = ...
@@ -1307,6 +1311,7 @@ end)
 _testWatchFrame:SetScript("OnUpdate", function(self, e)
     local waited = GetTime() - _testWatchStart
     if waited >= 3.0 then
+        self:UnregisterEvent("COMBAT_LOG_EVENT_UNFILTERED")   -- Claude (perf): stop the per-event handler once the window closes
         self:Hide()
         if not _testWatchSeen then
             print(string.format("|cffffaa44ConLogs|r [testcast] |cffff6666DID NOT LAND|r — no CLEU event for '%s' in 3s",
@@ -1326,6 +1331,7 @@ _G.ConLogsDummy_TestCast = function(spellName, stopAfter)
     _testWatchSpellName = spellName
     _testWatchSeen = false
     _testWatchStart = GetTime()
+    _testWatchFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")   -- Claude (perf): watch only during the test window
     _testWatchFrame:Show()
 
     if not CastSpellByName then
@@ -1475,6 +1481,10 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
     elseif event == "PLAYER_REGEN_ENABLED" then
         OnLeaveCombat()
     elseif event == "UNIT_AURA" then
+        -- Claude (perf): nothing to validate unless a test is active/armed. When idle —
+        -- always the case in a raid/dungeon — bail before any work (UNIT_AURA churns hard
+        -- on the player in a raid).
+        if state == "idle" then return end
         local unit = ...
         if unit == "player"
            or (savedDummyGUID and unit and UnitGUID(unit) == savedDummyGUID)
@@ -1487,6 +1497,13 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             end
         end
     elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
+        -- Claude (perf — CRITICAL for instance FPS): O(1) idle gate. The dummy module only
+        -- does work during a test (armed/logging/stopping/practice) or while verifying a
+        -- just-cast marker right after one ("stopped"). It is ALWAYS "idle" in a raid/dungeon
+        -- (dummy tests happen at city dummies), so without this gate the 12-local vararg unpack
+        -- below ran on every one of the thousands of combat events/sec for the whole raid.
+        -- "idle" is the only state with nothing to do, so bailing on it is fully safe.
+        if state == "idle" then return end
         -- 3.3.5 signature: timestamp, subevent, sourceGUID, sourceName,
         -- sourceFlags, destGUID, destName, destFlags, [event-specific args]...
         -- Pull 12 args so we can read the damage amount in either layout:

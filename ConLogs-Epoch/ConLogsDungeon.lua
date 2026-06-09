@@ -1475,8 +1475,14 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
     if event == "COMBAT_LOG_EVENT_UNFILTERED" then
         if not currentDungeon then return end
-        local _, subevent, _, _, _, _, destName = ...
-        if subevent ~= "UNIT_DIED" or not destName then return end
+        -- Claude (perf): currentDungeon is set for the WHOLE raid (raid auto-log), so this
+        -- handler runs on every combat event all raid. Only UNIT_DIED matters, and it's a
+        -- tiny fraction of the stream — so pull ONLY arg2 (subevent) to gate, and unpack
+        -- destName lazily after that, instead of unpacking 7 locals on every event.
+        local subevent = select(2, ...)
+        if subevent ~= "UNIT_DIED" then return end
+        local destName = select(7, ...)
+        if not destName then return end
         if IsBossOfCurrent(destName) then
             OnBossKilled(destName)
             return

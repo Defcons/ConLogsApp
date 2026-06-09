@@ -281,12 +281,27 @@ end
 -- freeze players reported. We cache by payload string, so every re-offer after the first is a
 -- no-op lookup. Delivery semantics are unchanged (still re-offered until it lands, dedup on
 -- the last chunk's onLand) — only the wasted re-encoding is gone.
+-- Claude (v2.7.x) PERF/throughput: strip the position-40 item-info hints from the RELAY
+-- copy of the payload. Item stats are immutable per itemID; the in-game MESH broadcast keeps
+-- the full hints (peers cache them by itemID for their own .lua uploads), and the site's item
+-- database is built from those .lua uploads — so the combat-log relay never needs them. The
+-- epoglogs relay decoder discards position 40 anyway, so today they only bloat the chunked CI
+-- (they're ~half its size → ~2x the chunks to land against the ~9-failed-casts/min budget).
+-- We BLANK field 40 rather than remove it so positions 41-44 (talents/guild/charStats/race)
+-- stay aligned for the wire decoder. Done once per gear-version (the result is cached below).
+local function _stripRelayHints(raw)
+    if type(raw) ~= "string" then return raw end
+    local t = { strsplit("^", raw) }
+    if #t >= 40 then t[40] = "" else return raw end   -- no hints field present (older payload)
+    return table.concat(t, "^")
+end
+
 local _ciB64Cache = {}   -- guid -> { raw = <payload>, pieces = { <b64 chunk strings> } }
 local function enqueueCI(guid, raw, onLand)
     local short = tostring(guid):gsub("^0x", "")
     local c = _ciB64Cache[guid]
     if not (c and c.raw == raw) then
-        local b64 = b64encode(raw)
+        local b64 = b64encode(_stripRelayHints(raw))
         local pieces = {}
         local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
         for i = 1, total do pieces[i] = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY) end

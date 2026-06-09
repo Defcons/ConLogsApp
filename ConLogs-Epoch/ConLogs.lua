@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "2.7.0"
+local ADDON_VERSION = "2.8.0"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -1235,12 +1235,22 @@ local function MarkPendingCache(itemID, itemLink, slot)
     end
 end
 
+-- Claude (perf): cap the number of HEAVY resolves per tick. Each successful CacheItemInfo
+-- here runs GetItemStats + ScanTooltip (the heaviest pure-Lua work in the file). Received-
+-- gear items are now ALL routed through this loop (see CachePayloadItems), so a syncfrom /
+-- auto-sync replay can leave hundreds queued — resolving them all in one tick would be a
+-- visible hitch. Resolve at most this many per 0.25s tick; unresolved items are cheap
+-- (GetItemInfo nil → early return) so iterating the rest each tick stays trivial.
+local CACHE_RESOLVE_PER_TICK = 8
 local function TryCachePending()
     if not next(pendingCache) then return end
     local nowT = now()
+    local resolved = 0
     for iid, info in pairs(pendingCache) do
+        if resolved >= CACHE_RESOLVE_PER_TICK then break end
         if CacheItemInfo(iid, info.link, info.slot) then
             pendingCache[iid] = nil
+            resolved = resolved + 1   -- count only successful (potentially heavy) resolves
         elseif (nowT - info.firstSeen) > CACHE_GIVE_UP then
             pendingCache[iid] = nil -- server never responded; try again on next scan
         else
@@ -1270,8 +1280,15 @@ local function CachePayloadItems(entry)
         if raw and raw ~= "" then
             local iid = tonumber(raw:match("^(%d+)"))
             if iid and iid > 0 then
-                local link = "item:" .. raw
-                if not CacheItemInfo(iid, link, slot) then MarkPendingCache(iid, link, slot) end
+                -- Claude (perf): route received-gear items through the THROTTLED pending loop
+                -- instead of resolving inline. CacheItemInfo here ran GetItemStats + ScanTooltip
+                -- synchronously on the receive frame for every resolvable item; a syncfrom /
+                -- auto-sync replay completing several sets could stack those into a hitch.
+                -- MarkPendingCache skips already-cached / hint-seeded items cheaply and queues
+                -- the rest for TryCachePending (capped per tick). ShouldStore's name-blacklist
+                -- still works — it reads the client's own GetItemInfo cache, which our scan
+                -- never populated synchronously anyway.
+                MarkPendingCache(iid, "item:" .. raw, slot)
             end
         end
     end
