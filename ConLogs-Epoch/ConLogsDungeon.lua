@@ -212,6 +212,7 @@ local DUNGEONS = {
         -- countable adds). Auto-logs on entry via the raid-auto-log
         -- behavior wired in OnEnterDungeon.
         displayName = "Onyxia's Lair",
+        finalBoss = "Onyxia",   -- Claude (v2.7.0): explicit final-boss gate for the loot prompt
         bosses = {
             "Onyxia",
         },
@@ -235,7 +236,65 @@ local DUNGEONS = {
             { name = "Blackstone elite", mobs = {"Blackstone Sea Dog","Blackstone Bosun","Blackstone Surgeon"},        required = 14 },
         },
     },
+    -- ========================================================================
+    -- Raids — Claude (v2.7.0). Added so the relay's end-of-raid LOOT-FLUSH prompt
+    -- (ConLogsRelay.lua) knows each raid's LAST boss. What actually gates that prompt
+    -- is (1) the instance KEY below = GetInstanceInfo() exactly, and (2) `finalBoss` =
+    -- the boss's UNIT_DIED destName exactly. OnBossKilled fires _G.ConLogs_OnRunComplete
+    -- the instant finalBoss dies, so a wrong/missing MID-roster name won't break the
+    -- prompt — only those two strings matter. The full `bosses` lists are best-effort
+    -- (kill tracking / future UI); raids run in silent mode so they add no on-screen UI.
+    -- VERIFY in-game: `/conlogs dungeondebug` prints the real instance name; the
+    -- "boss down - X" chat line on the final kill confirms the destName matched.
+    -- ========================================================================
+    ["Molten Core"] = {
+        displayName = "Molten Core",
+        finalBoss = "Ragnaros",
+        bosses = {
+            "Lucifron", "Magmadar", "Gehennas", "Garr", "Baron Geddon",
+            "Shazzrah", "Sulfuron Harbinger", "Golemagg the Incinerator",
+            "Majordomo Executus", "Ragnaros",
+        },
+    },
+    ["Blackwing Lair"] = {
+        displayName = "Blackwing Lair",
+        finalBoss = "Nefarian",
+        bosses = {
+            "Razorgore the Untamed", "Vaelastrasz the Corrupt", "Broodlord Lashlayer",
+            "Firemaw", "Ebonroc", "Flamegor", "Chromaggus", "Nefarian",
+        },
+    },
+    ["Zul'Gurub"] = {
+        displayName = "Zul'Gurub",
+        finalBoss = "Hakkar",
+        bosses = {
+            "High Priestess Jeklik", "High Priest Venoxis", "High Priestess Mar'li",
+            "Bloodlord Mandokir", "High Priest Thekal", "High Priestess Arlokk",
+            "Jin'do the Hexxer", "Hakkar",
+        },
+    },
+    ["Ruins of Ahn'Qiraj"] = {
+        displayName = "Ruins of Ahn'Qiraj (AQ20)",
+        finalBoss = "Ossirian the Unscarred",
+        bosses = {
+            "Kurinnaxx", "General Rajaxx", "Moam", "Buru the Gorger",
+            "Ayamiss the Hunter", "Ossirian the Unscarred",
+        },
+    },
+    ["Ahn'Qiraj Temple"] = {
+        displayName = "Temple of Ahn'Qiraj (AQ40)",
+        finalBoss = "C'Thun",
+        bosses = {
+            "The Prophet Skeram", "Battleguard Sartura", "Fankriss the Unyielding",
+            "Princess Huhuran", "Emperor Vek'lor", "Emperor Vek'nilash", "Ouro", "C'Thun",
+        },
+    },
 }
+
+-- Claude (v2.7.0): AQ40's GetInstanceInfo() name differs between client builds
+-- ("Ahn'Qiraj Temple" vs "Ahn'Qiraj") — alias both to the same roster so detection
+-- works either way (harmless if Epoch only ever reports one of them).
+DUNGEONS["Ahn'Qiraj"] = DUNGEONS["Ahn'Qiraj Temple"]
 
 -- Per-dungeon reverse lookup: boss name → variant key. Built once at
 -- file load so OnBossKilled can O(1) auto-resolve the variant for
@@ -422,6 +481,20 @@ local function GetCurrentBosses()
         end
     end
     return def.bosses
+end
+
+-- Claude (v2.7.0): the instance's DESIGNATED final boss (the one whose death = end of run),
+-- used to fire run-complete for the relay's end-of-raid loot prompt. Variant-aware like
+-- GetCurrentBosses. Returns nil when no `finalBoss` is set (existing dungeons), so their
+-- run-complete keeps relying purely on the all-bosses count — behavior unchanged for them.
+local function GetCurrentFinalBoss()
+    if not currentDungeon then return nil end
+    local def = DUNGEONS[currentDungeon]
+    if def.variants then
+        local v = currentVariant and def.variants[currentVariant]
+        return v and v.finalBoss or nil
+    end
+    return def.finalBoss
 end
 
 -- Returns the trash bucket list for the current dungeon (resolved
@@ -678,6 +751,15 @@ local function OnBossKilled(bossName)
         if killed >= #bosses and _G.ConLogs_OnRunComplete then
             _G.ConLogs_OnRunComplete()
         end
+    end
+    -- Claude (v2.7.0): also fire run-complete the instant the DESIGNATED final boss dies —
+    -- even if some other roster boss wasn't matched (name drift, or a skipped optional boss
+    -- like ZG's Gahz'ranka). For the end-of-raid loot prompt, "the last boss is dead" is the
+    -- real signal, and keying off ONE name is far more robust than requiring the whole roster.
+    -- _G.ConLogs_OnRunComplete just sets a flag, so firing it twice is harmless.
+    local finalBoss = GetCurrentFinalBoss()
+    if finalBoss and bossName == finalBoss and _G.ConLogs_OnRunComplete then
+        _G.ConLogs_OnRunComplete()
     end
 end
 
