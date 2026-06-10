@@ -474,6 +474,10 @@ local TOOLTIP_STAT_PATTERNS = {
     { "hit with melee and ranged attacks by (%-?%d+)%%",             "HIT_MELEE_RANGED_PCT" },
     { "hit with spells by (%-?%d+)%%",                               "HIT_SPELL_PCT" },
     { "Improves your chance to hit by (%-?%d+)%%",                   "HIT_PCT" },
+    -- Epoch "Acuity": speeds casts AND periodic (DoT) ticks. Without this rule
+    -- the line falls through to tooltipExtras (verbatim text) and never becomes
+    -- a structured stat — see epoch-sim docs/ACUITY_ESD_GUIDE.md.
+    { "casting speed and causes periodic effects to occur more frequently with spells by (%-?%d+)%%", "SPELL_ACUITY_PCT" },
     { "be dodged or parried by (%-?%d+)%%",                          "EXPERTISE_PCT" },
     -- ---------- Percent-based defensive (dodge / parry / block) ----------
     { "chance to dodge an attack by (%-?%d+)%%",                     "DODGE_PCT" },
