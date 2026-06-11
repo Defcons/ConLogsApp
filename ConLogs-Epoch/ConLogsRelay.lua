@@ -33,6 +33,33 @@
   Commands: /conlogs relay on | off | status | test
 =========================================================================== ]]--
 
+-- Claude (v3.0.0) PERF: upvalue the globals used in the hot scan/OnUpdate paths. Every bare
+-- global call (UnitAura, string.format, …) is otherwise a _G hash lookup; in the whole-raid
+-- consumable scan (up to ~80 units × ~40 aura slots) and the per-frame OnUpdate those lookups
+-- add up. Binding them to file-local upvalues here is 100% behavior-preserving — every call
+-- site below resolves to the local automatically — and is the standard 3.3.5 addon idiom for
+-- shaving avoidable per-call cost (and thus raid-wide FPS overhead).
+local UnitAura            = UnitAura
+local UnitExists          = UnitExists
+local UnitGUID            = UnitGUID
+local UnitIsUnit          = UnitIsUnit
+local UnitName            = UnitName
+local UnitAffectingCombat = UnitAffectingCombat
+local IsInInstance        = IsInInstance
+local GetNumRaidMembers   = GetNumRaidMembers
+local GetNumPartyMembers  = GetNumPartyMembers
+local GetTime             = GetTime
+local LoggingCombat       = LoggingCombat
+local SendAddonMessage    = SendAddonMessage
+local GetPlayerMapPosition = GetPlayerMapPosition
+local time, date          = time, date
+local ipairs, pairs       = ipairs, pairs
+local tostring, tonumber  = tostring, tonumber
+local select, unpack      = select, unpack
+local type, wipe          = type, wipe
+local strsplit            = strsplit
+local string, table, math = string, table, math
+
 local PREFIX_FAMILY = "[[CL_"   -- landed-evidence family prefix (all our chunk kinds share it)
 local CI_PREFIX     = "[[CL_CI_v1_"
 local TS_PREFIX     = "[[CL_TS_v1_"   -- telemetry snapshot (positions)
@@ -45,6 +72,7 @@ local TELEMETRY_INTERVAL = 3.0        -- Claude (v2.5.1): 2.0 -> 3.0s between po
 local BUFF_POLL_INTERVAL = 3.0        -- seconds between buff-aura polls (catches juju/totem up/down edges)
 local RAID_CONSUME_INTERVAL = 20.0   -- Claude (v2.9.3): seconds between whole-raid CONSUMABLE scans. Slow on purpose — consumables are static, so dedup keeps it at ~zero chunks after the first capture; this cadence just catches re-pots + late-readable players.
 local CONSUME_MAX_SCANS = 6          -- Claude (v2.9.4): per-GUID scan cap. A unit is "settled" once its consumable set is non-empty AND unchanged across 2 scans (stop scanning it); a buffless/never-settling unit gives up after this many scans (pulls + 20s timer ≈ through the first boss).
+local RC_UNITS_PER_TICK = 6          -- Claude (v3.0.0): whole-raid consumable scan is spread across frames — read at most this many unit tokens per OnUpdate frame instead of all ~80 at once. 6 units × ≤40 aura slots ≈ ≤240 UnitAura calls/frame worst case (vs ~3200 in one frame); a full 40-man pass drains in ~14 frames (~0.25s), and settled units cost ~nothing. Keeps the pull frame off the hook entirely (the pull only *starts* a pass).
 local CHUNK_BODY    = 850       -- base64 chars per chunk (field cap ~1023, header ~46)
 local QUEUE_MAX     = 400       -- ring cap
 local CHUNK_TTL     = 600       -- seconds a chunk waits before TTL-evict
@@ -608,7 +636,8 @@ end
 -- and a flask popped before /combatlog emits no CLEU event so it's invisible without a relay.
 -- This is budget-safe because the consumable list is tiny per player AND consumables are STATIC,
 -- so after the first capture the per-GUID dedup relays zero — unlike the flickering raid buffs
--- that sank the old full scan. See raidConsumeUnits / enqueueRaidConsumables.
+-- that sank the old full scan. See raidConsumeUnits / startRaidConsumeScan (the scan is spread
+-- across frames — a few units per OnUpdate — so the read never lands on one frame; v3.0.0).
 --
 -- Per-unit dedup: a unit's (allowlisted) aura set is relayed only when it CHANGES — the
 -- first pull captures the static pre-pull buffs, later polls relay just totem/juju up/down
@@ -745,64 +774,84 @@ local relayedBuffs = {}   -- guidHex -> last relayed aura-list string (dedup: sk
 local consumeScans  = {}  -- guid -> scan count
 local consumeStable = {}  -- guid -> last non-empty consumable set string
 local consumeDone   = {}  -- guid -> true once settled / given up
+-- Claude (v3.0.0): in-flight state for the SPREAD whole-raid consumable scan. A "pass" freezes
+-- the roster's unit list (rcUnits) and walks it a few units per frame (rcCursor), accumulating
+-- changed blocks (rcBlocks) + the dedup commit map (rcUpdates) + per-pass GUID dedup (rcSeen).
+-- nil rcUnits = idle. The payload is built + enqueued only when the cursor finishes the list, so
+-- the whole pass still lands as ONE BU snapshot (same packing/budget as the old one-shot scan).
+local rcUnits, rcCursor, rcBlocks, rcUpdates, rcSeen = nil, 0, nil, nil, nil
 local function resetConsumeScans()
     wipe(consumeScans); wipe(consumeStable); wipe(consumeDone)
+    rcUnits, rcCursor, rcBlocks, rcUpdates, rcSeen = nil, 0, nil, nil, nil  -- abort any in-flight spread pass (stale roster on zone change)
 end
 -- Returns payload, commit. The dedup baseline (relayedBuffs) is NOT updated here —
 -- the returned commit() applies it, and is only invoked once the chunk lands (so a
 -- dropped chunk re-offers its buffs next poll instead of being lost permanently).
 -- units = unit tokens to scan; consumablesOnly = match only the consumable list (whole-raid
 -- pass) vs the broad allowlist + consumables (self+pet pass).
-local function captureBuffs(force, units, consumablesOnly)
-    if type(UnitAura) ~= "function" then return nil end
-    local blocks, seen, updates = {}, {}, {}
-    for _, u in ipairs(units) do
-        -- Whole-raid pass: skip the player + own pet — the self+pet broad pass owns their
-        -- GUIDs in relayedBuffs, so double-writing here would thrash the per-GUID dedup.
-        if UnitExists(u) and not (consumablesOnly and (UnitIsUnit(u, "player") or UnitIsUnit(u, "pet"))) then
-            local g = (UnitGUID(u) or ""):gsub("^0x", "")
-            -- Claude (v2.9.4): skip units whose consumables have settled (raid pass only) —
-            -- avoids re-reading their auras every cycle. force (test) bypasses the skip.
-            if g ~= "" and not seen[g] and not (consumablesOnly and consumeDone[g] and not force) then
-                seen[g] = true
-                local listStr = table.concat(readAuras(u, consumablesOnly), ",")   -- "" when no readable buffs
-                local prev = relayedBuffs[g]
-                -- Relay a block when this unit's aura-set CHANGED. A transition to empty
-                -- ("g=") tells the server the unit's tracked buffs all dropped (closes
-                -- open windows). Skip units that have never had buffs (prev==nil & empty)
-                -- so out-of-range/buffless units don't spam empty blocks. force (test)
-                -- re-sends present sets only.
-                if force then
-                    if listStr ~= "" then updates[g] = listStr; blocks[#blocks + 1] = g .. "=" .. listStr end
-                elseif not (listStr == "" and prev == nil) and listStr ~= prev then
-                    updates[g] = listStr
-                    blocks[#blocks + 1] = g .. "=" .. listStr
-                end
-                -- Claude (v2.9.4): consumable scan-state (raid pass only; the relay above already
-                -- ran, so the settling scan's data is never lost). Settled = non-empty + unchanged
-                -- across 2 scans; give up after CONSUME_MAX_SCANS (buffless or never-settling).
-                if consumablesOnly and not force then
-                    local n = (consumeScans[g] or 0) + 1
-                    consumeScans[g] = n
-                    if listStr ~= "" and n >= 2 and listStr == consumeStable[g] then
-                        consumeDone[g] = true
-                    elseif n >= CONSUME_MAX_SCANS then
-                        consumeDone[g] = true
-                    end
-                    if listStr ~= "" then consumeStable[g] = listStr end
-                end
-            end
-        end
+-- Scan ONE unit for the BU producer, appending a changed-block to blocks/updates (and, on the
+-- whole-raid consumable pass, advancing the per-GUID settle state). Pure extraction of the old
+-- captureBuffs per-unit body — single-sourced so the one-shot self+pet path (captureBuffs) and
+-- the spread whole-raid path (stepRaidConsumeScan) stay identical. `seen` dedups GUIDs per pass.
+-- Claude (v3.0.0).
+local function scanBuffUnit(u, consumablesOnly, force, blocks, seen, updates)
+    -- Whole-raid pass: skip the player + own pet — the self+pet broad pass owns their
+    -- GUIDs in relayedBuffs, so double-writing here would thrash the per-GUID dedup.
+    if not UnitExists(u) then return end
+    if consumablesOnly and (UnitIsUnit(u, "player") or UnitIsUnit(u, "pet")) then return end
+    local g = (UnitGUID(u) or ""):gsub("^0x", "")
+    -- Claude (v2.9.4): skip units whose consumables have settled (raid pass only) —
+    -- avoids re-reading their auras every cycle. force (test) bypasses the skip.
+    if g == "" or seen[g] or (consumablesOnly and consumeDone[g] and not force) then return end
+    seen[g] = true
+    local listStr = table.concat(readAuras(u, consumablesOnly), ",")   -- "" when no readable buffs
+    local prev = relayedBuffs[g]
+    -- Relay a block when this unit's aura-set CHANGED. A transition to empty
+    -- ("g=") tells the server the unit's tracked buffs all dropped (closes
+    -- open windows). Skip units that have never had buffs (prev==nil & empty)
+    -- so out-of-range/buffless units don't spam empty blocks. force (test)
+    -- re-sends present sets only.
+    if force then
+        if listStr ~= "" then updates[g] = listStr; blocks[#blocks + 1] = g .. "=" .. listStr end
+    elseif not (listStr == "" and prev == nil) and listStr ~= prev then
+        updates[g] = listStr
+        blocks[#blocks + 1] = g .. "=" .. listStr
     end
-    if #blocks == 0 then return nil end
-    -- Claude (v2.5.1): field 4 is a combat-log-format date stamp (same as LT). It lets the
-    -- server rebase this snapshot onto the fight timeline exactly (synth aura windows compare
-    -- to fight.startMs) instead of guessing from the failed-cast line that finally carried it.
-    -- The server tells label-vs-block apart by the '=' every block has and a date never does.
+    -- Claude (v2.9.4): consumable scan-state (raid pass only; the relay above already
+    -- ran, so the settling scan's data is never lost). Settled = non-empty + unchanged
+    -- across 2 scans; give up after CONSUME_MAX_SCANS (buffless or never-settling).
+    if consumablesOnly and not force then
+        local n = (consumeScans[g] or 0) + 1
+        consumeScans[g] = n
+        if listStr ~= "" and n >= 2 and listStr == consumeStable[g] then
+            consumeDone[g] = true
+        elseif n >= CONSUME_MAX_SCANS then
+            consumeDone[g] = true
+        end
+        if listStr ~= "" then consumeStable[g] = listStr end
+    end
+end
+
+-- Build the BU payload + dedup commit from accumulated blocks/updates (nil when nothing changed).
+-- Claude (v2.5.1): field 4 is a combat-log-format date stamp (same as LT). It lets the server
+-- rebase this snapshot onto the fight timeline exactly (synth aura windows compare to
+-- fight.startMs) instead of guessing from the failed-cast line that finally carried it. The
+-- server tells label-vs-block apart by the '=' every block has and a date never does.
+local function buildBuffPayload(blocks, updates)
+    if not blocks or #blocks == 0 then return nil end
     local payload = string.format("BU|%d|%d|%s|%s",
         math.floor((GetTime() or 0) * 1000), time() or 0, date("%m/%d %H:%M:%S"), table.concat(blocks, "|"))
     local commit = function() for g, v in pairs(updates) do relayedBuffs[g] = v end end
     return payload, commit
+end
+
+local function captureBuffs(force, units, consumablesOnly)
+    if type(UnitAura) ~= "function" then return nil end
+    local blocks, seen, updates = {}, {}, {}
+    for _, u in ipairs(units) do
+        scanBuffUnit(u, consumablesOnly, force, blocks, seen, updates)
+    end
+    return buildBuffPayload(blocks, updates)
 end
 
 local function _enqueueBuffPayload(payload, commit)
@@ -824,10 +873,38 @@ local function enqueueBuffs(force)
     return _enqueueBuffPayload(captureBuffs(force, buffUnitTokens(), false))
 end
 
--- whole raid + their pets, consumables only. Static auras → after the first capture the
--- per-GUID dedup keeps this at zero chunks, so it's a one-time burst, not a recurring cost.
-local function enqueueRaidConsumables(force)
-    return _enqueueBuffPayload(captureBuffs(force, raidConsumeUnits(), true))
+-- whole raid + their pets, consumables only — SPREAD ACROSS FRAMES. Claude (v3.0.0): the old
+-- one-shot scan read up to ~80 unit tokens × ≤40 aura slots in a SINGLE frame (worst case at the
+-- first pull, exactly when the frame is already busy with the CI base64 + self+pet/PO scans) — a
+-- visible hitch risk in a big raid. Now a trigger just STARTS a pass (freezes the roster list);
+-- the OnUpdate drains RC_UNITS_PER_TICK units per frame and enqueues ONE BU snapshot when the
+-- list finishes. Static consumables + per-GUID dedup still make it a one-time burst that zeroes
+-- out after the first ~minute; the only change is *when* the reads happen (a handful per frame
+-- over ~0.25s) instead of all at once.
+local function startRaidConsumeScan()
+    if rcUnits then return end                  -- a pass is already in flight (a pull mid-pass is a no-op, not a restart)
+    if type(UnitAura) ~= "function" then return end   -- parity with captureBuffs' old guard
+    local units = raidConsumeUnits()
+    if #units == 0 then return end
+    rcUnits, rcCursor, rcBlocks, rcUpdates, rcSeen = units, 1, {}, {}, {}
+end
+
+-- Advance the in-flight pass by at most `budget` unit tokens. When the cursor finishes the list,
+-- build + enqueue the accumulated snapshot (one BU payload, dedup commit on its last chunk's land)
+-- and return to idle. No-op when idle. Same per-unit logic as the self+pet pass (scanBuffUnit).
+local function stepRaidConsumeScan(budget)
+    if not rcUnits then return end
+    local n = 0
+    while rcCursor <= #rcUnits and n < budget do
+        scanBuffUnit(rcUnits[rcCursor], true, false, rcBlocks, rcSeen, rcUpdates)
+        rcCursor = rcCursor + 1
+        n = n + 1
+    end
+    if rcCursor > #rcUnits then
+        local payload, commit = buildBuffPayload(rcBlocks, rcUpdates)
+        rcUnits, rcCursor, rcBlocks, rcUpdates, rcSeen = nil, 0, nil, nil, nil
+        _enqueueBuffPayload(payload, commit)   -- payload nil (nothing changed) → no-op
+    end
 end
 
 --==========================================================================--
@@ -1029,6 +1106,16 @@ local function ensureFlushAttr()
 end
 
 updateFlushPrompt = function()
+    -- Claude (v3.0.0) PERF: this runs every 0.5s for the whole session (the OnUpdate ticker is
+    -- ungated). The prompt can ONLY ever show when forced, or when the run is complete AND the
+    -- relay is active — i.e. never mid-raid until the last boss, and never out of an instance.
+    -- In every other state `show` resolves to false regardless of the queue, so bail BEFORE
+    -- ltPending()'s whole-queue scan (up to QUEUE_MAX entries, twice a second). When we do gate
+    -- through, ltPending() still reconciles lootRowsPending exactly as before.
+    if not (flushForce or (active and runComplete)) then
+        if flushFrame then flushFrame:SetAlpha(0) end
+        return
+    end
     local lt = ltPending()
     if lt == 0 then lootRowsPending = 0 end   -- reconcile: the chunks all landed or TTL-evicted
 
@@ -1088,7 +1175,9 @@ frame:SetScript("OnEvent", function(self, event, ...)
         -- (first pull captures the raid, later pulls are near-zero unless someone
         -- rebuffs). Gear stays once-per-version via enqueueGroupCI. Claude (v2.6.0):
         -- pet->owner snapshot too (deterministic attribution; dedup keeps it cheap).
-        if active then enqueueGroupCI(false); enqueueBuffs(false); enqueueRaidConsumables(false); enqueueVersion(); enqueuePetOwners(false) end
+        -- Claude (v3.0.0): startRaidConsumeScan() only ARMS the spread scan — the OnUpdate drains
+        -- it a few units/frame, so the pull frame itself no longer eats the whole-raid aura read.
+        if active then enqueueGroupCI(false); enqueueBuffs(false); startRaidConsumeScan(); enqueueVersion(); enqueuePetOwners(false) end
     elseif event == "UNIT_PET" or event == "RAID_ROSTER_UPDATE" or event == "PARTY_MEMBERS_CHANGED" then
         -- Claude (v2.6.0): a pet was summoned/dismissed/resummoned (new GUID) or the roster
         -- changed (a member's pet may now be readable, or a new petN slot appeared) — re-scan
@@ -1160,11 +1249,15 @@ frame:SetScript("OnUpdate", function(self, elapsed)
         -- Claude (v2.9.3): slow whole-raid consumable scan. Separate (slow) cadence from the
         -- 3s self+pet poll so the ~80-unit scan doesn't run every 3s; dedup makes the relay
         -- a one-time burst regardless.
+        -- Claude (v3.0.0): the 20s tick only ARMS a pass; stepRaidConsumeScan below drains it a
+        -- few units per frame so the heavy read never lands on a single frame. startRaidConsumeScan
+        -- no-ops while a pass is in flight, so the timer can't stack passes.
         raidConsumeAccum = raidConsumeAccum + (elapsed or 0)
         if raidConsumeAccum >= RAID_CONSUME_INTERVAL then
             raidConsumeAccum = 0
-            enqueueRaidConsumables(false)
+            startRaidConsumeScan()
         end
+        stepRaidConsumeScan(RC_UNITS_PER_TICK)   -- drain any in-flight consumable pass, a slice per frame
     end
     -- Loot flush runs outside the `active` gate (loot is usually looted out of
     -- combat). The chunk queue holds the enqueued chunk until the next failed cast
