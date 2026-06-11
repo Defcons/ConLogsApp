@@ -43,6 +43,7 @@ local PO_PREFIX     = "[[CL_PO_v1_"   -- pet->owner (deterministic UnitGUID scan
 local LOOT_FLUSH_DELAY = 3.0          -- seconds to batch loot events into one chunk
 local TELEMETRY_INTERVAL = 3.0        -- Claude (v2.5.1): 2.0 -> 3.0s between position snapshots (less per-tick overhead; POS_TTL=5 still covers it)
 local BUFF_POLL_INTERVAL = 3.0        -- seconds between buff-aura polls (catches juju/totem up/down edges)
+local RAID_CONSUME_INTERVAL = 20.0   -- Claude (v2.9.3): seconds between whole-raid CONSUMABLE scans. Slow on purpose — consumables are static, so dedup keeps it at ~zero chunks after the first capture; this cadence just catches re-pots + late-readable players.
 local CHUNK_BODY    = 850       -- base64 chars per chunk (field cap ~1023, header ~46)
 local QUEUE_MAX     = 400       -- ring cap
 local CHUNK_TTL     = 600       -- seconds a chunk waits before TTL-evict
@@ -597,11 +598,16 @@ end
 -- Both feed the same BU stream; the server injects synthetic APPLIED at the first
 -- snapshot a buff appears in, and REMOVED at the snapshot it disappears from.
 --
--- Claude (v2.5.1): we scan SELF + own pet only (was whole-raid — see buffUnitTokens), and
--- only the curated blind-spot allowlist (see readAuras). A whole-raid full-aura snapshot was
--- 28-47 chunks and NEVER completed against the ~9 chunks/min failed-cast budget; self+pet
--- curated is ~1 chunk and completes atomically. The MESH-OF-SELF gives per-player breadth:
--- every ConLogs user relays their own buffs in their own log, and merged groups stitch them.
+-- Claude (v2.5.1): the BROAD allowlist (totems/blessings/raid auras, see readAuras) is scanned
+-- on SELF + own pet only. A whole-raid FULL-aura snapshot was 28-47 chunks and NEVER completed
+-- against the ~9 chunks/min failed-cast budget; self+pet curated is ~1 chunk and completes
+-- atomically.
+-- Claude (v2.9.3): CONSUMABLES are the exception — they ARE scanned whole-raid (+ pets), because
+-- the MESH-OF-SELF can't be relied on for them (most raiders don't run the addon / won't upload),
+-- and a flask popped before /combatlog emits no CLEU event so it's invisible without a relay.
+-- This is budget-safe because the consumable list is tiny per player AND consumables are STATIC,
+-- so after the first capture the per-GUID dedup relays zero — unlike the flickering raid buffs
+-- that sank the old full scan. See raidConsumeUnits / enqueueRaidConsumables.
 --
 -- Per-unit dedup: a unit's (allowlisted) aura set is relayed only when it CHANGES — the
 -- first pull captures the static pre-pull buffs, later polls relay just totem/juju up/down
@@ -644,26 +650,88 @@ local function isRelayBuff(name)
     end
     return false
 end
-local function readAuras(unit)
+
+-- Claude (v2.9.3): CONSUMABLE aura list — the auras CLEU can't be relied on for, because
+-- they're typically popped BEFORE /combatlog (flasks/elixirs/food at the start of the raid)
+-- and so emit no SPELL_AURA_APPLIED in the log. Unlike the totem/raid-buff allowlist above,
+-- these are scanned across the WHOLE raid (+ pets), so the match must be PRECISE: an
+-- EXACT-name set for the oddballs (flask buffs rarely contain "Flask"; e.g. Flask of Supreme
+-- Power -> "Supreme Power") plus only the few SAFE substring families. Critically, exact
+-- matching on bare stat names ("Intellect" etc.) avoids catching the FLICKERING raid buffs
+-- ("Arcane Intellect") that CLEU already records — relaying those raid-wide is what buried
+-- the queue in the old whole-raid scan. Consumables are static, so once captured the per-GUID
+-- dedup keeps this at zero chunks. Buff names verified against a real PE raid log where noted.
+local CONSUME_SUBSTR = { "Elixir", "Well Fed", "Enhance " } -- Elixir of X / Greater Arcane Elixir; food; scroll buffs
+local CONSUME_EXACT = {
+    -- Flasks (buff names — NOT "Flask of …")
+    ["Supreme Power"] = true, ["Distilled Wisdom"] = true,       -- verified in PE log
+    ["Flask of the Titans"] = true, ["Flask of the Chromatic Dragon"] = true,
+    -- Flask of Overwhelming Might (+90 AP/RAP, PE) — exact buff name unconfirmed; cover both forms.
+    ["Overwhelming Might"] = true, ["Overwhelming Power"] = true,
+    ["Flask of Overwhelming Might"] = true, ["Flask of Overwhelming Power"] = true,
+    -- Battle elixirs whose buff name lacks "Elixir"
+    ["Pure Arcane Power"] = true, ["Arcane Power"] = true,       -- verified (PE custom)
+    ["Greater Agility"] = true, ["Increased Agility"] = true,    -- verified
+    ["Shadow Power"] = true, ["Firepower"] = true, ["Frost Power"] = true,
+    ["Winterfall Firewater"] = true,
+    -- Guardian elixirs whose buff name lacks "Elixir"
+    ["Greater Intellect"] = true, ["Mageblood"] = true,         -- Greater Intellect verified
+    -- Scroll / lesser-stat buffs (PE names them bare, not "Enhance …" — verified in log)
+    ["Agility"] = true, ["Strength"] = true, ["Intellect"] = true,
+    ["Stamina"] = true, ["Spirit"] = true,
+    -- Juju (only the two DPS ones, per user). Also applied to PETS.
+    ["Juju Power"] = true, ["Juju Might"] = true,
+}
+local function isConsumableAura(name)
+    if type(name) ~= "string" then return false end
+    if CONSUME_EXACT[name] then return true end
+    for _, s in ipairs(CONSUME_SUBSTR) do
+        if name:find(s, 1, true) then return true end
+    end
+    return false
+end
+
+-- consumablesOnly=true (whole-raid + pets): match ONLY the consumable list. Otherwise
+-- (self+pet): the broad totem/raid-buff allowlist PLUS consumables, so the logger's own
+-- flask (e.g. "Supreme Power") is no longer missed by the substring-only allowlist.
+local function readAuras(unit, consumablesOnly)
     local list = {}
     for i = 1, 40 do
         local name, _, _, _, _, _, _, _, _, _, spellId = UnitAura(unit, i, "HELPFUL")
         if not name then break end
-        if isRelayBuff(name) then
+        local keep = consumablesOnly and isConsumableAura(name)
+            or (not consumablesOnly and (isRelayBuff(name) or isConsumableAura(name)))
+        if keep then
             list[#list + 1] = string.format("%s~%s", tostring(spellId or 0), name)
         end
     end
     return list
 end
 
--- Claude (v2.5.1): SELF + own pet ONLY. The whole-raid scan produced 28-47-chunk payloads
--- that never completed (the failed-cast budget is ~9 chunks/min, and a fresh full-raid
--- snapshot enqueued every 3s buried the queue). Self+pet curated is ~1 chunk and completes
--- atomically. Per-player breadth comes from the MESH-OF-SELF — every ConLogs user relays
--- their OWN buffs in their OWN log, and merged raid groups stitch the loggers together —
--- so one log no longer has to (and never successfully did) carry the whole raid.
+-- Claude (v2.5.1 / v2.9.3): the BROAD allowlist scans SELF + own pet only — a whole-raid full
+-- scan was 28-47 chunks/3s and buried the ~9-chunks/min queue. (CONSUMABLES are scanned
+-- whole-raid separately via raidConsumeUnits — safe because that list is static + tiny, so
+-- dedup zeroes it after the first capture, unlike the flickering raid buffs that sank the old
+-- full scan.) Totem/raid-buff breadth still leans on the MESH-OF-SELF for non-loggers.
 local function buffUnitTokens()
     return { "player", "pet" }
+end
+
+-- Claude (v2.9.3): units for the whole-raid CONSUMABLE scan — every raid/party member AND
+-- their pet (jujus + scrolls get applied to PETS too). The player + own pet are intentionally
+-- absent: the self+pet broad pass (buffUnitTokens) already owns their GUIDs in the dedup table,
+-- and double-covering would thrash it. 3.3.5 unit tokens: raid1-40 / raidpetN, party1-4 / partypetN.
+local function raidConsumeUnits()
+    local t = {}
+    local nr = (GetNumRaidMembers and GetNumRaidMembers()) or 0
+    if nr > 0 then
+        for i = 1, nr do t[#t + 1] = "raid" .. i; t[#t + 1] = "raidpet" .. i end
+    else
+        local np = (GetNumPartyMembers and GetNumPartyMembers()) or 0
+        for i = 1, np do t[#t + 1] = "party" .. i; t[#t + 1] = "partypet" .. i end
+        -- party1-4 already excludes the player; their own pet rides the self+pet pass.
+    end
+    return t
 end
 
 local buffSnapId = 0
@@ -671,15 +739,19 @@ local relayedBuffs = {}   -- guidHex -> last relayed aura-list string (dedup: sk
 -- Returns payload, commit. The dedup baseline (relayedBuffs) is NOT updated here —
 -- the returned commit() applies it, and is only invoked once the chunk lands (so a
 -- dropped chunk re-offers its buffs next poll instead of being lost permanently).
-local function captureBuffs(force)
+-- units = unit tokens to scan; consumablesOnly = match only the consumable list (whole-raid
+-- pass) vs the broad allowlist + consumables (self+pet pass).
+local function captureBuffs(force, units, consumablesOnly)
     if type(UnitAura) ~= "function" then return nil end
     local blocks, seen, updates = {}, {}, {}
-    for _, u in ipairs(buffUnitTokens()) do
-        if UnitExists(u) then
+    for _, u in ipairs(units) do
+        -- Whole-raid pass: skip the player + own pet — the self+pet broad pass owns their
+        -- GUIDs in relayedBuffs, so double-writing here would thrash the per-GUID dedup.
+        if UnitExists(u) and not (consumablesOnly and (UnitIsUnit(u, "player") or UnitIsUnit(u, "pet"))) then
             local g = (UnitGUID(u) or ""):gsub("^0x", "")
             if g ~= "" and not seen[g] then
                 seen[g] = true
-                local listStr = table.concat(readAuras(u), ",")   -- "" when no readable buffs
+                local listStr = table.concat(readAuras(u, consumablesOnly), ",")   -- "" when no readable buffs
                 local prev = relayedBuffs[g]
                 -- Relay a block when this unit's aura-set CHANGED. A transition to empty
                 -- ("g=") tells the server the unit's tracked buffs all dropped (closes
@@ -706,8 +778,7 @@ local function captureBuffs(force)
     return payload, commit
 end
 
-local function enqueueBuffs(force)
-    local payload, commit = captureBuffs(force)
+local function _enqueueBuffPayload(payload, commit)
     if not payload then return 0 end
     buffSnapId = buffSnapId + 1
     local b64 = b64encode(payload)
@@ -719,6 +790,17 @@ local function enqueueBuffs(force)
             (i == total) and commit or nil, PRIO_BU)
     end
     return total
+end
+
+-- self + own pet, broad allowlist (totems need the 3s freshness) + consumables.
+local function enqueueBuffs(force)
+    return _enqueueBuffPayload(captureBuffs(force, buffUnitTokens(), false))
+end
+
+-- whole raid + their pets, consumables only. Static auras → after the first capture the
+-- per-GUID dedup keeps this at zero chunks, so it's a one-time burst, not a recurring cost.
+local function enqueueRaidConsumables(force)
+    return _enqueueBuffPayload(captureBuffs(force, raidConsumeUnits(), true))
 end
 
 --==========================================================================--
@@ -979,7 +1061,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
         -- (first pull captures the raid, later pulls are near-zero unless someone
         -- rebuffs). Gear stays once-per-version via enqueueGroupCI. Claude (v2.6.0):
         -- pet->owner snapshot too (deterministic attribution; dedup keeps it cheap).
-        if active then enqueueGroupCI(false); enqueueBuffs(false); enqueueVersion(); enqueuePetOwners(false) end
+        if active then enqueueGroupCI(false); enqueueBuffs(false); enqueueRaidConsumables(false); enqueueVersion(); enqueuePetOwners(false) end
     elseif event == "UNIT_PET" or event == "RAID_ROSTER_UPDATE" or event == "PARTY_MEMBERS_CHANGED" then
         -- Claude (v2.6.0): a pet was summoned/dismissed/resummoned (new GUID) or the roster
         -- changed (a member's pet may now be readable, or a new petN slot appeared) — re-scan
@@ -1023,6 +1105,7 @@ end)
 -- client still sends once per TELEMETRY_INTERVAL).
 local tsAccum  = (math.random and (math.random() * TELEMETRY_INTERVAL)) or 0
 local buffAccum = 0
+local raidConsumeAccum = 0   -- Claude (v2.9.3): whole-raid consumable scan throttle
 local flushAccum = 0   -- Claude (v2.7.0): throttle the end-of-raid loot-flush prompt re-eval
 frame:SetScript("OnUpdate", function(self, elapsed)
     -- Claude (v2.5.1) PERF: skip the entire position producer (incl. the SetMapToCurrentZone
@@ -1045,6 +1128,14 @@ frame:SetScript("OnUpdate", function(self, elapsed)
         if buffAccum >= BUFF_POLL_INTERVAL then
             buffAccum = 0
             enqueueBuffs(false)
+        end
+        -- Claude (v2.9.3): slow whole-raid consumable scan. Separate (slow) cadence from the
+        -- 3s self+pet poll so the ~80-unit scan doesn't run every 3s; dedup makes the relay
+        -- a one-time burst regardless.
+        raidConsumeAccum = raidConsumeAccum + (elapsed or 0)
+        if raidConsumeAccum >= RAID_CONSUME_INTERVAL then
+            raidConsumeAccum = 0
+            enqueueRaidConsumables(false)
         end
     end
     -- Loot flush runs outside the `active` gate (loot is usually looted out of
