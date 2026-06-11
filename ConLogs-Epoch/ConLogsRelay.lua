@@ -633,7 +633,9 @@ local RELAY_BUFF_SUBSTRINGS = {
     "Gift of the Wild", "Mark of the Wild", "Prayer of", "Fortitude", "Spirit",
     "Intellect", "Brilliance", "Shout", "Inspiration", "Unleashed Rage",
     -- consumables / world buffs
-    "Flask", "Elixir", "Well Fed", "Juju", "Scroll", "Resistance", "Knowledge",
+    -- Claude: "Enhance " catches the scroll APPLIED-buff names ("Enhance Agility/Strength/
+    -- Intellect/Stamina") — the buff is NOT named "Scroll …", so the "Scroll" term alone missed them.
+    "Flask", "Elixir", "Well Fed", "Juju", "Scroll", "Enhance ", "Resistance", "Knowledge",
 }
 local function isRelayBuff(name)
     if type(name) ~= "string" then return false end
