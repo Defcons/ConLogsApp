@@ -44,6 +44,7 @@ local LOOT_FLUSH_DELAY = 3.0          -- seconds to batch loot events into one c
 local TELEMETRY_INTERVAL = 3.0        -- Claude (v2.5.1): 2.0 -> 3.0s between position snapshots (less per-tick overhead; POS_TTL=5 still covers it)
 local BUFF_POLL_INTERVAL = 3.0        -- seconds between buff-aura polls (catches juju/totem up/down edges)
 local RAID_CONSUME_INTERVAL = 20.0   -- Claude (v2.9.3): seconds between whole-raid CONSUMABLE scans. Slow on purpose — consumables are static, so dedup keeps it at ~zero chunks after the first capture; this cadence just catches re-pots + late-readable players.
+local CONSUME_MAX_SCANS = 6          -- Claude (v2.9.4): per-GUID scan cap. A unit is "settled" once its consumable set is non-empty AND unchanged across 2 scans (stop scanning it); a buffless/never-settling unit gives up after this many scans (pulls + 20s timer ≈ through the first boss).
 local CHUNK_BODY    = 850       -- base64 chars per chunk (field cap ~1023, header ~46)
 local QUEUE_MAX     = 400       -- ring cap
 local CHUNK_TTL     = 600       -- seconds a chunk waits before TTL-evict
@@ -736,6 +737,17 @@ end
 
 local buffSnapId = 0
 local relayedBuffs = {}   -- guidHex -> last relayed aura-list string (dedup: skip unchanged)
+-- Claude (v2.9.4): per-GUID consumable scan throttle (whole-raid pass only). Once a unit's
+-- consumable set is non-empty AND unchanged across two scans it's "settled" → stop scanning it
+-- (a player who'd only popped SOME consumes at the first scan keeps getting scanned until the
+-- set stabilises, catching the rest). A buffless/never-settling unit is dropped after
+-- CONSUME_MAX_SCANS. Reset per run (resetConsumeScans) so a new raid re-scans.
+local consumeScans  = {}  -- guid -> scan count
+local consumeStable = {}  -- guid -> last non-empty consumable set string
+local consumeDone   = {}  -- guid -> true once settled / given up
+local function resetConsumeScans()
+    wipe(consumeScans); wipe(consumeStable); wipe(consumeDone)
+end
 -- Returns payload, commit. The dedup baseline (relayedBuffs) is NOT updated here —
 -- the returned commit() applies it, and is only invoked once the chunk lands (so a
 -- dropped chunk re-offers its buffs next poll instead of being lost permanently).
@@ -749,7 +761,9 @@ local function captureBuffs(force, units, consumablesOnly)
         -- GUIDs in relayedBuffs, so double-writing here would thrash the per-GUID dedup.
         if UnitExists(u) and not (consumablesOnly and (UnitIsUnit(u, "player") or UnitIsUnit(u, "pet"))) then
             local g = (UnitGUID(u) or ""):gsub("^0x", "")
-            if g ~= "" and not seen[g] then
+            -- Claude (v2.9.4): skip units whose consumables have settled (raid pass only) —
+            -- avoids re-reading their auras every cycle. force (test) bypasses the skip.
+            if g ~= "" and not seen[g] and not (consumablesOnly and consumeDone[g] and not force) then
                 seen[g] = true
                 local listStr = table.concat(readAuras(u, consumablesOnly), ",")   -- "" when no readable buffs
                 local prev = relayedBuffs[g]
@@ -763,6 +777,19 @@ local function captureBuffs(force, units, consumablesOnly)
                 elseif not (listStr == "" and prev == nil) and listStr ~= prev then
                     updates[g] = listStr
                     blocks[#blocks + 1] = g .. "=" .. listStr
+                end
+                -- Claude (v2.9.4): consumable scan-state (raid pass only; the relay above already
+                -- ran, so the settling scan's data is never lost). Settled = non-empty + unchanged
+                -- across 2 scans; give up after CONSUME_MAX_SCANS (buffless or never-settling).
+                if consumablesOnly and not force then
+                    local n = (consumeScans[g] or 0) + 1
+                    consumeScans[g] = n
+                    if listStr ~= "" and n >= 2 and listStr == consumeStable[g] then
+                        consumeDone[g] = true
+                    elseif n >= CONSUME_MAX_SCANS then
+                        consumeDone[g] = true
+                    end
+                    if listStr ~= "" then consumeStable[g] = listStr end
                 end
             end
         end
@@ -1079,6 +1106,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
         else
             runComplete = false; lootNudged = false; posMapUnusable = false
             lootRowsPending = 0; flushForce = false   -- Claude (v2.7.0): new run → clear stale loot-prompt state
+            resetConsumeScans()   -- Claude (v2.9.4): new instance → re-scan everyone's consumables (relay dedup still suppresses unchanged sets)
             if flushFrame then flushFrame:SetAlpha(0) end
         end
         reevaluate()
