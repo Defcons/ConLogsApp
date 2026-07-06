@@ -601,15 +601,55 @@ local function cmdCoa()
     -- The getter RETURNS are the useful bit — keep these in chat (short).
     for name, ret in pairs(apiCalls) do out("  call " .. name .. "() -> " .. ret) end
 
+    -- GOAL / ENCOUNTER probe: what completes THIS run (e.g. SM Library => Arcanist Doan).
+    -- Shallow-dump the table-returning getters (to expose fields like mapID + encounter
+    -- lists) and try the map-encounter getters both with a candidate mapID and no-arg.
+    local function shallowStr(v, depth)
+        if type(v) ~= "table" then return tostring(v) end
+        local parts = {}
+        for k, vv in pairs(v) do
+            local s = (type(vv) == "table")
+                and (((depth or 0) > 0) and ("{" .. shallowStr(vv, depth - 1) .. "}") or "{..}")
+                or tostring(vv)
+            parts[#parts + 1] = tostring(k) .. "=" .. s
+        end
+        return table.concat(parts, ", ")
+    end
+    local goalDumps = {}
+    local function dumpCall(label, tbl, fn, ...)
+        local t = _G[tbl]
+        if type(t) ~= "table" or type(t[fn]) ~= "function" then return end
+        local r = { pcall(t[fn], ...) }
+        if not r[1] then goalDumps[label] = "ERR"; return end
+        local parts = {}
+        for i = 2, #r do
+            parts[#parts + 1] = (type(r[i]) == "table") and ("{" .. shallowStr(r[i], 1) .. "}") or tostring(r[i])
+        end
+        goalDumps[label] = "(" .. table.concat(parts, " | ") .. ")"
+    end
+    dumpCall("GetActiveKeystoneInfo", "C_MythicPlus", "GetActiveKeystoneInfo")
+    dumpCall("GetKeystoneInfo", "C_MythicPlus", "GetKeystoneInfo")
+    dumpCall("GetActiveKeystoneEncounters", "C_MythicPlus", "GetActiveKeystoneEncounters")
+    dumpCall("GetActiveChallenges", "C_Challenge", "GetActiveChallenges")
+    local mapID = (type(GetCurrentMapAreaID) == "function" and GetCurrentMapAreaID()) or nil
+    goalDumps._mapAreaID = tostring(mapID)
+    dumpCall("GetMapFinalEncounter()", "C_MythicPlus", "GetMapFinalEncounter")
+    dumpCall("GetMapEncounters()", "C_MythicPlus", "GetMapEncounters")
+    if mapID then
+        dumpCall("GetMapFinalEncounter(mapID)", "C_MythicPlus", "GetMapFinalEncounter", mapID)
+        dumpCall("GetMapEncounters(mapID)", "C_MythicPlus", "GetMapEncounters", mapID)
+    end
+    for k, v in pairs(goalDumps) do out("  goal " .. k .. " = " .. tostring(v)) end
+
     ConLogsSpikeDB = ConLogsSpikeDB or {}
     ConLogsSpikeDB.coaProbe = {
         when = date and date("%Y-%m-%d %H:%M:%S") or time(),
         realm = realm, zone = zone, groupSize = groupN,
         instance = { name = iname, type = itype, difficulty = idiff, difficultyName = idiffName, maxPlayers = imax },
         bagKeystones = keyHits, affixAuras = auraHits, globals = gHits,
-        apiMethods = apiMethods, apiCalls = apiCalls,
+        apiMethods = apiMethods, apiCalls = apiCalls, goalDumps = goalDumps,
     }
-    out("Stored to ConLogsSpikeDB.coaProbe. Best run: inside an ACTIVE M+ keystone dungeon (+ a heroic/mythic raid). Then /conlogs spike dump + send me the SV file.")
+    out("Stored to ConLogsSpikeDB.coaProbe (incl. goal/encounter dump). /conlogs spike dump + send me the SV file.")
 end
 
 local function spikeHelp()
