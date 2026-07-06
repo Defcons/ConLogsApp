@@ -1,0 +1,4372 @@
+-- ConLogs.lua
+--
+-- ConLogs-CoA — Copyright (C) 2026 Defcon
+-- Licensed under the GNU General Public License v3.0 or later.
+-- This program is free software: you can redistribute it and/or modify it
+-- under the terms of the GPL as published by the Free Software Foundation.
+-- It comes with ABSOLUTELY NO WARRANTY. See the LICENSE file for details.
+--
+-- single-addon mesh gear inspector. Every client runs the same code:
+-- scans self + groupmates in dungeons/raids, broadcasts chunked gear on the
+-- "EpogArmory" addon-message prefix, receives other clients' broadcasts,
+-- and stores latest gear per GUID in ConLogsDB for manual upload to
+-- epoglogs.com.
+--
+-- Renamed from EpogArmory → ConLogs-CoA (v2.x). PREFIX intentionally stays
+-- "EpogArmory" so ConLogs peers still mesh with any client still on the old
+-- EpogArmory addon during the transition — DO NOT change PREFIX.
+
+local ADDON = "ConLogs-CoA"
+local PREFIX = "EpogArmory"
+
+-- ============================================================================
+-- FORWARD COMPATIBILITY — READ BEFORE EDITING THE WIRE FORMAT OR DB SHAPES
+-- ============================================================================
+-- The mesh must accept any version of the addon talking to any other. The
+-- protections:
+--
+-- 1. APPEND-ONLY WIRE FORMAT. Positions 1..30 of the caret-delimited payload
+--    are frozen forever (proto tag, name, realm, class, level, guid, spec,
+--    scanTime, zone, gear slots 1..19). New fields land at position 31+.
+--    Receivers silently drop unknown trailing tokens, so old clients never
+--    reject new payloads — they just miss fields they don't know.
+--
+-- 2. PROTO LENIENCY. ParsePayload accepts "v<PROTO>" exactly AND
+--    "v<PROTO>.<minor>". Lets us nudge the protocol subtly without breaking
+--    old parsers (e.g. "v1.2" won't be rejected by a "v1"-only reader).
+--
+-- 3. ITEM DATA IS LOCAL, NOT TRANSMITTED. stats / tooltipStats / setBonuses /
+--    damage / speed / tooltipExtras are all computed locally from
+--    GetItemStats and tooltip scans — they never cross the mesh. Adding new
+--    captured fields does NOT require mesh coordination. Each client resolves
+--    items independently from its own live game data.
+--
+-- Rules (never break these):
+--   a. Never reorder existing wire positions. Only append at position 31+.
+--   b. Never change a field's semantics. If ITEM_MOD_STRENGTH_SHORT is
+--      strength today, it's strength forever. Add new fields instead.
+--   c. Never remove fields — old clients may read them. Set to nil, let
+--      absence signal unavailable.
+--
+-- ESCAPE HATCH: if a change is genuinely impossible additively, bump
+-- PROTO = "1" to "2". The new client emits BOTH v1 and v2 payloads during a
+-- transition window (months); v2 receivers prefer v2, fall back to v1. After
+-- widespread adoption, drop v1 emit. Much later, drop v1 receive. No public
+-- release has needed this yet.
+--
+-- ON-DISK MIGRATIONS:
+--   * ConLogsDB — MigratePlayers() runs every PLAYER_LOGIN and reshapes
+--     older per-player records idempotently. Add new migration branches
+--     there when changing the record shape.
+--   * ConLogsItemCacheDB — every entry carries `v = CACHE_SCHEMA`. Bump the
+--     constant when the entry shape changes; stale entries re-fetch on next
+--     touch. See CACHE_SCHEMA's own comment block for the schema version log.
+-- ============================================================================
+local PROTO = "1"
+-- Runtime version. Hardcoded (NOT GetAddOnMetadata) on purpose: GetAddOnMetadata reads
+-- the .toc as cached at client LAUNCH and is NOT refreshed by /reload, so the minimap
+-- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
+-- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
+-- KEEP THIS IN SYNC with the .toc "## Version" on every release.
+local ADDON_VERSION = "0.1.0"
+local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
+
+-- Tuning
+local INSPECT_COOLDOWN      = 900
+local OUT_OF_RANGE_COOLDOWN = 30     -- retry fast when CanInspect fails
+local INSPECT_TIMEOUT       = 4
+local INSPECT_INTERVAL      = 2.5
+-- Delay between consecutive addon-message sends from outQueue.
+--
+-- v0.51: tightened from 2.0s → 0.5s. The original 2.0 was set when the
+-- only outbound traffic was rare organic inspect broadcasts (no urgency).
+-- /conlogs syncfrom changed that — users actively wait on bulk transfers
+-- of up to 200 sets, and 2.0s stagger pushed full-sync time to ~27 min.
+--
+-- Math at 0.5s with ~225 B per wire message: ~450 B/s sustained, well
+-- under WoW 3.3.5's ~800 B/s addon-channel throttle (the figure
+-- ChatThrottleLib uses, which DBM/Recount/etc all rely on). Leaves
+-- ~350 B/s headroom for other addons sharing the channel during raid pulls.
+-- Net effect: sync ETA drops 4x (200-set cap goes 27 min → ~7 min).
+local BROADCAST_STAGGER     = 0.5
+local MAX_CHUNK_BODY        = 200
+local ROSTER_TICK           = 10
+local MIN_INSPECT_LEVEL     = 60
+local MIN_STORE_LEVEL       = 60
+-- Claude: MIN_STORE_EQUIPPED removed in v1.3.3 — replaced by the per-slot
+-- CheckFullSet gate (defined near ItemStringFromLink), which requires every
+-- "useful" slot rather than a numeric threshold.
+local ASSEMBLY_TIMEOUT      = 60
+local MAX_REASM_CHUNKS      = 64   -- reject framing claiming more chunks than this (anti-DoS)
+local MAX_REASM_KEYS        = 200  -- cap concurrent reassembly buffers; evict oldest beyond this
+-- v0.34: reduced from 24h to 4h. AddUnit only ever fires for groupmates
+-- (called from ScanRoster's party/raid iteration), so this window controls
+-- how often we re-inspect teammates to catch spec / gear / PvP-trinket swaps
+-- that happen mid-session. Still shared mesh-wide via lastScanned, so when
+-- one client inspects and broadcasts, every peer's window restarts together
+-- and traffic converges to "one inspect per target per 4h across the mesh".
+-- Traffic impact: ~6x v0.33, which in a 40-player raid is roughly 6 × 12s
+-- of per-target broadcast drain ≈ 1 minute per target per day. Acceptable.
+local SCAN_FRESH_WINDOW     = 14400
+
+-- Runtime config, persisted in ConLogsDB.config on logout.
+-- v0.40: zone restriction removed. PvP loadouts now route to sets["pvp"]
+-- and the mount-gear filter (UTILITY_ITEMS / UTILITY_ITEM_NAMES_ANY_SLOT /
+-- tooltip enchant scan for Mithril Spurs etc.) catches bank-alt / show-off
+-- loadouts regardless of zone. No longer need to gate on instance-only.
+
+local UTILITY_ITEMS = {
+    [11122] = "Carrot on a Stick",
+    [25653] = "Riding Crop",
+    [32863] = "Charm of Swift Flight",
+    [46906] = "Argent War Horn",
+    [6256]  = "Fishing Pole",
+    [6365]  = "Strong Fishing Pole",
+    [6366]  = "Darkwood Fishing Pole",
+    [6367]  = "Big Iron Fishing Pole",
+    [12225] = "Blump Family Fishing Pole",
+    [19970] = "Arcanite Fishing Pole",
+    [25978] = "Seth's Graphite Fishing Pole",
+    [44050] = "Mastercraft Kalu'ak Fishing Pole",
+    [45858] = "Nat's Lucky Fishing Pole",
+    [45991] = "Bone Fishing Pole",
+    [19972] = "Lucky Fishing Hat",
+    [33820] = "Weather-Beaten Fishing Hat",
+    [33864] = "Chef's Hat",
+}
+
+local UTILITY_ENCHANTS = {
+    [464] = "Enchant Gloves - Riding Skill", -- Minor +mount speed
+}
+
+-- Item-name blacklist patterns, matched via GetItemInfo at store time. Used
+-- for items whose IDs vary across Ascension's custom content but whose names
+-- are stable.
+local UTILITY_ITEM_NAMES_ANY_SLOT = {
+    "Rugged Sandle",   -- user's spelling (exact)
+    "Rugged Sandal",   -- alternate spelling ("Rugged Sandals")
+    -- Claude (v1.5.2): low-level "utility" trinkets / weapons that pollute
+    -- raid-relevant gear scans. Name-based (not ID) because Ascension
+    -- reassigns vanilla itemIDs server-side — names are more stable.
+    "Argent Dawn Commission",  -- +rep trinket, common Stratholme leveling drop
+    "Finkle's Skinner",        -- skinning-only one-handed dagger
+    "Skull of Impending Doom", -- novelty trinket (Wailing Caverns)
+}
+
+-- Slot-restricted name patterns. Applied only when the item is in the listed
+-- equipment slots. v0.33: Insignia patterns moved out — an Insignia trinket
+-- no longer rejects the scan; instead it marks the scan as a PvP loadout
+-- and routes gear into sets["pvp"] alongside the talent-tree sets.
+local UTILITY_ITEM_NAMES_BY_SLOT = {
+    -- (empty for now — future slot-specific utility patterns go here)
+}
+
+-- PvP loadout detection: a PvP trinket in slot 13 or 14 flags the
+-- whole equipped set as a PvP loadout. Scanned as a distinct set keyed
+-- sets["pvp"] on the player record.
+-- v1.1.1: broadened patterns. Vanilla/TBC/WotLK PvP trinkets are named
+-- "Insignia of the Alliance/Horde" OR "Medallion of the Alliance/Horde"
+-- (and various Battlemaster's variants). The original "Insignia"-only
+-- pattern missed Medallions entirely — so a Medallion-equipped scan
+-- would route to the dominant-tree set instead of sets["pvp"].
+local PVP_TRINKET_NAME_PATTERNS = { "Insignia", "Medallion", "Battlemaster's" }
+local TRINKET_SLOTS = { 13, 14 }
+
+local function GearLooksPvP(gearLookup)
+    for _, slot in ipairs(TRINKET_SLOTS) do
+        local itemName = gearLookup(slot)
+        if itemName then
+            for _, pat in ipairs(PVP_TRINKET_NAME_PATTERNS) do
+                if itemName:find(pat, 1, true) then return true end
+            end
+        end
+    end
+    return false
+end
+
+-- Claude (v1.5.3): name-resolution fallback chain. GetItemInfo reads the
+-- WoW *client* cache (server-fetched), which is async — a freshly-received
+-- itemID may not yet have a name available when we make the routing
+-- decision in Ingest. ConLogsItemCacheDB is seeded synchronously from
+-- v1.2+ item-info hints BEFORE EntryGearLooksPvP runs, so checking it
+-- first guarantees we have a name to pattern-match against if the
+-- broadcaster sent one. Critical for "Insignia/Medallion/Battlemaster's"
+-- routing — a missed name match would silently route a PvP set to a
+-- talent-tree key.
+local function ResolveItemName(iid)
+    if not iid then return nil end
+    if ConLogsItemCacheDB and ConLogsItemCacheDB[iid] and ConLogsItemCacheDB[iid].name
+       and ConLogsItemCacheDB[iid].name ~= "" then
+        return ConLogsItemCacheDB[iid].name
+    end
+    return GetItemInfo(iid) or nil
+end
+
+-- Live-unit variant: queries GetInventoryItemLink + GetItemInfo. Used in
+-- BuildPayload when we're the scanner.
+local function UnitLooksPvP(unit)
+    return GearLooksPvP(function(slot)
+        local link = GetInventoryItemLink(unit, slot)
+        if not link then return nil end
+        local name = GetItemInfo(link)
+        if name then return name end
+        -- Claude (v1.5.3): fall back to our own item cache if WoW's client
+        -- cache hasn't resolved the inspected item yet.
+        local iid = tonumber(link:match("item:(%d+)"))
+        return ResolveItemName(iid)
+    end)
+end
+
+-- Gear-table variant: reads itemstrings from a parsed payload. Used in
+-- Ingest when we're the receiver.
+local function EntryGearLooksPvP(gear)
+    if not gear then return false end
+    return GearLooksPvP(function(slot)
+        local str = gear[slot]
+        if not str or str == "" then return nil end
+        local iid = tonumber(str:match("^(%d+)"))
+        return ResolveItemName(iid)
+    end)
+end
+
+-- Enchant-name patterns matched by tooltip text on specific slots. Used when
+-- an enchant doesn't have a stable SpellItemEnchantment.dbc ID we can rely on
+-- (e.g. Mithril Spurs — legacy engineering boot enchant). Only scanned on
+-- slots in MOUNT_ENCHANT_SLOTS below, and only at BuildPayload time (sender
+-- side) to avoid tooltip-scanning every received broadcast.
+local UTILITY_ENCHANT_TOOLTIP_PATTERNS = {
+    "Mithril Spurs",
+}
+
+local MOUNT_ENCHANT_SLOTS = { 8, 10 } -- feet, hands
+
+-- v1.1.7: Ascension's transmog system overrides what `GetInventoryItemLink`
+-- returns for inspected players — we get the visual itemID, not the
+-- gameplay one. The "Reality Recalibrators" aura grants the inspector a
+-- server-side override that makes inspect APIs return TRUE gear data.
+-- Without the aura, scanning groupmates produces transmog visuals (often
+-- "naked" loadouts) which would just pollute the mesh, so we skip
+-- non-self auto-inspects when the aura is absent.
+--
+-- The aura applies only to scanning OTHERS — your own self-scan always
+-- sees real gear regardless (transmog never hides your own items from
+-- you), so self-scans aren't gated.
+local REALITY_AURA_NAME = "Reality Recalibrators"
+
+-- Claude (v1.4.1 → v1.4.6): toggle the auto-inspect gating on the Reality
+-- Recalibrators aura. When false, all three interlock points (BuildPayload,
+-- ScanRoster, TryInspect) skip the aura check and let scans proceed.
+--
+-- v1.4.1 test result (validated on Epoch): the 400ms settle + 1.5s verify
+-- pass is NOT sufficient on its own — Ascension/Epoch's transmog override
+-- holds the cosmetic itemID well past those windows for inspected players,
+-- so without the aura we just broadcast junk. Re-enabled the interlock as
+-- the only way to get real gear data.
+--
+-- Flag kept (rather than removed) so we can re-test if server behavior
+-- changes — flipping false is a one-line revert. Diagnostic surfaces
+-- (status command, browser banner, minimap tooltip) still honor the flag.
+local REQUIRE_REALITY_AURA = true
+
+-- v1.1.7+: track whether we've ever seen the aura active this session.
+-- Used to suppress the "aura not active" hint for users who clearly
+-- know about it (avoids false-positive nags during zone transitions
+-- and BG exits, where UnitBuff briefly returns nothing while the
+-- world is loading).
+local everSawRealityAura = false
+
+-- v1.1.7+: aura-settle window after PLAYER_ENTERING_WORLD. Zone
+-- transitions (BG exit, instance load) briefly clear all buffs from
+-- the API's perspective; UnitBuff returns nothing for ~3-6 seconds
+-- before the server re-asserts them. During this window we skip the
+-- aura-missing actions (don't drain the queue, don't show hints,
+-- don't process inspects) — just wait for auras to settle. Once the
+-- window expires, normal gating resumes.
+local AURA_SETTLE_WINDOW = 10 -- seconds after PLAYER_ENTERING_WORLD
+local auraSettleUntil    = 0  -- timestamp; if now() < this, we're in the settle window
+
+local function InAuraSettleWindow()
+    -- Use GetTime() directly. This helper is declared before the
+    -- `local function now()` at line ~613, so `now` doesn't resolve to
+    -- the local — at call time it would look up global `now` (nil) and
+    -- error. GetTime is a Blizzard global, always available.
+    return GetTime() < auraSettleUntil
+end
+
+local function HasRealityAura()
+    if not UnitBuff then return false end
+    for i = 1, 40 do
+        local n = UnitBuff("player", i)
+        if not n then break end
+        if n == REALITY_AURA_NAME then
+            everSawRealityAura = true
+            return true
+        end
+    end
+    return false
+end
+
+-- State
+local queue, inQueue, seen = {}, {}, {}
+local current = nil
+local outQueue = {}
+local nextInspectAt, nextSendAt, lastRoster = 0, 0, 0
+local msgCounter = 0
+local assembly = {}
+
+-- Version ping: broadcast our ADDON_VERSION once at T+120s after login so
+-- groupmates/guildmates running the addon learn when a newer release is out.
+-- Listening is always-on via OnAddonMessage; the outbound ping is one-shot.
+local VERSION_PING_DELAY = 120
+local VERSION_PING_RETRY = 60 -- if no broadcast channel available (solo + no guild), defer
+local versionPingAt      = 0
+local versionPingSent    = false
+local versionNotified    = false
+-- v1.1.7: track whether we've shown the "Reality Recalibrators aura
+-- missing" hint this session. Print once when ScanRoster encounters
+-- groupmates while we lack the aura, then stay silent.
+local realityAuraHintShown = false
+
+-- Admin sync protocol (v0.35): a targeted peer can request another peer's
+-- recent stored scans for bulk-catch-up. Hidden slash command:
+--   /conlogs syncfrom <playerName> [days]
+-- Receiver broadcasts a SYNCREQ; the named target replays their stored
+-- set.rawPayload blobs back through the normal outQueue. Other guildmates
+-- ingest the replays too (free benefit — their DBs also catch up).
+local SYNC_RESPONSE_COOLDOWN     = 3600        -- 1h per requester
+local SYNC_MAX_SETS_PER_RESPONSE = 200         -- cap drain at ~7min even for huge DBs (v0.51 stagger)
+local lastSyncResponseTo         = {}          -- in-memory: requesterName -> time() of last response
+
+-- v0.37: requester-side cap — 3 concurrent outgoing syncs max. Each tracked
+-- with an estimated end time. UI greys rows while a sync is active.
+-- Tracker is in-memory; /reload resets it (which also wipes outQueue, so
+-- both sides stay consistent).
+-- v0.50+: actual ETA is computed per-peer from peerInfo.dbSize and stored
+-- in activeSyncs; this constant is the FALLBACK when peerInfo is missing.
+-- v0.51: tightened from 25*60 → 8*60 to match the new 0.5s stagger
+-- (200-set cap × ~2s/set = ~7 min, +1 min safety).
+local SYNC_MAX_CONCURRENT = 3
+local SYNC_EST_DURATION   = 8 * 60
+local activeSyncs         = {} -- peerName -> estimatedEndTime
+
+-- v0.37: responder-side defense-in-depth. Global cooldown across ALL sync
+-- responses means even a multi-attacker bomb (10 requesters from 10 alts)
+-- only triggers ONE response per 15 min. Combined with the per-requester
+-- 1h cooldown, caps the victim's outQueue load at one 20-min drain at a
+-- time, not N × drain in parallel.
+local SYNC_GLOBAL_COOLDOWN = 900 -- 15 min between any sync responses
+local lastSyncResponseAt   = 0   -- any-peer global timestamp of last response
+
+-- Claude (v1.5.1): auto-sync. Background catch-up from reachable peers
+-- without the user typing /conlogs syncfrom <name>. Picks one new peer
+-- every AUTO_SYNC_TICK_INTERVAL, respects SYNC_MAX_CONCURRENT, applies a
+-- 24h per-peer cooldown so we don't drain the same person over and over.
+-- The cooldown is persisted in ConLogsDB.peerInfo[name].lastSyncedFrom
+-- so it survives /reload and re-login. Disabled via /conlogs autosync off.
+local AUTO_SYNC_PEER_COOLDOWN  = 24 * 3600 -- once per peer per day
+local AUTO_SYNC_TICK_INTERVAL  = 5 * 60    -- at most one new auto-sync every 5 min
+local AUTO_SYNC_MIN_DBSIZE     = 10        -- skip peers with tiny DBs (not worth bandwidth)
+local AUTO_SYNC_DEFAULT_DAYS   = 7         -- request last 7 days of scans
+local AUTO_SYNC_PEER_FRESHNESS = 24 * 3600 -- only consider peers heard from in last 24h
+local AUTO_SYNC_INITIAL_DELAY  = 90        -- first attempt N seconds after PLAYER_LOGIN
+local lastAutoSyncAttemptAt    = 0
+
+-- v0.47: lightweight "who's out there" peer refresh. Lets the UI button in
+-- the Scanners view actively poll the guild for current identity + dbSize
+-- instead of waiting for organic gear-scan broadcasts. PEERPING is a tiny
+-- request; each receiver replies PEERPONG with their MyIdentity, dbSize,
+-- version, and current character name. Responses update peerInfo, which
+-- the Scanners leaderboard reads.
+local PEER_PING_COOLDOWN     = 60   -- user can press Refresh Peers at most every 60s
+local PEER_RESPONSE_COOLDOWN = 60   -- don't respond to same requester twice in 1 min
+local lastPeerPingSentAt     = 0    -- in-memory: last time WE sent a PEERPING
+local lastPeerPongTo         = {}   -- in-memory: requesterName -> time() of last PEERPONG sent
+
+local function CleanExpiredSyncs()
+    local t = time()
+    for name, endT in pairs(activeSyncs) do
+        if endT <= t then activeSyncs[name] = nil end
+    end
+end
+local function CountActiveSyncs()
+    CleanExpiredSyncs()
+    local n = 0
+    for _ in pairs(activeSyncs) do n = n + 1 end
+    return n
+end
+
+-- item-info cache. ConLogsItemCacheDB is the persistent half; pendingCache
+-- is the in-memory retry queue for items the client hasn't fetched yet.
+local pendingCache = {} -- itemID -> firstSeenTime
+local CACHE_RETRY_INTERVAL = 0.5
+-- v1.1.4: was 15s. Bumped because mass cachebuild on Ascension custom-itemID
+-- payloads needs time for the server to respond to all CMSG_ITEM_QUERY_SINGLE
+-- requests, and our previous re-trigger spam (now fixed) starved the channel.
+local CACHE_GIVE_UP        = 60
+-- Cache schema version. Bumped when the shape of ConLogsItemCacheDB[itemID]
+-- changes in a way that requires re-fetching. Entries with a lower (or
+-- missing) .v are treated as stale on the next touch.
+-- v1: name/quality/itemLevel/icon/ts
+-- v2: + stats (v0.22)
+-- v3: + tooltipStats for percent-based bonuses on old (pre-rating)
+--     items like Darkmantle. v0.26 release.
+-- v4: + Ascension PvP percent patterns (DAMAGE_VS_PLAYERS_PCT etc.) +
+--     hardened Set-bonus filter that catches "(N) Set:" piece-count lines
+--     in addition to plain "Set:" prefixes. v0.27 release.
+-- v5: + tooltipExtras array carrying raw "Chance on hit:" / "Use:" lines
+--     verbatim, so the site's armory tooltip can render item flavor text
+--     (procs, use-effects) that don't reduce to numeric stats. v0.28.
+-- v6: + setBonuses array carrying each "Set:" / "(N) Set:" line as a
+--     structured { pieces, text } entry so the armory tooltip can render
+--     the full set bonus block. Previously filtered out entirely. v0.29.
+-- v7: + damage range { min, max, school } + speed for weapons (GetItemStats
+--     only exposes DPS, not min/max or speed), and "Equip:" added to the
+--     tooltipExtras prefix whitelist so proc-style Equip lines (Hand of
+--     Justice etc.) get captured as flavor text. v0.30.
+-- v8: bug fix — the tooltipExtras prefix check used string.find with the
+--     plain=true flag combined with a `^` anchor, which doesn't anchor
+--     (plain=true disables pattern metacharacters). No extras were being
+--     captured since v0.28. Fixed with sub-and-equal compare. Schema bump
+--     forces re-fetch of v7 entries that silently captured nothing. v0.31.
+-- v9: + IsStatLikeEquipLine filter — Equip lines that describe pure stats
+--     already captured by GetItemStats ("Equip: +20 Attack Power." /
+--     "Equip: Increases critical strike rating by 20.") no longer land in
+--     tooltipExtras. Avoids rendering the same stat twice on the site.
+--     Proc lines with "chance" / "on hit" / "for N sec" / etc. are NOT
+--     stat-like and continue to be preserved. v0.32.
+-- v10: + TOOLTIP_STAT_REDUNDANT_WITH dedup — tooltip patterns like
+--      SPELL_POWER_FLAT / HEALING_FLAT that have an ITEM_MOD_* equivalent
+--      in GetItemStats now skip the tooltipStats write when the
+--      equivalent is already present in stats. Was double-rendering
+--      on the site (once from stats, once from tooltipStats) for any
+--      modern item that has both. v0.40.
+-- v11: + slot-vs-equipLoc verification. Ascension reassigns vanilla
+--      itemIDs server-side; client DBC returns stale (vanilla) data
+--      that mismatches the actual equipped slot. New entry fields:
+--        equipLoc        — stored from GetItemInfo
+--        verified        — true if equipLoc matched observed slot
+--        verifyAttempts  — 0..3, retries forcing SetHyperlink to refresh
+--                          the dynamic cache; gives up after 3
+--      Existing v10 entries get re-validated on next observation.
+local CACHE_SCHEMA = 11
+
+-- Claude (v1.3.5): DB_SCHEMA_VERSION removed. The wipe-on-mismatch logic
+-- was throwing away accumulated mesh data on every breaking-shape bump —
+-- net negative UX. The wire format is already forward-compat (missing
+-- fields default via t[N] or X), and any real shape change should be
+-- handled by per-field migration in the read path, not by wiping.
+
+-- Tooltip-text patterns for percent-based stats that predate the rating
+-- system and aren't in GetItemStats' enum. Keys are plain uppercase tokens
+-- (deliberately NOT ITEM_MOD_* prefixed — the site's ingest maps these in
+-- a separate handler from the GetItemStats fields). Order matters: more
+-- specific patterns come first so they match before the generic fallbacks.
+-- Ordering matters here — more-specific patterns come first so they win the
+-- first-match break. Example: "damage and healing done by magical spells"
+-- must be tried before "healing done by magical spells" so a line with both
+-- concepts maps to SPELL_POWER_FLAT instead of HEALING_FLAT.
+local TOOLTIP_STAT_PATTERNS = {
+    -- ---------- Percent-based offensive (crit / hit) ----------
+    { "critical strike with melee and ranged attacks by (%-?%d+)%%", "CRIT_MELEE_RANGED_PCT" },
+    { "critical strike with spells by (%-?%d+)%%",                   "CRIT_SPELL_PCT" },
+    { "critical strike chance by (%-?%d+)%%",                        "CRIT_PCT" },
+    { "critical strike by (%-?%d+)%%",                               "CRIT_PCT" },
+    { "hit with melee and ranged attacks by (%-?%d+)%%",             "HIT_MELEE_RANGED_PCT" },
+    { "hit with spells by (%-?%d+)%%",                               "HIT_SPELL_PCT" },
+    { "Improves your chance to hit by (%-?%d+)%%",                   "HIT_PCT" },
+    -- Epoch "Alacrity": speeds casts AND periodic (DoT) ticks. Without this rule
+    -- the line falls through to tooltipExtras (verbatim text) and never becomes
+    -- a structured stat — see epoch-sim docs/ALACRITY_ESD_GUIDE.md.
+    { "casting speed and causes periodic effects to occur more frequently with spells by (%-?%d+)%%", "SPELL_ALACRITY_PCT" },
+    { "be dodged or parried by (%-?%d+)%%",                          "EXPERTISE_PCT" },
+    -- ---------- Percent-based defensive (dodge / parry / block) ----------
+    { "chance to dodge an attack by (%-?%d+)%%",                     "DODGE_PCT" },
+    { "chance to parry an attack by (%-?%d+)%%",                     "PARRY_PCT" },
+    { "chance to block an attack by (%-?%d+)%%",                     "BLOCK_PCT" },
+    -- ---------- Flat regen (pre-rating) ----------
+    { "Restores (%d+) mana per 5 sec",                               "MP5" },
+    { "Restores (%d+) health per 5 sec",                             "HP5" },
+    -- ---------- Flat spell power / damage / healing (TBC-era items) ----------
+    -- "damage and healing" beats "healing" / "damage" alone.
+    { "damage and healing done by magical spells and effects by up to (%d+)", "SPELL_POWER_FLAT" },
+    { "damage and healing done by magical spells by up to (%d+)",    "SPELL_POWER_FLAT" },
+    { "healing done by magical spells and effects by up to (%d+)",   "HEALING_FLAT" },
+    { "healing done by magical spells by up to (%d+)",               "HEALING_FLAT" },
+    { "damage done by magical spells and effects by up to (%d+)",    "SPELL_DAMAGE_FLAT" },
+    { "damage done by magical spells by up to (%d+)",                "SPELL_DAMAGE_FLAT" },
+    -- Per-school (rare on WotLK gear but still present on some TBC drops)
+    { "damage done by Arcane spells and effects by up to (%d+)",     "SPELL_DAMAGE_ARCANE" },
+    { "damage done by Fire spells and effects by up to (%d+)",       "SPELL_DAMAGE_FIRE" },
+    { "damage done by Frost spells and effects by up to (%d+)",      "SPELL_DAMAGE_FROST" },
+    { "damage done by Nature spells and effects by up to (%d+)",     "SPELL_DAMAGE_NATURE" },
+    { "damage done by Shadow spells and effects by up to (%d+)",     "SPELL_DAMAGE_SHADOW" },
+    { "damage done by Holy spells and effects by up to (%d+)",       "SPELL_DAMAGE_HOLY" },
+    -- ---------- Other pre-rating flats ----------
+    { "Increased Defense %+(%d+)",                                   "DEFENSE_FLAT" },
+    { "Spell Penetration %+(%d+)",                                   "SPELL_PENETRATION_FLAT" },
+    { "Increases the block value of your shield by (%d+)",           "BLOCK_VALUE_FLAT" },
+    -- ---------- PvP-specific percent (Ascension "Rival's" gear etc.) ----------
+    -- Values stored as the positive raw number. Sign is implicit in the key
+    -- name: DAMAGE_VS_PLAYERS increases outgoing; DAMAGE_REDUCTION reduces
+    -- incoming (both are player buffs even though the tooltip verb differs).
+    { "damage dealt against other players by (%-?%d+)%%",            "DAMAGE_VS_PLAYERS_PCT" },
+    { "damage taken from other players by (%-?%d+)%%",               "DAMAGE_REDUCTION_VS_PLAYERS_PCT" },
+}
+
+-- Prefixes that mark "special" tooltip lines worth preserving verbatim into
+-- entry.tooltipExtras — procs, activated trinket effects, and other flavor
+-- text the site's armory tooltip renders as-is.
+local TOOLTIP_EXTRA_PREFIXES = {
+    "Chance on hit:",
+    "Use:",
+    "Equip:", -- v0.30: catch proc-style Equip lines (Hand of Justice etc.)
+}
+
+-- v0.40: dedup map — tooltip stat keys that GetItemStats already captures
+-- via an ITEM_MOD_* enum on modern items. When GetItemStats HAS the
+-- equivalent, skip the tooltip capture to avoid rendering the same stat
+-- twice on the armory site (once from stats, once from tooltipStats).
+-- Pre-rating items (vanilla/TBC) that lack the ITEM_MOD_* still get the
+-- tooltip capture — the dedup only triggers when BOTH would be present.
+--
+-- Percent-based keys (CRIT_*_PCT, HIT_*_PCT, DODGE_PCT, etc.) and
+-- per-school spell damage (SPELL_DAMAGE_FIRE etc.) are NOT in the
+-- GetItemStats enum on any item, so no redundancy check is needed for
+-- them — they always flow to tooltipStats.
+local TOOLTIP_STAT_REDUNDANT_WITH = {
+    SPELL_POWER_FLAT       = "ITEM_MOD_SPELL_POWER_SHORT",
+    HEALING_FLAT           = "ITEM_MOD_SPELL_HEALING_DONE_SHORT",
+    SPELL_DAMAGE_FLAT      = "ITEM_MOD_SPELL_DAMAGE_DONE_SHORT",
+    MP5                    = "ITEM_MOD_MANA_REGENERATION_SHORT",
+    HP5                    = "ITEM_MOD_HEALTH_REGEN_SHORT",
+    DEFENSE_FLAT           = "ITEM_MOD_DEFENSE_SKILL_RATING_SHORT",
+    SPELL_PENETRATION_FLAT = "ITEM_MOD_SPELL_PENETRATION_SHORT",
+    BLOCK_VALUE_FLAT       = "ITEM_MOD_BLOCK_VALUE_SHORT",
+}
+
+-- v0.32: stat-like Equip lines (e.g. "Equip: +20 Attack Power." or
+-- "Equip: Increases attack power by 20.") describe numeric stats that
+-- GetItemStats already captured into entry.stats. Including them in
+-- tooltipExtras would render the stat twice on the site's armory tooltip.
+-- This filter skips them; actual procs (containing "chance" / "on hit" /
+-- "for N sec" / etc.) do NOT match these patterns and still land in extras.
+local EQUIP_STAT_LINE_PATTERNS = {
+    "^Equip: %+%-?%d+ ",                        -- "Equip: +20 Attack Power."
+    "^Equip: Increases [%w ]+by %-?%d+%.?$",    -- "Equip: Increases attack power by 20."
+    "^Equip: Increases your [%w ]+by %-?%d+%.?$", -- "Equip: Increases your crit rating by 20."
+    "^Equip: Decreases your [%w ]+by %-?%d+%.?$", -- rare but possible
+    "^Equip: Restores %d+ [%w ]+per 5 sec%.?$",   -- "Equip: Restores 10 mana per 5 sec."
+}
+local function IsStatLikeEquipLine(text)
+    if not text then return false end
+    for _, pat in ipairs(EQUIP_STAT_LINE_PATTERNS) do
+        if text:match(pat) then return true end
+    end
+    return false
+end
+
+-- Parse a possible set-bonus line. Returns (pieces, description) if the line
+-- is a set bonus, or nil if it's not. Handles three formats seen in the wild:
+--   "Set: <desc>"               — no piece count (Ascension's Darkmantle etc.)
+--   "(N) Set: <desc>"           — N pieces required (Eskhandar's)
+--   "(N/M) Set: <desc>"         — N of M pieces active (some servers)
+local function ParseSetBonusLine(text)
+    if not text then return nil end
+    -- Try "(N/M) Set: ..." and "(N) Set: ..." — leading digits captured, any
+    -- trailing "/M" consumed by [/%d]*
+    local pieces, desc = text:match("^%((%d+)[/%d]*%)%s*Set:%s*(.+)$")
+    if pieces then return tonumber(pieces) or 0, desc end
+    -- Plain "Set: ..." format, no piece count
+    desc = text:match("^Set:%s*(.+)$")
+    if desc then return 0, desc end
+    return nil
+end
+
+-- Parse a weapon damage line. Three shapes:
+--   "9 - 17 Damage"              — plain physical
+--   "12 - 19 Holy Damage"        — pure elemental weapon
+--   "9 - 17 Damage\n+5 Fire"     — physical with elemental bonus (two lines;
+--                                   we capture the main range only)
+-- Returns (min, max, school) or nil. school is nil for plain physical.
+local function ParseDamageLine(text)
+    if not text then return nil end
+    local dmin, dmax, school = text:match("^(%d+)%s*%-%s*(%d+)%s+(%a*)%s*Damage$")
+    if not dmin then return nil end
+    dmin, dmax = tonumber(dmin), tonumber(dmax)
+    if not (dmin and dmax) then return nil end
+    if school == "" then school = nil end
+    return dmin, dmax, school
+end
+
+-- Parse a weapon speed line. The tooltip puts speed on the equip-slot line
+-- (e.g. "Main Hand<tab>Speed 2.80") or on its own. Capture the decimal.
+local function ParseSpeedLine(text)
+    if not text then return nil end
+    local s = text:match("Speed%s+(%d+%.?%d*)")
+    return s and tonumber(s) or nil
+end
+
+local tooltipScanTip
+-- Scan an item's tooltip once and return (stats, extras, setBonuses, damage, speed):
+--   stats       — percent-based / pre-rating stat table keyed by TOOLTIP_STAT_PATTERNS
+--   extras      — array of raw tooltip lines matching TOOLTIP_EXTRA_PREFIXES
+--   setBonuses  — array of { pieces, text } set-bonus entries
+--   damage      — { min, max, school? } for weapons (nil for armor)
+--   speed       — attack speed in seconds, e.g. 2.8 (nil for non-weapons)
+-- Any may be nil if nothing matched in that category.
+-- `fromGetStats` (v0.40, optional) — the entry.stats table populated by
+-- GetItemStats earlier in CacheItemInfo. Used to dedup tooltip captures
+-- that would duplicate an already-present ITEM_MOD_* (e.g. don't emit
+-- SPELL_POWER_FLAT=29 to tooltipStats when stats.ITEM_MOD_SPELL_POWER_SHORT=29
+-- already exists).
+local function ScanTooltip(link, fromGetStats)
+    if not link then return nil, nil, nil, nil, nil end
+    if not tooltipScanTip then
+        tooltipScanTip = CreateFrame("GameTooltip", "ConLogsTooltipStatsTip", UIParent, "GameTooltipTemplate")
+    end
+    tooltipScanTip:SetOwner(UIParent, "ANCHOR_NONE")
+    tooltipScanTip:ClearLines()
+    tooltipScanTip:SetHyperlink(link)
+
+    local stats, extras, setBonuses, damage, speed = nil, nil, nil, nil, nil
+    for i = 2, tooltipScanTip:NumLines() do
+        local fs = _G["ConLogsTooltipStatsTipTextLeft" .. i]
+        local text = fs and fs:GetText()
+        -- Also scan the right-column text since weapons put Speed there,
+        -- aligned with the equip-slot label on the left.
+        local fsR = _G["ConLogsTooltipStatsTipTextRight" .. i]
+        local textR = fsR and fsR:GetText()
+        if text then
+            -- Weapon damage + speed: captured once per scan. Speed can
+            -- appear in either column depending on server/client layout.
+            if not damage then
+                local dmin, dmax, school = ParseDamageLine(text)
+                if dmin then damage = { min = dmin, max = dmax, school = school } end
+            end
+            if not speed then
+                speed = ParseSpeedLine(text) or ParseSpeedLine(textR)
+            end
+
+            -- Set-bonus lines: captured structurally, not filtered.
+            local pieces, desc = ParseSetBonusLine(text)
+            if desc then
+                setBonuses = setBonuses or {}
+                setBonuses[#setBonuses + 1] = { pieces = pieces, text = desc }
+            else
+                -- First try stat patterns. Matches "consume" the line
+                -- regardless of whether we actually store the value — so
+                -- a redundant-with-GetItemStats line doesn't then leak
+                -- into tooltipExtras. v0.40: if the equivalent ITEM_MOD_*
+                -- is already in fromGetStats, skip the tooltipStats write
+                -- to prevent double-stat rendering on the site.
+                local matched = false
+                for _, pat in ipairs(TOOLTIP_STAT_PATTERNS) do
+                    local n = text:match(pat[1])
+                    if n then
+                        n = tonumber(n)
+                        if n and n ~= 0 then
+                            local redundant = TOOLTIP_STAT_REDUNDANT_WITH[pat[2]]
+                            if not (redundant and fromGetStats and fromGetStats[redundant]) then
+                                stats = stats or {}
+                                stats[pat[2]] = (stats[pat[2]] or 0) + n
+                            end
+                            matched = true
+                            break
+                        end
+                    end
+                end
+                -- If the line didn't resolve to a stat, check whether it's a
+                -- special-effect line worth preserving verbatim. We use a
+                -- direct prefix compare instead of string.find with a `^`
+                -- anchor — combining `^` with plain=true doesn't anchor
+                -- (plain=true disables pattern metacharacters) and combining
+                -- `^` without plain=true requires escaping `-` / `(` / `)`
+                -- in the prefix strings. sub-and-equal is simpler and right.
+                if not matched then
+                    for _, prefix in ipairs(TOOLTIP_EXTRA_PREFIXES) do
+                        if text:sub(1, #prefix) == prefix then
+                            -- v0.32: skip Equip lines that are pure stat
+                            -- descriptions — GetItemStats already captured
+                            -- the numeric value into entry.stats; duplicating
+                            -- the raw text would double-render on the site.
+                            if not (prefix == "Equip:" and IsStatLikeEquipLine(text)) then
+                                extras = extras or {}
+                                extras[#extras + 1] = text
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return stats, extras, setBonuses, damage, speed
+end
+
+local function now() return GetTime() end
+
+-- v0.43: resolve "who are we, identity-wise" for cross-alt consolidation.
+-- Returns the configured main name if set, otherwise the live character
+-- name. Used when broadcasting and answering "is this SYNCREQ targeting me".
+local function MyIdentity()
+    if ConLogsDB and ConLogsDB.config and ConLogsDB.config.mainName
+        and ConLogsDB.config.mainName ~= "" then
+        return ConLogsDB.config.mainName
+    end
+    return UnitName("player") or "?"
+end
+
+-- Which of the 3 class talent trees has the most points. 1, 2, or 3. Used as
+-- the per-player set key so a rogue's Assassination/Combat/Subtlety each get
+-- their own gear snapshot. Matches the player's mental model of "spec"; works
+-- regardless of Ascension's GetActiveTalentGroup quirks (which on a classless
+-- client seem to always return 1 and aren't useful as a key here).
+-- Ties break to the lowest index (arbitrary but stable).
+local function DominantTree(spec)
+    if not spec then return 1 end
+    local maxIdx, maxVal = 1, spec[1] or 0
+    for i = 2, 3 do
+        if (spec[i] or 0) > maxVal then maxIdx, maxVal = i, spec[i] or 0 end
+    end
+    return maxIdx
+end
+
+local function dprint(...)
+    if ConLogsDebug then
+        print("|cffffaa44ConLogs|r", ...)
+    end
+end
+
+local function markRetryIn(guid, retryIn)
+    seen[guid] = now() - (INSPECT_COOLDOWN - retryIn)
+end
+
+local function ZoneType()
+    local inInstance, instType = IsInInstance()
+    if not inInstance then return "outdoor" end
+    if instType == "raid" then return "raid" end
+    if instType == "party" then return "party" end
+    if instType == "pvp" then return "bg" end
+    if instType == "arena" then return "arena" end
+    return instType or "unknown"
+end
+
+
+local function ItemStringFromLink(link)
+    if not link then return "" end
+    local s = link:match("|Hitem:([%-%d:]+)|h")
+    return s or ""
+end
+
+-- Claude: full-set gate. Refuse to broadcast or store inspects that are
+-- missing any "useful" slot — catches mid-equipment-swap moments where
+-- the player has briefly unequipped a weapon (or other gear) and the
+-- inspect happened during the gap. Slot 4 (shirt) and 19 (tabard) are
+-- disregarded as cosmetic. Slot 17 (offhand) is conditionally required:
+-- only when slot 16 doesn't hold a 2-hand weapon.
+local REQUIRED_GEAR_SLOTS = { 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18 }
+local GEAR_SLOT_NAMES = {
+    [1] = "head",     [2] = "neck",     [3] = "shoulder",
+    [5] = "chest",    [6] = "waist",    [7] = "legs",     [8] = "feet",
+    [9] = "wrist",    [10] = "hands",
+    [11] = "finger1", [12] = "finger2",
+    [13] = "trinket1",[14] = "trinket2",
+    [15] = "back",    [16] = "mainhand",[17] = "offhand", [18] = "ranged",
+}
+
+-- Claude (v1.5.2): item-ref → ilvl lookup. Accepts an inventory link, an
+-- item-string ("12345:0:0:..."), or a numeric itemID. Returns 0 when
+-- GetItemInfo can't resolve the item (cache miss).
+local function ItemIlvl(itemRef)
+    if not itemRef or itemRef == "" then return 0 end
+    local ilvl
+    if type(itemRef) == "string" and itemRef:find("|H") then
+        ilvl = select(4, GetItemInfo(itemRef))
+    else
+        local id = tonumber(tostring(itemRef):match("^(%d+)"))
+        if id then ilvl = select(4, GetItemInfo(id)) end
+    end
+    return ilvl or 0
+end
+
+-- Claude (v1.5.2): minimum average ilvl gate. Below this threshold a set
+-- is considered "leveling gear" and rejected from the mesh — keeps the
+-- DB focused on raid-relevant scans. 55 picks the floor of L60 dungeon-
+-- blue territory; pure greens average ~45-50, full T0 / dungeon set is
+-- ~55-58, raid epics 65+.
+local MIN_AVG_ILVL = 55
+
+-- Claude (v1.5.2): average ilvl across filled non-cosmetic slots.
+-- Cosmetic slots (shirt 4, tabard 19) are excluded — they're not always
+-- equipped and don't reflect gear progression. Empty slots also excluded
+-- from the denominator so a 2H wielder with no offhand isn't penalized.
+local function AverageIlvl(gearLookup)
+    local sum, count = 0, 0
+    for slot = 1, 19 do
+        if slot ~= 4 and slot ~= 19 then -- skip cosmetic slots
+            local ref = gearLookup(slot)
+            if ref and ref ~= "" then
+                local ilvl = ItemIlvl(ref)
+                if ilvl > 0 then
+                    sum = sum + ilvl
+                    count = count + 1
+                end
+            end
+        end
+    end
+    if count == 0 then return 0, 0 end
+    return sum / count, count
+end
+
+-- Claude: gearLookup(slot) returns a link, item-string, or nil/"".
+-- Returns true if every required slot is filled, false + reason otherwise.
+-- v1.5.2: offhand (17) is now ALWAYS optional — the prior conditional
+-- "required unless mainhand is 2H" rule was too strict for fury warriors
+-- swapping titan grip configs etc. Also gates on average ilvl > 55 to
+-- keep leveling-gear scans out of the mesh.
+local function CheckFullSet(gearLookup)
+    for _, slot in ipairs(REQUIRED_GEAR_SLOTS) do
+        local v = gearLookup(slot)
+        if not v or v == "" then
+            return false, string.format("missing %s (slot %d)",
+                GEAR_SLOT_NAMES[slot] or "?", slot)
+        end
+    end
+    -- ilvl gate. If we have enough valid ilvl reads (≥10 slots), enforce
+    -- the average minimum. Sparser reads (cache miss on most items) skip
+    -- the check defensively — next scan will catch it once items resolve.
+    local avg, samples = AverageIlvl(gearLookup)
+    if samples >= 10 and avg < MIN_AVG_ILVL then
+        return false, string.format("avg ilvl %.1f < %d (leveling gear)", avg, MIN_AVG_ILVL)
+    end
+    return true
+end
+
+-- v1.2: scanner-side item-info hint encoding. Receivers on Ascension can't
+-- always resolve itemIDs via GetItemInfo (server reassigns vanilla IDs and
+-- doesn't always respond to CMSG_ITEM_QUERY_SINGLE for those), so the
+-- scanner — who DOES have correct data right after a fresh inspect via
+-- SMSG_INSPECT_RESULTS — packs name/quality/ilvl/equipLoc/icon/stats into
+-- wire position 40. Receivers seed their ConLogsItemCacheDB from the hints
+-- and avoid the broken server-query path entirely.
+--
+-- Format:
+--   item entries separated by ';'
+--   fields within an entry separated by '~'
+--   stats encoded as 'KEY=val,KEY=val' (commas separate stat entries)
+--   item entry shape: iid~name~q~ilvl~equipLoc~icon~stats
+--
+-- All wire-control characters (^~;=,) are stripped from string fields
+-- defensively. Receivers ignore the field entirely on older payloads.
+local function StripHintWireChars(s)
+    if not s then return "" end
+    return (s:gsub("[%^~;=,]", " "))
+end
+
+local function EncodeHintStats(stats)
+    if not stats then return "" end
+    local parts = {}
+    for k, v in pairs(stats) do
+        if type(v) == "number" and v ~= 0 then
+            parts[#parts + 1] = k .. "=" .. tostring(v)
+        end
+    end
+    return table.concat(parts, ",")
+end
+
+local function DecodeHintStats(s)
+    if not s or s == "" then return nil end
+    local stats = {}
+    local any = false
+    for kv in s:gmatch("([^,]+)") do
+        local k, v = kv:match("^([^=]+)=(.+)$")
+        if k and v then
+            local n = tonumber(v)
+            if n then
+                stats[k] = n
+                any = true
+            end
+        end
+    end
+    return any and stats or nil
+end
+
+local function ParseItemInfoHints(s)
+    local out = {}
+    if not s or s == "" then return out end
+    for entry in s:gmatch("([^;]+)") do
+        local iid_s, name, q_s, ilvl_s, equipLoc, icon, statsStr = strsplit("~", entry)
+        local iid = tonumber(iid_s)
+        if iid and iid > 0 then
+            out[iid] = {
+                name      = name or "?",
+                quality   = tonumber(q_s) or 0,
+                itemLevel = tonumber(ilvl_s) or 0,
+                equipLoc  = equipLoc or "",
+                icon      = icon or "",
+                stats     = DecodeHintStats(statsStr or ""),
+            }
+        end
+    end
+    return out
+end
+
+-- mark a GUID as inspected at unix timestamp `scanTime`. Called from
+-- both local successful inspects and gossip-reassembled broadcasts. Keeps the
+-- max of current vs new so older arrivals don't overwrite fresh data.
+local function MarkInspected(guid, scanTime)
+    if not guid or guid == "" or not scanTime or scanTime <= 0 then return end
+    ConLogsDB = ConLogsDB or { meta = { version = 1, created = time() }, players = {}, lastScanned = {}, config = {} }
+    ConLogsDB.lastScanned = ConLogsDB.lastScanned or {}
+    local existing = ConLogsDB.lastScanned[guid] or 0
+    if scanTime > existing then
+        ConLogsDB.lastScanned[guid] = scanTime
+    end
+end
+
+local function HasFreshScan(guid)
+    if not ConLogsDB or not ConLogsDB.lastScanned then return false end
+    local t = ConLogsDB.lastScanned[guid]
+    return t and (time() - t) < SCAN_FRESH_WINDOW
+end
+
+-- ---------------- Stored-data pruning ----------------
+-- 3.3.5 has a hard SavedVariables serialization limit ("block too big"): once a
+-- single saved table grows past it the WHOLE variable silently fails to write and
+-- all accumulated data is lost. ConLogsDB.players (each set also stashes the full
+-- rawPayload wire string) and ConLogsItemCacheDB otherwise grow without bound, so
+-- prune both at login to stay well under the ceiling.
+local PLAYER_RETAIN_DAYS    = 45    -- drop player records whose newest set is older than this
+local PLAYER_MAX_RECORDS    = 4000  -- hard cap; drop the oldest beyond this
+local ITEMCACHE_RETAIN_DAYS = 60    -- drop item-cache entries not refreshed in this long
+
+local function newestSetTime(rec)
+    local newest = 0
+    if rec and rec.sets then
+        for _, s in pairs(rec.sets) do
+            local st = s.scanTime or 0
+            if st > newest then newest = st end
+        end
+    end
+    return newest
+end
+
+local function PruneStoredData()
+    ConLogsDB = ConLogsDB or {}
+    ConLogsDB.players     = ConLogsDB.players or {}
+    ConLogsDB.lastScanned = ConLogsDB.lastScanned or {}
+    local nowT = time()
+    local prunedP, prunedI = 0, 0
+
+    -- 1. age-prune player records (newest set older than the retain window)
+    local playerCut = nowT - PLAYER_RETAIN_DAYS * 86400
+    for guid, rec in pairs(ConLogsDB.players) do
+        if newestSetTime(rec) < playerCut then
+            ConLogsDB.players[guid]     = nil
+            ConLogsDB.lastScanned[guid] = nil
+            prunedP = prunedP + 1
+        end
+    end
+
+    -- 2. count-cap: if still over the cap, drop the oldest records first
+    local count = 0
+    for _ in pairs(ConLogsDB.players) do count = count + 1 end
+    if count > PLAYER_MAX_RECORDS then
+        local arr = {}
+        for guid, rec in pairs(ConLogsDB.players) do
+            arr[#arr + 1] = { guid = guid, t = newestSetTime(rec) }
+        end
+        table.sort(arr, function(a, b) return a.t < b.t end) -- oldest first
+        for i = 1, (count - PLAYER_MAX_RECORDS) do
+            ConLogsDB.players[arr[i].guid]     = nil
+            ConLogsDB.lastScanned[arr[i].guid] = nil
+            prunedP = prunedP + 1
+        end
+    end
+
+    -- 3. drop orphan lastScanned entries (no matching player record)
+    for guid in pairs(ConLogsDB.lastScanned) do
+        if not ConLogsDB.players[guid] then ConLogsDB.lastScanned[guid] = nil end
+    end
+
+    -- 4. age-prune the item cache by last-refresh timestamp (also clears the
+    --    verify-retry stubs, which never carry a .ts)
+    if ConLogsItemCacheDB then
+        local itemCut = nowT - ITEMCACHE_RETAIN_DAYS * 86400
+        for id, e in pairs(ConLogsItemCacheDB) do
+            if type(e) == "table" and (e.ts or 0) < itemCut then
+                ConLogsItemCacheDB[id] = nil
+                prunedI = prunedI + 1
+            end
+        end
+    end
+
+    if prunedP > 0 or prunedI > 0 then
+        dprint(string.format("[prune] removed %d stale player record(s) + %d item-cache entr(ies)", prunedP, prunedI))
+    end
+end
+
+-- ---------------- Item-info cache ----------------
+-- for every itemID we see on a scanned player, query GetItemInfo()
+-- locally. If the client already has the item cached, we get
+-- name/quality/itemLevel/texture and persist to ConLogsItemCacheDB so the web
+-- site can render without needing external data sources. If the client hasn't
+-- seen the item yet, we trigger a background fetch via a hidden tooltip and
+-- retry from an OnUpdate poll. Covers Ascension-custom items that aren't in
+-- Wowhead / TrinityCore data.
+
+local cacheTip -- created lazily on first use
+
+-- v11: equipment slot index → set of valid INVTYPE_* strings the slot
+-- accepts. Used to detect when GetItemInfo returns stale DBC data
+-- (Ascension reassigns vanilla itemIDs server-side; the client's local
+-- DBC returns the OLD vanilla item info, which has a slot type that
+-- doesn't match what the player actually has equipped). A mismatch is
+-- the signal to force a server query and refresh the dynamic cache.
+local EXPECTED_INVTYPE_BY_SLOT = {
+    [1]  = { ["INVTYPE_HEAD"]     = true },
+    [2]  = { ["INVTYPE_NECK"]     = true },
+    [3]  = { ["INVTYPE_SHOULDER"] = true },
+    [4]  = { ["INVTYPE_BODY"]     = true }, -- shirt
+    [5]  = { ["INVTYPE_CHEST"]    = true, ["INVTYPE_ROBE"] = true },
+    [6]  = { ["INVTYPE_WAIST"]    = true },
+    [7]  = { ["INVTYPE_LEGS"]     = true },
+    [8]  = { ["INVTYPE_FEET"]     = true },
+    [9]  = { ["INVTYPE_WRIST"]    = true },
+    [10] = { ["INVTYPE_HAND"]     = true },
+    [11] = { ["INVTYPE_FINGER"]   = true },
+    [12] = { ["INVTYPE_FINGER"]   = true },
+    [13] = { ["INVTYPE_TRINKET"]  = true },
+    [14] = { ["INVTYPE_TRINKET"]  = true },
+    [15] = { ["INVTYPE_CLOAK"]    = true },
+    -- Empirical Ascension finding: real-world data shows vanilla
+    -- INVTYPE_WEAPONMAINHAND items (e.g. "Barman Shanker") AND Ascension
+    -- custom INVTYPE_WEAPONMAINHAND/INVTYPE_2HWEAPON items being equipped
+    -- in slot 17. Titan's Grip doesn't exist on this server, but the
+    -- classless system still permits these slot/equipLoc combinations
+    -- server-side. CMSG_ITEM_QUERY_SINGLE returns the same equipLoc
+    -- (no reassignment), so the verification can't "fix" them — it
+    -- just keeps logging unverified noise after 3 failed attempts.
+    -- Both weapon slots now accept ALL weapon equipLocs. The verification
+    -- still catches genuine wrong-category mismatches (e.g. INVTYPE_FEET
+    -- in slot 15) — only weapon-vs-weapon sub-type differences pass now.
+    [16] = { ["INVTYPE_WEAPON"] = true, ["INVTYPE_2HWEAPON"] = true,
+             ["INVTYPE_WEAPONMAINHAND"] = true, ["INVTYPE_WEAPONOFFHAND"] = true },
+    [17] = { ["INVTYPE_WEAPON"] = true, ["INVTYPE_2HWEAPON"] = true,
+             ["INVTYPE_WEAPONMAINHAND"] = true, ["INVTYPE_WEAPONOFFHAND"] = true,
+             ["INVTYPE_SHIELD"] = true, ["INVTYPE_HOLDABLE"] = true },
+    [18] = { ["INVTYPE_RANGED"]   = true, ["INVTYPE_RANGEDRIGHT"] = true, ["INVTYPE_THROWN"] = true, ["INVTYPE_RELIC"] = true },
+    [19] = { ["INVTYPE_TABARD"]   = true },
+}
+
+-- True when the equipLoc fits the slot. False = definite mismatch (smoking
+-- gun for itemID reassignment). Returns true if either argument is missing
+-- so we don't flag-as-bad items where we lack data to compare.
+local function SlotMatchesInvtype(slot, equipLoc)
+    if not slot or not equipLoc or equipLoc == "" then return true end
+    local valid = EXPECTED_INVTYPE_BY_SLOT[slot]
+    return (valid and valid[equipLoc]) and true or false
+end
+
+local function TriggerItemFetch(itemID, itemLink)
+    if not cacheTip then
+        cacheTip = CreateFrame("GameTooltip", "ConLogsItemCacheTip", UIParent, "GameTooltipTemplate")
+        cacheTip:SetOwner(UIParent, "ANCHOR_NONE")
+    end
+    cacheTip:ClearLines()
+    -- v1.1.4: prefer the full itemstring (with enchant/gem/suffix) over a
+    -- bare "item:itemID". Ascension server-side data may differ when queried
+    -- with vs without the suffix payload.
+    cacheTip:SetHyperlink(itemLink or ("item:" .. itemID))
+    cacheTip:Hide()
+end
+
+-- returns true if GetItemInfo succeeded and we wrote to the cache,
+-- false if still pending (client hasn't resolved the item yet).
+-- itemLink (optional): the full "item:itemID:enchantID:gem1:..." string. Used
+-- by GetItemStats below to capture Ascension's modified stat values. If
+-- omitted, falls back to a bare "item:itemID" link which still returns the
+-- base item's stats.
+local function CacheItemInfo(itemID, itemLink, slot)
+    if not itemID or itemID <= 0 then return false end
+    ConLogsItemCacheDB = ConLogsItemCacheDB or {}
+    -- Skip only when we already have a current-schema entry that's been
+    -- verified (v11+: equipLoc matches observed slot) OR we have no slot
+    -- to validate against. Pre-v0.22 entries (no .v, no stats) re-fetch
+    -- here so they pick up GetItemStats data; v10 entries lacking
+    -- equipLoc/verified fields fall through and get re-validated.
+    local existing = ConLogsItemCacheDB[itemID]
+    if existing and existing.v == CACHE_SCHEMA and existing.verified ~= false then
+        if not slot then return true end
+        if SlotMatchesInvtype(slot, existing.equipLoc) then return true end
+        -- Existing entry's stored equipLoc disagrees with the slot this
+        -- itemID was just observed in. Could be: server reassigned the ID
+        -- since we last cached, OR our prior cache had wrong data. Fall
+        -- through and re-validate.
+    end
+
+    local name, _, quality, itemLevel, _, _, _, _, equipLoc, texture = GetItemInfo(itemID)
+    if not name then
+        -- v1.1.4: don't re-fire TriggerItemFetch on every TryCachePending
+        -- retry. The fetch was already triggered when MarkPendingCache
+        -- added this item to pendingCache; firing again on every retry
+        -- spammed SetHyperlink at ~4750/sec for 1188-pending caches,
+        -- starving the channel and making the server stop responding.
+        -- Just return false; pending-cache loop will keep polling
+        -- GetItemInfo until the response arrives or CACHE_GIVE_UP expires.
+        return false
+    end
+
+    -- v11: slot-vs-equipLoc verification. If GetItemInfo returns an equipLoc
+    -- that doesn't fit the slot we observed this itemID in, the client's
+    -- DBC has stale data (Ascension server-side itemID reassignment).
+    -- Force a server query via SetHyperlink — the dynamic item cache will
+    -- update on SMSG_QUERY_ITEM_RESPONSE and a future call will see the
+    -- correct equipLoc. Cap at 3 attempts so we don't loop forever.
+    local verified = SlotMatchesInvtype(slot, equipLoc)
+    if (not verified) and slot then
+        local attempts = (existing and existing.verifyAttempts) or 0
+        local lastT = (existing and existing.lastVerifyAt) or 0
+        local secsSince = floor(time()) - lastT
+        if attempts < 3 then
+            -- v1.1.4: throttle re-triggers by time. Each TryCachePending
+            -- tick (every 0.25s) re-evaluates pending items; without this
+            -- gate we'd fire SetHyperlink up to 4 times/sec per item.
+            -- 2-second floor between attempts gives the server time to
+            -- respond before we declare another miss.
+            if secsSince >= 2 then
+                TriggerItemFetch(itemID, itemLink)
+                ConLogsItemCacheDB[itemID] = existing or { v = CACHE_SCHEMA }
+                ConLogsItemCacheDB[itemID].v = CACHE_SCHEMA
+                ConLogsItemCacheDB[itemID].verifyAttempts = attempts + 1
+                ConLogsItemCacheDB[itemID].lastVerifyAt = floor(time())
+                ConLogsItemCacheDB[itemID].verified = false
+                dprint(string.format("[cache] slot mismatch for itemID %d: GetItemInfo→equipLoc=%s for slot %d (\"%s\") — query attempt %d/3",
+                    itemID, equipLoc or "?", slot, name or "?", attempts + 1))
+            end
+            return false
+        end
+        dprint(string.format("[cache] giving up verification for itemID %d after 3 attempts (slot %d, equipLoc=%s) — caching unverified",
+            itemID, slot, equipLoc or "?"))
+    end
+    -- texture is "Interface\Icons\INV_Sword_01" — we want the basename, lowercased.
+    local icon = nil
+    if texture then
+        icon = texture:match("([^\\/]+)$") or texture
+        icon = icon:lower()
+    end
+    local entry = {
+        v = CACHE_SCHEMA,
+        name = name,
+        quality = quality or 0,
+        itemLevel = itemLevel or 0,
+        icon = icon,
+        equipLoc = equipLoc,    -- v11: stored for future verification + dump diagnostics
+        verified = verified,    -- v11: true when equipLoc matched the observed slot
+        ts = floor(time()),
+    }
+
+    -- v0.22: capture per-item stats via GetItemStats. Ascension modifies stats
+    -- on most retail items and adds entirely server-custom items not in any
+    -- TDB extract — the client API is the only authoritative source. Stored
+    -- with the original ITEM_MOD_* keys so the site's ingest can map them
+    -- via the same enum used for TDB merging. Random suffix variants are
+    -- ignored per spec — first roll wins for a given itemID.
+    local link = itemLink or ("item:" .. itemID)
+    if GetItemStats then
+        local stats = GetItemStats(link)
+        if stats then
+            local serial = {}
+            for k, v in pairs(stats) do
+                if type(v) == "number" and v ~= 0 then
+                    serial[k] = v
+                end
+            end
+            -- Skip empty {} for shirts/tabards etc. so a missing field reads
+            -- as "no data captured" rather than "captured but empty".
+            if next(serial) then
+                entry.stats = serial
+            end
+        end
+    end
+
+    -- v0.26+: tooltip-scan. Returns five fields:
+    --   tooltipStats  — percent-based / pre-rating stats (Darkmantle "+1%
+    --                   crit", Rival's "+3% player damage") that GetItemStats
+    --                   doesn't expose in its enum.
+    --   tooltipExtras — raw flavor/proc lines like Eskhandar's "Chance on
+    --                   hit: Slows enemy's movement by 60%..." which aren't
+    --                   numeric stats but belong on the armory tooltip.
+    --   setBonuses    — each "Set:" / "(N) Set:" line as { pieces, text }.
+    --                   Same bonus block appears on every item in the set;
+    --                   site-side can dedup by itemSet later.
+    --   damage        — weapon damage range { min, max, school? } (GetItemStats
+    --                   only exposes DPS; the min/max and elemental school
+    --                   live only in tooltip text).
+    --   speed         — weapon attack speed as a decimal (e.g. 2.8).
+    -- Any may be nil if not applicable to the item; site's ingest handles
+    -- each in its own display path.
+    local tooltipStats, tooltipExtras, setBonuses, damage, speed = ScanTooltip(link, entry.stats)
+    if tooltipStats  then entry.tooltipStats  = tooltipStats  end
+    if tooltipExtras then entry.tooltipExtras = tooltipExtras end
+    if setBonuses    then entry.setBonuses    = setBonuses    end
+    if damage        then entry.damage        = damage        end
+    if speed         then entry.speed         = speed         end
+
+    ConLogsItemCacheDB[itemID] = entry
+    return true
+end
+
+local function MarkPendingCache(itemID, itemLink, slot)
+    if not itemID or itemID <= 0 then return end
+    -- Only skip if a current-schema entry exists AND it's verified. Stale
+    -- entries (or unverified slot-mismatched entries) fall through so the
+    -- pending retry loop re-runs CacheItemInfo and either upgrades the
+    -- cache or bumps verifyAttempts.
+    local existing = ConLogsItemCacheDB and ConLogsItemCacheDB[itemID]
+    if existing and existing.v == CACHE_SCHEMA and existing.verified ~= false then
+        -- If we have a slot, also confirm the cached equipLoc fits — if it
+        -- doesn't, fall through to retry (covers v10→v11 migration where
+        -- old entries lack equipLoc).
+        if not slot or SlotMatchesInvtype(slot, existing.equipLoc) then return end
+    end
+    if not pendingCache[itemID] then
+        pendingCache[itemID] = { firstSeen = now(), link = itemLink, slot = slot }
+        -- v1.1.4: pass the full itemstring so the server query carries
+        -- enchant/gem/suffix data (Ascension custom suffix items may
+        -- resolve differently with vs without the full payload).
+        TriggerItemFetch(itemID, itemLink)
+    end
+end
+
+-- Claude (perf): cap the number of HEAVY resolves per tick. Each successful CacheItemInfo
+-- here runs GetItemStats + ScanTooltip (the heaviest pure-Lua work in the file). Received-
+-- gear items are now ALL routed through this loop (see CachePayloadItems), so a syncfrom /
+-- auto-sync replay can leave hundreds queued — resolving them all in one tick would be a
+-- visible hitch. Resolve at most this many per 0.25s tick; unresolved items are cheap
+-- (GetItemInfo nil → early return) so iterating the rest each tick stays trivial.
+local CACHE_RESOLVE_PER_TICK = 8
+local function TryCachePending()
+    if not next(pendingCache) then return end
+    local nowT = now()
+    local resolved = 0
+    for iid, info in pairs(pendingCache) do
+        if resolved >= CACHE_RESOLVE_PER_TICK then break end
+        if CacheItemInfo(iid, info.link, info.slot) then
+            pendingCache[iid] = nil
+            resolved = resolved + 1   -- count only successful (potentially heavy) resolves
+        elseif (nowT - info.firstSeen) > CACHE_GIVE_UP then
+            pendingCache[iid] = nil -- server never responded; try again on next scan
+        else
+            -- v1.1.5: backoff re-trigger. Initial SetHyperlink fired on
+            -- MarkPendingCache; if the server didn't respond after 10s,
+            -- fire one more. Gives a second chance without per-tick
+            -- spam (which was the v1.1.3 bug).
+            local lastFire = info.lastFiredAt or info.firstSeen
+            if (nowT - lastFire) > 10 then
+                TriggerItemFetch(iid, info.link)
+                info.lastFiredAt = nowT
+                dprint(string.format("[cache] re-firing fetch for itemID %d (%.0fs since first request)",
+                    iid, nowT - info.firstSeen))
+            end
+        end
+    end
+end
+
+-- iterate gear slots, ensure every itemID is either cached or queued.
+-- Passes the full itemstring as the hyperlink so GetItemStats can include
+-- suffix-variant stats on the first scan that lands.
+-- v11: passes slot index so CacheItemInfo can verify equipLoc matches.
+local function CachePayloadItems(entry)
+    if not entry or not entry.gear then return end
+    for slot = 1, 19 do
+        local raw = entry.gear[slot]
+        if raw and raw ~= "" then
+            local iid = tonumber(raw:match("^(%d+)"))
+            if iid and iid > 0 then
+                -- Claude (perf): route received-gear items through the THROTTLED pending loop
+                -- instead of resolving inline. CacheItemInfo here ran GetItemStats + ScanTooltip
+                -- synchronously on the receive frame for every resolvable item; a syncfrom /
+                -- auto-sync replay completing several sets could stack those into a hitch.
+                -- MarkPendingCache skips already-cached / hint-seeded items cheaply and queues
+                -- the rest for TryCachePending (capped per tick). ShouldStore's name-blacklist
+                -- still works — it reads the client's own GetItemInfo cache, which our scan
+                -- never populated synchronously anyway.
+                MarkPendingCache(iid, "item:" .. raw, slot)
+            end
+        end
+    end
+end
+
+-- ---------------- Build + broadcast ----------------
+
+-- Read the talent point distribution across the 3 tabs for a given unit.
+-- Ascension's classless system sometimes returns 0 from GetTalentTabInfo's
+-- pointsSpent field even when the player has real talents — so we also fall
+-- back to summing pointsSpent across individual GetTalentInfo() reads. The
+-- explicit talentGroup (from GetActiveTalentGroup) helps in cases where the
+-- API doesn't default to the active group on Ascension.
+-- Returns: s1, s2, s3, activeGroup (1-based, defaults to 1 when API missing).
+local function ReadSpecPoints(unit)
+    -- inspectFlag: 1 when reading another unit's talents (after NotifyInspect),
+    -- nil for "player" — standard 3.3.5 GetTalentTabInfo convention.
+    -- IMPORTANT: the idiom `cond and nil or 1` BREAKS when you want nil as the
+    -- true branch — `true and nil` evaluates to `nil`, then `nil or 1` is `1`.
+    -- Every self-scan from v0.3 through v0.15 was accidentally reading inspect
+    -- data (isInspect=1) for "player", which returns 0 for every tab because
+    -- you can't NotifyInspect yourself. That's why spec=0/0/0 on all self-scans.
+    local isInspect
+    if not UnitIsUnit(unit, "player") then isInspect = 1 end
+
+    local function tabPoints(tabIndex)
+        local pts = select(3, GetTalentTabInfo(tabIndex, isInspect)) or 0
+        if pts > 0 then return pts end
+        -- Fallback: iterate talents in this tab and sum pointsSpent directly.
+        if GetNumTalents and GetTalentInfo then
+            local n = GetNumTalents(tabIndex, isInspect) or 0
+            local total = 0
+            for i = 1, n do
+                local _, _, _, _, spent = GetTalentInfo(tabIndex, i, isInspect)
+                total = total + (spent or 0)
+            end
+            if total > 0 then return total end
+        end
+        return 0
+    end
+
+    return tabPoints(1), tabPoints(2), tabPoints(3)
+end
+
+-- Read the 3 class talent tabs' display names AND icon texture paths.
+-- Ascension reorders tabs from retail WotLK on some classes, so we encode
+-- this info per-scan into the payload rather than relying on a hardcoded
+-- SPEC_TREE lookup. GetTalentTabInfo returns (name, iconTexture, pointsSpent,
+-- background, previewPointsSpent, isUnlocked).
+local function ReadTabInfo(unit)
+    local isInspect
+    if not UnitIsUnit(unit, "player") then isInspect = 1 end
+    -- Defensive: strip the '^' separator and '|' (item-link escape) just in
+    -- case a server-custom tab name or icon path contains them.
+    local function clean(s) return (s or ""):gsub("[%^|]", "") end
+    local names, icons = {}, {}
+    for tab = 1, 3 do
+        local n, i = GetTalentTabInfo(tab, isInspect)
+        names[tab] = clean(n or "")
+        icons[tab] = clean(i or "")
+    end
+    return names, icons
+end
+
+-- v1.3: capture per-talent point distribution for the unit's 3 talent tabs.
+-- Encodes ranks in talent-index order (the same order GetTalentInfo returns
+-- them), one tab per ';'-delimited segment, ranks within a tab separated by
+-- ','. Receivers + the website map talent-index → name/tier/column via the
+-- class's talent tree definition (epog-data DBC extraction). Wire size is
+-- small (~200 bytes for 3 full tabs).
+--
+-- Format: "rank,rank,rank,...;rank,rank,...;rank,rank,..."
+-- Example for a 51-pointer in tab 1: "0,0,5,3,0,0,5,5,5,5,3,...;0,0,0;0,0,0"
+local function BuildTalentRanks(unit)
+    if not (GetNumTalents and GetTalentInfo) then return "" end
+    local isInspect
+    if not UnitIsUnit(unit, "player") then isInspect = 1 end
+    local pieces = {}
+    for tab = 1, 3 do
+        local n = GetNumTalents(tab, isInspect) or 0
+        local ranks = {}
+        for i = 1, n do
+            local _, _, _, _, spent = GetTalentInfo(tab, i, isInspect)
+            ranks[i] = tostring(spent or 0)
+        end
+        pieces[#pieces + 1] = table.concat(ranks, ",")
+    end
+    return table.concat(pieces, ";")
+end
+
+local function ParseTalentRanks(s)
+    if not s or s == "" then return nil end
+    local out = {}
+    local tabIdx = 0
+    for tabRanks in s:gmatch("([^;]+)") do
+        tabIdx = tabIdx + 1
+        local ranks = {}
+        for r in tabRanks:gmatch("([^,]+)") do
+            ranks[#ranks + 1] = tonumber(r) or 0
+        end
+        out[tabIdx] = ranks
+    end
+    return out
+end
+
+-- v1.3: capture per-class talent tree METADATA (name, icon, tier, column,
+-- maxRank for each talent) into a new account-wide SavedVariable. The
+-- broadcast wire only carries ranks (position 41) — metadata is too big
+-- to ship every scan. So each client captures metadata locally whenever
+-- it has access to GetTalentInfo for a given class (self-scans always,
+-- inspect-scans for the inspected unit's class).
+--
+-- Result: over time everyone's local ConLogsTalentTreeDB accumulates metadata
+-- for every class they encounter. The in-game inspect frame's talent
+-- tree renderer + the website's tree renderer both use this data.
+local function CaptureTalentMetadata(unit, classFile)
+    if not (GetNumTalents and GetTalentInfo and GetTalentTabInfo) then return end
+    if not classFile or classFile == "" then return end
+    local isInspect = (not UnitIsUnit(unit, "player")) and 1 or nil
+    ConLogsTalentTreeDB = ConLogsTalentTreeDB or {}
+    ConLogsTalentTreeDB[classFile] = ConLogsTalentTreeDB[classFile] or { tabs = {} }
+    local cls = ConLogsTalentTreeDB[classFile]
+    cls.tabs = cls.tabs or {}
+    local function cleanIcon(s) return (s or ""):gsub("[%^|]", "") end
+    for tab = 1, 3 do
+        local tabName, tabIcon, _, tabBackground = GetTalentTabInfo(tab, isInspect)
+        local n = GetNumTalents(tab, isInspect) or 0
+        local talents = {}
+        for i = 1, n do
+            local name, icon, tier, column, _, maxRank = GetTalentInfo(tab, i, isInspect)
+            if name then
+                local talent = {
+                    name    = name,
+                    icon    = cleanIcon(icon),
+                    tier    = tier or 0,
+                    column  = column or 0,
+                    maxRank = maxRank or 0,
+                }
+                -- v1.3+: capture prereqs so the renderer can draw arrows
+                -- between dependent talents like Blizzard's PlayerTalentFrame.
+                -- GetTalentPrereqs returns (tier, column, isLearnable, ...) —
+                -- repeated triples for multi-prereq talents (rare in WotLK).
+                if GetTalentPrereqs then
+                    local pTier, pCol = GetTalentPrereqs(tab, i, isInspect)
+                    if pTier and pCol then
+                        talent.prereqTier = pTier
+                        talent.prereqCol  = pCol
+                    end
+                end
+                talents[i] = talent
+            end
+        end
+        -- Only update the tab record when we got a non-empty talent list —
+        -- defensive against transient nil returns mid-inspect that would
+        -- otherwise blow away good cached metadata.
+        if next(talents) then
+            cls.tabs[tab] = {
+                name       = tabName or "",
+                icon       = cleanIcon(tabIcon or ""),
+                background = cleanIcon(tabBackground or ""),
+                talents    = talents,
+            }
+        end
+    end
+    cls.lastUpdate = floor(time())
+end
+
+-- Scan the enchant description lines of an equipped item for blacklisted
+-- patterns (Mithril Spurs etc.). Returns the first matching pattern or nil.
+-- Only called on sender side (BuildPayload) so received broadcasts don't
+-- pay the tooltip cost.
+local enchantScanTip
+local function ScanEnchantTooltip(link)
+    if not link then return nil end
+    if not enchantScanTip then
+        enchantScanTip = CreateFrame("GameTooltip", "ConLogsEnchantScanTip", UIParent, "GameTooltipTemplate")
+    end
+    enchantScanTip:SetOwner(UIParent, "ANCHOR_NONE")
+    enchantScanTip:ClearLines()
+    enchantScanTip:SetHyperlink(link)
+    for i = 1, enchantScanTip:NumLines() do
+        local fs = _G["ConLogsEnchantScanTipTextLeft" .. i]
+        local text = fs and fs:GetText() or ""
+        for _, pat in ipairs(UTILITY_ENCHANT_TOOLTIP_PATTERNS) do
+            if text:find(pat, 1, true) then return pat end
+        end
+    end
+    return nil
+end
+
+-- v1.2: walk the inspected unit's gear and emit position-40 hints for
+-- every itemID where the inspector's local GetItemInfo has data. Right
+-- after a successful inspect, the SMSG_INSPECT_RESULTS response has
+-- populated the dynamic cache for those items, so GetItemInfo + GetItemStats
+-- Claude (v1.4.4): capture live character stats at scan time. Item-only
+-- aggregation misses everything that isn't a flat slot stat:
+--   - race+level base attribute values
+--   - class AP formulas (warrior STR×2, hunter AGI×2, etc.)
+--   - weapon damage with AP scaling
+--   - buff/debuff effects active during the scan
+--   - talent multipliers (e.g., Toughness +Stamina)
+-- UnitStat / UnitArmor / UnitAttackPower / UnitDamage all work on
+-- inspected unit tokens (party/raid). The player-only APIs (GetCritChance,
+-- GetCombatRatingBonus, GetSpellBonusDamage) only fire when scanning self.
+-- For inspect-scans the panel falls back to derived-from-item-ratings for
+-- those fields.
+local function CapturePlayerStats(unit)
+    local out = {}
+    -- Effective stat (index 2 of UnitStat) matches what the Character pane
+    -- shows in the white "Strength: 74" line — base + items + buffs + talents.
+    -- Index 1 (base) is the UNBUFFED value: base race+class + gear + permanent
+    -- talents/enchants/gems, EXCLUDING temporary auras (Blessing of Kings,
+    -- Mark of the Wild, food, flasks). UnitStat returns (base, stat, pos, neg).
+    local bstr, str = UnitStat(unit, 1)
+    local bagi, agi = UnitStat(unit, 2)
+    local bsta, sta = UnitStat(unit, 3)
+    local bint, intel = UnitStat(unit, 4)
+    local bspi, spi = UnitStat(unit, 5)
+    out.str = str or 0
+    out.agi = agi or 0
+    out.sta = sta or 0
+    out.int = intel or 0
+    out.spi = spi or 0
+    -- Claude (v2.5.0): unbuffed base primaries. Subtracting equipped-item
+    -- stats from these server-side yields the pure race+class base stats —
+    -- the data the epoch-sim simulators need to validate RACE_BASE_STATS for
+    -- every race/class combo. Buff-free, so no need to reverse +%stat auras.
+    out.bstr = bstr or 0
+    out.bagi = bagi or 0
+    out.bsta = bsta or 0
+    out.bint = bint or 0
+    out.bspi = bspi or 0
+    -- Effective armor (index 2) includes base+items+buffs (e.g., Inner Fire).
+    local _, effArmor = UnitArmor(unit)
+    out.armor = effArmor or 0
+    -- AP: sum the three returns. UnitAttackPower returns base, posBuff, negBuff.
+    local apB, apP, apN = UnitAttackPower(unit)
+    out.mAP = (apB or 0) + (apP or 0) + (apN or 0)
+    local rapB, rapP, rapN = UnitRangedAttackPower(unit)
+    out.rAP = (rapB or 0) + (rapP or 0) + (rapN or 0)
+    -- Weapon damage range (UnitDamage returns minDmg, maxDmg as floats).
+    if UnitDamage then
+        local minD, maxD = UnitDamage(unit)
+        if minD and maxD and minD > 0 then
+            out.wMin = math.floor(minD + 0.5)
+            out.wMax = math.floor(maxD + 0.5)
+        end
+    end
+    -- Player-only stats: combat ratings and crit chances only respond to
+    -- the implicit "player" unit. Skip for inspect-scans of others; the
+    -- UI falls back to item-rating sums on the receive side.
+    if UnitIsUnit(unit, "player") then
+        if GetCritChance        then out.mCrit = GetCritChance() end
+        if GetRangedCritChance  then out.rCrit = GetRangedCritChance() end
+        if GetSpellCritChance   then out.sCrit = GetSpellCritChance(2) end -- fire school = typical caster value
+        if GetCombatRatingBonus then
+            -- These rating-bonus values are correct for Hit/Haste/Expertise:
+            -- the character pane's displayed % for those is rating-derived
+            -- (talents/racials add their own line in the tooltip but the
+            -- top-line % is from rating).
+            out.mHit  = GetCombatRatingBonus(6)  -- CR_HIT_MELEE
+            out.rHit  = GetCombatRatingBonus(7)  -- CR_HIT_RANGED
+            out.sHit  = GetCombatRatingBonus(8)  -- CR_HIT_SPELL
+            out.mHa   = GetCombatRatingBonus(18) -- CR_HASTE_MELEE
+            out.rHa   = GetCombatRatingBonus(19) -- CR_HASTE_RANGED
+            out.sHa   = GetCombatRatingBonus(20) -- CR_HASTE_SPELL
+            out.exp   = GetCombatRatingBonus(24) -- CR_EXPERTISE
+            out.res   = GetCombatRatingBonus(15) -- CR_CRIT_TAKEN_MELEE ≈ resilience
+            out.arp   = GetCombatRatingBonus(25) -- CR_ARMOR_PENETRATION
+        end
+        -- Claude (v1.4.5): defense-side totals. GetCombatRatingBonus(3/4/5)
+        -- only returns the rating-derived bonus; a Hunter with no dodge
+        -- rating still has ~4-5% dodge from base Agility, which the v1.4.4
+        -- code was displaying as 0%. The Get*Chance APIs return the full
+        -- dodge/parry/block including base, items, buffs, talents — which
+        -- is what the in-game character pane shows.
+        if GetDodgeChance then out.dod = GetDodgeChance() end
+        if GetParryChance then out.par = GetParryChance() end
+        if GetBlockChance then out.blk = GetBlockChance() end
+        -- Defense skill: UnitDefense("player") returns (base, modifier)
+        -- where base is the level-scaled minimum and modifier is the
+        -- bonus from defense-rating items + talents. Stored as the raw
+        -- skill total so the panel can display "(N skill)" similar to
+        -- the in-game tooltip.
+        if UnitDefense then
+            local defBase, defMod = UnitDefense("player")
+            out.def = (defBase or 0) + (defMod or 0)
+        end
+        if GetSpellBonusDamage then
+            local maxSP = 0
+            for school = 1, 7 do
+                local sp = GetSpellBonusDamage(school) or 0
+                if sp > maxSP then maxSP = sp end
+            end
+            out.sp = maxSP
+        end
+        if GetSpellBonusHealing then out.hp = GetSpellBonusHealing() or 0 end
+        if GetManaRegen then
+            local _, casting = GetManaRegen()
+            out.mp5 = math.floor(((casting or 0) * 5) + 0.5)
+        end
+    end
+    return out
+end
+
+-- Claude (v1.4.4): wire encoding for the stats blob. Compact key=value list
+-- separated by commas. Numeric values truncated to 2 decimals to keep
+-- the payload short. Wire-control chars (^|=,) are not legal in keys
+-- or values by construction (we only emit short ASCII keys + numeric
+-- values), so no escaping needed.
+local STATS_KEY_ORDER = {
+    "str","agi","sta","int","spi","armor",
+    "mAP","rAP","wMin","wMax",
+    "mCrit","rCrit","sCrit",
+    "mHit","rHit","sHit",
+    "mHa","rHa","sHa",
+    "exp","dod","par","blk","res","arp","def",
+    "sp","hp","mp5",
+    -- Claude (v2.5.0): unbuffed base primaries (UnitStat index 1), appended
+    -- per the never-reorder rule. Old receivers ignore unknown keys.
+    "bstr","bagi","bsta","bint","bspi",
+}
+local function EncodeCharStats(stats)
+    if not stats then return "" end
+    local parts = {}
+    for _, k in ipairs(STATS_KEY_ORDER) do
+        local v = stats[k]
+        if v and v ~= 0 then
+            -- 2-decimal precision is plenty for stats: 6.00% / 13.67% / 368.5
+            parts[#parts + 1] = string.format("%s=%.2f", k, v)
+        end
+    end
+    return table.concat(parts, ",")
+end
+
+-- Claude (v1.4.4): inverse of EncodeCharStats. Returns a stats table or
+-- nil if blob is empty/malformed (defensive — older payloads have no
+-- field 43, and we don't want a malformed blob to error the whole parse).
+local function ParseCharStats(blob)
+    if not blob or blob == "" then return nil end
+    local out = {}
+    for pair in blob:gmatch("([^,]+)") do
+        local k, v = pair:match("^([%w_]+)=([%-%d%.]+)$")
+        if k and v then
+            local n = tonumber(v)
+            if n then out[k] = n end
+        end
+    end
+    if not next(out) then return nil end
+    return out
+end
+
+-- return Ascension's server-correct values. Receivers seed their cache
+-- from these hints and bypass the broken server-query path entirely.
+local function BuildItemInfoHints(unit)
+    local pieces = {}
+    for slot = 1, 19 do
+        local link = GetInventoryItemLink(unit, slot)
+        if link then
+            local itemID = tonumber(link:match("item:(%d+)"))
+            if itemID then
+                local nm, _, quality, itemLevel, _, _, _, _, equipLoc, texture = GetItemInfo(link)
+                if nm then
+                    local icon = ""
+                    if texture then
+                        icon = (texture:match("([^\\/]+)$") or texture):lower()
+                    end
+                    local statsStr = ""
+                    if GetItemStats then
+                        statsStr = EncodeHintStats(GetItemStats(link))
+                    end
+                    pieces[#pieces + 1] = string.format("%d~%s~%d~%d~%s~%s~%s",
+                        itemID,
+                        StripHintWireChars(nm),
+                        quality or 0,
+                        itemLevel or 0,
+                        equipLoc or "",
+                        icon,
+                        statsStr)
+                end
+            end
+        end
+    end
+    return table.concat(pieces, ";")
+end
+
+local function BuildPayload(unit, guid)
+    local name = UnitName(unit)
+    if not name or name == "" or name == UNKNOWN then return nil, "name unresolved" end
+    -- v1.1.7: aura gate (defense-in-depth — ScanRoster + TryInspect also
+    -- check). Self-scans pass: you always see your own real gear regardless
+    -- of transmog. Other-unit scans require Reality Recalibrators because
+    -- inspect APIs return transmog visuals on Ascension without it.
+    -- v1.4.1: gate is conditional on REQUIRE_REALITY_AURA flag (test mode).
+    if REQUIRE_REALITY_AURA and not UnitIsUnit(unit, "player") and not HasRealityAura() then
+        return nil, "Reality Recalibrators aura not active (transmog would override real gear)"
+    end
+    local realm = GetRealmName() or ""
+    local _, classFile = UnitClass(unit)
+    classFile = classFile or ""
+    local level = UnitLevel(unit) or 0
+
+    local s1, s2, s3 = ReadSpecPoints(unit)
+    local dominantTree = DominantTree({s1, s2, s3})
+    local tabNames, tabIcons = ReadTabInfo(unit)
+    -- v0.33: PvP loadouts (Insignia trinket equipped) get routed to
+    -- sets["pvp"] on the player record instead of sets[dominantTree].
+    -- Group key is stringified: "1" / "2" / "3" / "pvp". Receivers compute
+    -- their own group locally from entry.gear, so the wire value is mostly
+    -- informational/forward-compat.
+    local groupKey = UnitLooksPvP(unit) and "pvp" or tostring(dominantTree)
+
+    local parts = {
+        "v" .. PROTO,
+        name, realm, classFile, tostring(level), guid or "",
+        tostring(s1), tostring(s2), tostring(s3),
+        tostring(floor(time())),
+        ZoneType(),
+    }
+    local equipped = 0
+    for slot = 1, 19 do
+        local link = GetInventoryItemLink(unit, slot)
+        local istr = ItemStringFromLink(link)
+        if istr ~= "" then equipped = equipped + 1 end
+
+        -- Name-based item blacklist (sender side — receive side also checks)
+        if link then
+            local itemName = GetItemInfo(link)
+            if itemName then
+                for _, pat in ipairs(UTILITY_ITEM_NAMES_ANY_SLOT) do
+                    if itemName:find(pat, 1, true) then
+                        return nil, string.format("utility item '%s' in slot %d", itemName, slot)
+                    end
+                end
+                local bySlot = UTILITY_ITEM_NAMES_BY_SLOT[slot]
+                if bySlot then
+                    for _, pat in ipairs(bySlot) do
+                        if itemName:find(pat, 1, true) then
+                            return nil, string.format("utility item '%s' in slot %d (blacklisted pattern '%s')", itemName, slot, pat)
+                        end
+                    end
+                end
+            end
+        end
+
+        parts[#parts + 1] = istr
+    end
+    -- Mount enchant tooltip scan on boots + gloves. Only runs once per scan
+    -- per slot, only on sender side.
+    for _, mountSlot in ipairs(MOUNT_ENCHANT_SLOTS) do
+        local link = GetInventoryItemLink(unit, mountSlot)
+        local bad = ScanEnchantTooltip(link)
+        if bad then
+            return nil, string.format("mount enchant '%s' on slot %d", bad, mountSlot)
+        end
+    end
+    -- Claude: full-set gate. Mid-equipment-swap inspects often have a
+    -- weapon slot briefly empty — saving that snapshot would record an
+    -- incomplete loadout. Reject anything missing a required slot so the
+    -- short-retry path picks them up again with their full kit equipped.
+    local fullOk, fullReason = CheckFullSet(function(slot) return GetInventoryItemLink(unit, slot) end)
+    if not fullOk then
+        return nil, fullReason .. " (likely mid-swap, retry)"
+    end
+    -- Append dominant-tree index at position 31 (per v0.7 append-only rule).
+    -- v0.14+ receivers actually compute this locally from entry.spec, so the
+    -- field is informational/forward-compat only. Old v0.12 clients ignore it.
+    parts[#parts + 1] = groupKey -- v0.33: "1"/"2"/"3" or "pvp" (was dominantTree numeric)
+    -- Tab names at positions 32/33/34 so receivers can render class-tree
+    -- labels that match the sender's actual client layout (Ascension reorders
+    -- some classes vs retail WotLK). Older clients ignore the trailing fields.
+    parts[#parts + 1] = tabNames[1]
+    parts[#parts + 1] = tabNames[2]
+    parts[#parts + 1] = tabNames[3]
+    -- Tab icon paths at positions 35/36/37 (v0.18+) so the inspect-frame
+    -- centerpiece icon exactly matches the server's spec icon.
+    parts[#parts + 1] = tabIcons[1]
+    parts[#parts + 1] = tabIcons[2]
+    parts[#parts + 1] = tabIcons[3]
+    -- v0.36: piggyback our local DB size (count of stored players) so the
+    -- browser's Scanners view can show peers ordered by "how much data they
+    -- have to share". Cheap — one small integer per broadcast, always
+    -- additive at the tail per the append-only wire rule.
+    local dbSize = 0
+    if ConLogsDB and ConLogsDB.players then
+        for _ in pairs(ConLogsDB.players) do dbSize = dbSize + 1 end
+    end
+    parts[#parts + 1] = tostring(dbSize)
+    -- v0.43: emit our configured main-name identity at position 39. Empty
+    -- string when not configured — receivers fall back to the wire sender
+    -- character name. Lets the user consolidate scans from all their alts
+    -- under one identity.
+    local myMain = (ConLogsDB and ConLogsDB.config and ConLogsDB.config.mainName) or ""
+    -- Strip wire-control chars defensively (^ separator, | item-link escape)
+    myMain = myMain:gsub("[%^|]", "")
+    parts[#parts + 1] = myMain
+    -- v1.2: wire position 40 — item-info hints. Lets receivers populate
+    -- their local cache with server-correct names/stats for itemIDs they
+    -- can't resolve via CMSG_ITEM_QUERY_SINGLE on Ascension. Old receivers
+    -- ignore the unknown trailing field (additive wire-extension rule).
+    parts[#parts + 1] = BuildItemInfoHints(unit)
+    -- v1.3: wire position 41 — per-talent rank distribution. Powers the
+    -- interactive talent tree on epoglogs.com. Format described at
+    -- BuildTalentRanks. Backward compatible — pre-v1.3 receivers ignore.
+    parts[#parts + 1] = BuildTalentRanks(unit)
+    -- Claude (v1.4.2): wire position 42 — scanner's guild name. Captured
+    -- from GetGuildInfo("player"). Receivers persist to peerInfo[name].guild
+    -- so the Scanners view in the Browser can show a Guild column. Empty
+    -- string when the scanner is unguilded. Strip wire-control chars
+    -- defensively (^ separator and | item-link escape) so a guild name
+    -- containing those can't break payload parsing downstream.
+    local myGuild = GetGuildInfo and GetGuildInfo("player") or ""
+    if type(myGuild) ~= "string" then myGuild = "" end
+    myGuild = myGuild:gsub("[%^|]", "")
+    parts[#parts + 1] = myGuild
+    -- Claude (v1.4.4): wire position 43 — live character stats from
+    -- UnitStat / UnitArmor / UnitAttackPower / UnitDamage. Lets the
+    -- receiver render real-character-pane numbers (base + items + buffs
+    -- + talents) in the Stats panel instead of pure-from-items sums.
+    -- For inspect-scans of others, only the unit-token-compatible stats
+    -- are present; player-only fields (crit/hit/haste/expertise %, spell
+    -- power, mp5) are skipped server-side and the UI falls back to
+    -- derived-from-rating sums on the receive side.
+    parts[#parts + 1] = EncodeCharStats(CapturePlayerStats(unit))
+    -- Claude (v2.5.0): wire position 44 — locale-independent race token from
+    -- UnitRace's 2nd return ("Human"/"Dwarf"/"Scourge"/"BloodElf"/…). Works on
+    -- inspected units too. Paired with the unbuffed base stats in field 43
+    -- (bstr…bspi), it lets the server derive race+class base stats per combo.
+    -- Append-only: pre-v2.5 receivers ignore the trailing field.
+    local _, raceFile = UnitRace(unit)
+    parts[#parts + 1] = raceFile or ""
+    -- v1.3: capture talent metadata locally for this class (name, icon,
+    -- tier, column, maxRank per talent). Stored in ConLogsTalentTreeDB.
+    -- Doesn't go on the wire — it's bulky and stable per-class. Each
+    -- client builds its own metadata DB by observing scans.
+    CaptureTalentMetadata(unit, classFile)
+    return table.concat(parts, "^"), equipped
+end
+
+local function MakeChunks(payload, msgID)
+    local body = MAX_CHUNK_BODY
+    local count = math.ceil(#payload / body)
+    if count < 1 then count = 1 end
+    local out = {}
+    for i = 1, count do
+        local sub = payload:sub((i - 1) * body + 1, i * body)
+        out[i] = string.format("%s^%d^%d^%s", msgID, i, count, sub)
+    end
+    return out
+end
+
+-- v0.53: returns true iff every party/raid member is in our guild. Used to
+-- skip the PARTY/RAID broadcast when we're already going to send to GUILD —
+-- a 5-man dungeon of guildies otherwise gets every scan twice (once per
+-- channel). Failsafe: if guild roster isn't yet populated, returns false
+-- (we'll send on both channels — current behavior, no data loss).
+local _guildiesCache, _guildiesCacheAt, _guildiesCacheN = nil, 0, 0
+local function AllGroupAreGuildies()
+    if not IsInGuild() then return false end
+    local n = GetNumGuildMembers and GetNumGuildMembers() or 0
+    if n == 0 then return false end -- roster not loaded yet → safe-fall to dual broadcast
+    -- Cache the guildies set briefly: building it is O(guildSize) and this runs from
+    -- PickChannels once per broadcast chunk, so rebuilding a 500-row roster table dozens
+    -- of times during a raid pull is a real hitch. Roster rarely changes → 30s TTL,
+    -- invalidated on member-count change.
+    local guildies = _guildiesCache
+    if not (guildies and (time() - _guildiesCacheAt) < 30 and _guildiesCacheN == n) then
+        guildies = {}
+        for i = 1, n do
+            local name = GetGuildRosterInfo(i)
+            if name then guildies[name] = true end
+        end
+        _guildiesCache, _guildiesCacheAt, _guildiesCacheN = guildies, time(), n
+    end
+    local me = UnitName("player")
+    if me then guildies[me] = true end
+    if GetNumRaidMembers() > 0 then
+        for i = 1, GetNumRaidMembers() do
+            local nm = UnitName("raid" .. i)
+            if nm and not guildies[nm] then return false end
+        end
+        return true
+    end
+    if GetNumPartyMembers() > 0 then
+        for i = 1, GetNumPartyMembers() do
+            local nm = UnitName("party" .. i)
+            if nm and not guildies[nm] then return false end
+        end
+        return true
+    end
+    return false -- not in a group
+end
+
+local function PickChannels()
+    local list = {}
+    local inGuild = IsInGuild()
+    -- v0.53: when everyone in the group is also a guildmate, skip the
+    -- PARTY/RAID send — the GUILD broadcast already reaches them and the
+    -- duplicate would just burn channel budget. Halves traffic for
+    -- all-guild dungeons/raids.
+    local skipGroupChan = inGuild and AllGroupAreGuildies()
+    if not skipGroupChan then
+        if GetNumRaidMembers() > 0 then
+            table.insert(list, "RAID")
+        elseif GetNumPartyMembers() > 0 then
+            table.insert(list, "PARTY")
+        end
+    end
+    if inGuild then
+        table.insert(list, "GUILD")
+    end
+    return list
+end
+
+local function EnqueueBroadcast(payload, targetName)
+    local channels = PickChannels()
+    if #channels == 0 then
+        dprint(string.format("[send] %s: no channel available (solo + no guild)", targetName or "?"))
+        return
+    end
+    msgCounter = msgCounter + 1
+    local msgID = string.format("%x%x", math.floor(now() * 10) % 0xffff, msgCounter % 0xffff)
+    local chunks = MakeChunks(payload, msgID)
+    for _, ch in ipairs(channels) do
+        for _, body in ipairs(chunks) do
+            outQueue[#outQueue + 1] = { ch = ch, body = body }
+        end
+    end
+    dprint(string.format("[send] %s: %d chunks x %d channels [%s] (%d bytes)",
+        targetName or "?", #chunks, #channels, table.concat(channels, "+"), #payload))
+end
+
+-- ---------------- Receive: parse + store ----------------
+
+local function ShouldStore(entry)
+    if not entry then return false, "nil entry" end
+    if (entry.level or 0) < MIN_STORE_LEVEL then
+        return false, string.format("level %d < %d", entry.level or 0, MIN_STORE_LEVEL)
+    end
+    -- Ascension is classless: GetTalentTabInfo(tab, ...) returns 0 points-spent
+    -- for every tab regardless of what the player actually specced, so we can't
+    -- use spec distribution as a "committed player" gate here. The server-side
+    -- validator in warcraftlogs-epog still has the final say on what gets
+    -- published — we just collect everything gated by level + gear-equipped.
+    -- Claude: full-set gate, mirrored from sender side. A peer running an
+    -- older addon (or a future bug) might broadcast an incomplete payload;
+    -- we refuse to persist anything that's missing a required slot so the
+    -- DB never contains half-swapped loadouts.
+    local fullOk, fullReason = CheckFullSet(function(slot) return entry.gear[slot] end)
+    if not fullOk then
+        return false, fullReason
+    end
+    for slot = 1, 19 do
+        local s = entry.gear[slot]
+        if s and s ~= "" then
+            local iid, eid = s:match("^(%d+):(%-?%d+)")
+            iid = tonumber(iid) or 0
+            eid = tonumber(eid) or 0
+            if UTILITY_ITEMS[iid] then
+                return false, "utility item equipped: " .. UTILITY_ITEMS[iid]
+            end
+            if UTILITY_ENCHANTS[eid] then
+                return false, "utility enchant: " .. UTILITY_ENCHANTS[eid]
+            end
+            -- Name-pattern blacklist (works across all Ascension custom item IDs).
+            -- Only effective if GetItemInfo has cached the item — uncached items
+            -- pass through this check. CachePayloadItems runs before ShouldStore
+            -- so most will be resolved by now.
+            if iid > 0 then
+                local itemName = GetItemInfo(iid)
+                if itemName then
+                    for _, pat in ipairs(UTILITY_ITEM_NAMES_ANY_SLOT) do
+                        if itemName:find(pat, 1, true) then
+                            return false, "utility item name: " .. itemName
+                        end
+                    end
+                    local bySlot = UTILITY_ITEM_NAMES_BY_SLOT[slot]
+                    if bySlot then
+                        for _, pat in ipairs(bySlot) do
+                            if itemName:find(pat, 1, true) then
+                                return false, string.format("utility item in slot %d: %s", slot, itemName)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return true
+end
+
+local function ParsePayload(payload)
+    local t = { strsplit("^", payload) }
+    -- Accept any payload in the same PROTO family: exact "v<PROTO>" or
+    -- "v<PROTO>.<minor>" (future soft-bump). Reject a different major (e.g. "v2").
+    -- Unknown trailing tokens past slot 19 (position 31+) are ignored — that's
+    -- our forward-compat channel for additive changes.
+    local tag = t[1]
+    if not tag or (tag ~= ("v" .. PROTO) and not tag:match("^v" .. PROTO .. "%.")) then
+        return nil
+    end
+    local entry = {
+        name        = t[2] or "",
+        realm       = t[3] or "",
+        class       = t[4] or "",
+        level       = tonumber(t[5]) or 0,
+        guid        = t[6] or "",
+        spec        = { tonumber(t[7]) or 0, tonumber(t[8]) or 0, tonumber(t[9]) or 0 },
+        scanTime    = tonumber(t[10]) or 0,
+        zone        = t[11] or "",
+        gear        = {},
+        -- Position 31 — v0.13+ carries the sender's group key. Value is
+        -- numeric "1"/"2"/"3" for class trees or "pvp" for PvP loadouts
+        -- (v0.33+). Kept as a string here for forward-compat; Ingest
+        -- computes its own group key locally from entry.gear + spec, so
+        -- this field is informational only.
+        groupKey    = t[31] or "1",
+    }
+    for i = 1, 19 do entry.gear[i] = t[11 + i] or "" end
+    -- v0.17+: positions 32/33/34 carry class tab names ("Combat",
+    -- "Assassination", "Subtlety"). Older payloads: tabNames stays nil and
+    -- the UI falls back to SPEC_TREE[class].
+    if t[32] and t[32] ~= "" then
+        entry.tabNames = { t[32] or "", t[33] or "", t[34] or "" }
+    end
+    -- v0.18+: positions 35/36/37 carry tab icon texture paths for rendering
+    -- the centerpiece spec icon in the inspect frame.
+    if t[35] and t[35] ~= "" then
+        entry.tabIcons = { t[35] or "", t[36] or "", t[37] or "" }
+    end
+    -- v0.36+: position 38 carries the sender's own DB size (count of stored
+    -- players). Used by the browser's Scanners view to rank peers by "how
+    -- much data they have to share". Absent on older payloads.
+    if t[38] and t[38] ~= "" then
+        entry.senderDBSize = tonumber(t[38])
+    end
+    -- v0.43+: position 39 carries the sender's configured main-name identity.
+    -- Used as the canonical scanner identity (scannedBy + peerInfo key) so
+    -- scans broadcast from multiple alts of the same user consolidate under
+    -- one name. Absent or empty on older payloads / unconfigured clients,
+    -- in which case the receiver falls back to the wire sender character
+    -- name.
+    if t[39] and t[39] ~= "" then
+        entry.senderMain = t[39]
+    end
+    -- v1.2: wire position 40 — item-info hints from the scanner. Used by
+    -- Ingest to seed ConLogsItemCacheDB without per-receiver server queries.
+    -- Absent on older payloads; no-op for receivers that don't apply hints.
+    if t[40] and t[40] ~= "" then
+        entry.itemHints = ParseItemInfoHints(t[40])
+    end
+    -- v1.3: wire position 41 — per-talent rank distribution. Stored on
+    -- the set for the website's interactive talent tree renderer.
+    -- Absent on older payloads; receivers without talent metadata just
+    -- skip rendering the tree.
+    if t[41] and t[41] ~= "" then
+        entry.talentRanks = ParseTalentRanks(t[41])
+    end
+    -- Claude (v1.4.2): wire position 42 — scanner's guild name. Used by
+    -- Ingest to populate peerInfo[name].guild for the Scanners view's
+    -- Guild column. Absent on pre-v1.4.2 payloads / unguilded scanners.
+    if t[42] and t[42] ~= "" then
+        entry.senderGuild = t[42]
+    end
+    -- Claude (v1.4.4): wire position 43 — live character stats blob
+    -- (UnitStat-derived). Stored on the set so the Stats panel can show
+    -- real character-pane values instead of pure-from-items sums.
+    -- Absent on pre-v1.4.4 payloads; UI falls back to item-sum aggregation
+    -- when entry.charStats is nil.
+    if t[43] and t[43] ~= "" then
+        entry.charStats = ParseCharStats(t[43])
+    end
+    -- Claude (v2.5.0): wire position 44 — locale-independent race token.
+    -- Stored top-level on the player record so the website/sims can group
+    -- base-stat samples by race/class combo. Absent on pre-v2.5 payloads.
+    if t[44] and t[44] ~= "" then
+        entry.race = t[44]
+    end
+    if entry.name == "" or entry.guid == "" then return nil end
+    return entry
+end
+
+local function Ingest(payload, sender)
+    local entry = ParsePayload(payload)
+    if not entry then
+        dprint("[store] REJECT: payload parse failed")
+        return
+    end
+
+    -- Always update the "when was this GUID last inspected by anyone" clock
+    -- so the 24h dedup works across the full mesh — even if this particular
+    -- scan fails ShouldStore (utility gear, wrong zone, etc).
+    MarkInspected(entry.guid, entry.scanTime)
+
+    -- v0.36: record the sender's reported DB size. Persisted in
+    -- ConLogsDB.peerInfo so the Scanners view works immediately on
+    -- login (before any fresh broadcasts arrive) based on the latest
+    -- counts we heard last session.
+    -- v0.43: key by the sender's main-name identity (entry.senderMain) when
+    -- they have one set, so all alts of the same user consolidate into one
+    -- Scanners-view entry. Track lastCharName so reachability checks have
+    -- a real character name to look up in guild/group rosters.
+    local effectiveScanner = (entry.senderMain ~= nil and entry.senderMain ~= "") and entry.senderMain or sender
+    if entry.senderDBSize and effectiveScanner and effectiveScanner ~= "" and effectiveScanner ~= MyIdentity() then
+        ConLogsDB.peerInfo = ConLogsDB.peerInfo or {}
+        -- Claude (v1.4.2): preserve any previously-known guild on the
+        -- existing peerInfo row so we don't blow it away when an old
+        -- pre-v1.4.2 client (no senderGuild) broadcasts. Only overwrite
+        -- when the new payload actually carries a guild value.
+        local prevGuild = (ConLogsDB.peerInfo[effectiveScanner] and ConLogsDB.peerInfo[effectiveScanner].guild) or nil
+        ConLogsDB.peerInfo[effectiveScanner] = {
+            dbSize       = entry.senderDBSize,
+            lastSeen     = entry.scanTime or time(),
+            lastCharName = sender, -- character actually broadcasting (for reachability lookups)
+            guild        = entry.senderGuild or prevGuild, -- Claude (v1.4.2): for Scanners-view Guild column
+        }
+    end
+
+    -- v1.2: apply scanner-provided item-info hints BEFORE CachePayloadItems
+    -- runs. Hints carry server-correct name/quality/ilvl/equipLoc/icon/stats
+    -- captured by the scanner immediately after a fresh inspect. Receivers
+    -- on Ascension can't always resolve these via CMSG_ITEM_QUERY_SINGLE —
+    -- the scanner's data is the only authoritative source. CachePayloadItems
+    -- then short-circuits on the seeded entries and skips the broken
+    -- server-query path entirely.
+    if entry.itemHints then
+        ConLogsDB = ConLogsDB or {}
+        ConLogsItemCacheDB = ConLogsItemCacheDB or {}
+        local applied = 0
+        for itemID, hint in pairs(entry.itemHints) do
+            local existing = ConLogsItemCacheDB[itemID]
+            -- Don't overwrite a locally-fetched verified entry (we trust
+            -- our own server-query result over a peer's claim). DO overwrite
+            -- previous hint-sourced entries (newer hint wins) and any
+            -- unverified/stale entry.
+            local skip = existing
+                and existing.v == CACHE_SCHEMA
+                and existing.verified == true
+                and existing.fromHint ~= true
+            if not skip then
+                ConLogsItemCacheDB[itemID] = {
+                    v          = CACHE_SCHEMA,
+                    name       = hint.name,
+                    quality    = hint.quality,
+                    itemLevel  = hint.itemLevel,
+                    equipLoc   = hint.equipLoc,
+                    icon       = hint.icon,
+                    stats      = hint.stats,
+                    verified   = true,    -- scanner had server-fed data
+                    fromHint   = true,    -- mark as scanner-provided
+                    ts         = floor(time()),
+                }
+                applied = applied + 1
+            end
+        end
+        if applied > 0 then
+            dprint(string.format("[hint] applied %d item-info hint(s) from %s's scan",
+                applied, sender or "?"))
+        end
+    end
+
+    -- Populate the item-info cache from every scan we observe — even rejected
+    -- ones give us valid itemIDs to enrich our DB.
+    CachePayloadItems(entry)
+
+    local ok, reason = ShouldStore(entry)
+    if not ok then
+        dprint(string.format("[store] REJECT: %s L%d — %s", entry.name, entry.level, reason))
+        return
+    end
+
+    ConLogsDB = ConLogsDB or { meta = { version = 1, created = time() }, players = {}, lastScanned = {}, config = {} }
+    ConLogsDB.players = ConLogsDB.players or {}
+
+    -- Set key — computed locally, NOT read from wire position 31, so we're
+    -- robust against sender bugs and older clients that key differently.
+    -- If the scanned player has an Insignia/Medallion/Battlemaster's
+    -- trinket equipped (slot 13/14) the loadout is a PvP set and routes
+    -- to sets["pvp"]. Otherwise it goes to sets[DominantTree(spec)] for
+    -- 1/2/3 class-tree keying.
+    local group
+    if EntryGearLooksPvP(entry.gear) then
+        group = "pvp"
+        -- Claude (v1.5.3): log the PvP routing decision so users can verify
+        -- the gate is firing for Insignia-equipped scans. Toggle via
+        -- /conlogs debug.
+        dprint(string.format("[route] %s → sets[\"pvp\"] (PvP trinket detected in slot 13/14)",
+            entry.name or "?"))
+    else
+        group = DominantTree(entry.spec)
+    end
+    -- v0.43: prefer the broadcaster's main-name identity (entry.senderMain)
+    -- so set.scannedBy reads as the consolidated user name across alts.
+    -- Fall back to wire sender for older clients without the field, and
+    -- finally to MyIdentity() (covers the local direct-ingest path where
+    -- sender == self and we want our own configured main name applied).
+    local scannedBy = entry.senderMain
+    if not scannedBy or scannedBy == "" then scannedBy = sender end
+    if not scannedBy or scannedBy == "" then scannedBy = MyIdentity() end
+    local existing = ConLogsDB.players[entry.guid]
+
+    -- Per-spec dedup: only this tree's set is compared for staleness. A newer
+    -- scan of a *different* tree set is never skipped here — different slot.
+    if existing and existing.sets and existing.sets[group]
+        and (existing.sets[group].scanTime or 0) >= entry.scanTime then
+        dprint(string.format("[store] SKIP: %s (set %s) — existing set is newer (%s vs %s)",
+            entry.name, tostring(group),
+            date("%H:%M:%S", existing.sets[group].scanTime or 0),
+            date("%H:%M:%S", entry.scanTime)))
+        return
+    end
+
+    -- Create or merge the player record, preserving sets for the other talent
+    -- groups. Top-level `name/realm/class/level` always reflect the latest scan.
+    existing = existing or { sets = {} }
+    existing.sets  = existing.sets or {}
+    existing.guid  = entry.guid -- v0.20: store guid on the record so the UI can pass it to DeletePlayer
+    existing.name  = entry.name
+    existing.realm = entry.realm
+    existing.class = entry.class
+    existing.level = entry.level
+    if entry.race then existing.race = entry.race end -- Claude (v2.5.0): race/class combo key
+    if entry.tabNames then existing.tabNames = entry.tabNames end -- v0.17+
+    if entry.tabIcons then existing.tabIcons = entry.tabIcons end -- v0.18+
+    existing.sets[group] = {
+        spec       = entry.spec,
+        gear       = entry.gear,
+        scanTime   = entry.scanTime,
+        zone       = entry.zone,
+        scannedBy  = scannedBy,
+        -- v0.35: stash the raw wire payload so an admin running
+        -- /conlogs syncfrom <us> can replay it verbatim without
+        -- having to reconstruct the wire format from structured fields.
+        -- Keeps the sync protocol drift-proof as BuildPayload evolves.
+        rawPayload = payload,
+        -- v1.3: per-talent rank distribution (wire pos 41). Powers the
+        -- website's interactive talent tree. Receiver maps talent index →
+        -- name/tier/column via class talent tree metadata.
+        talentRanks = entry.talentRanks,
+        -- Claude (v1.4.4): live character stats from UnitStat-derived
+        -- snapshot at scan time (wire pos 43). Lets the Stats panel show
+        -- real character-pane values (base + items + buffs + talents)
+        -- instead of pure-from-items sums.
+        charStats = entry.charStats,
+    }
+
+    -- Mirror the most-recently-scanned set to top-level fields for
+    -- backward-compat with the UI (v0.14 UI reads directly from .sets and this
+    -- mirror becomes redundant). Picks the highest-scanTime set across all
+    -- stored talent groups.
+    local latestSet, latestTime = nil, 0
+    for _, s in pairs(existing.sets) do
+        if (s.scanTime or 0) > latestTime then
+            latestTime = s.scanTime or 0
+            latestSet = s
+        end
+    end
+    if latestSet then
+        existing.spec      = latestSet.spec
+        existing.gear      = latestSet.gear
+        existing.scanTime  = latestSet.scanTime
+        existing.zone      = latestSet.zone
+        existing.scannedBy = latestSet.scannedBy
+    end
+
+    ConLogsDB.players[entry.guid] = existing
+    dprint(string.format("[store] OK: %s L%d [set %s / %s] — scanned by %s at %s",
+        entry.name, entry.level, tostring(group), entry.zone, scannedBy,
+        date("%H:%M:%S", entry.scanTime)))
+
+    -- v0.21: notify the UI so an open browser list refreshes without the
+    -- user having to close + reopen. Registered as a field on the shared
+    -- namespace table; nil-safe if UI hasn't wired it up yet.
+    if _G.ConLogs and _G.ConLogs.OnPlayerChanged then
+        _G.ConLogs.OnPlayerChanged(entry.guid)
+    end
+end
+
+-- Numeric-tuple semver compare. Returns 1 if a > b, -1 if a < b, 0 equal.
+-- Non-numeric suffixes (e.g. "-beta") are ignored — only digit runs count.
+local function CompareVersions(a, b)
+    if a == b then return 0 end
+    local function parts(v)
+        local out = {}
+        for n in tostring(v or ""):gmatch("(%d+)") do out[#out+1] = tonumber(n) end
+        return out
+    end
+    local pa, pb = parts(a), parts(b)
+    local len = math.max(#pa, #pb)
+    for i = 1, len do
+        local na, nb = pa[i] or 0, pb[i] or 0
+        if na ~= nb then return na > nb and 1 or -1 end
+    end
+    return 0
+end
+
+-- v1.1.5: notify-worthy compare. Only triggers the in-game "newer version
+-- available" message when the major.minor pair changes (1.1 → 1.2, or
+-- 1.x → 2.0). Patch-level bumps (1.1.4 → 1.1.5) don't notify, so iterating
+-- on small fixes between minor releases stays quiet on the mesh.
+-- Returns 1 if a's major.minor > b's, -1 if less, 0 equal-or-only-patch-diff.
+local function CompareMajorMinor(a, b)
+    local function parts(v)
+        local out = {}
+        for n in tostring(v or ""):gmatch("(%d+)") do out[#out+1] = tonumber(n) end
+        return out
+    end
+    local pa, pb = parts(a), parts(b)
+    local aMajor, aMinor = pa[1] or 0, pa[2] or 0
+    local bMajor, bMinor = pb[1] or 0, pb[2] or 0
+    if aMajor ~= bMajor then return aMajor > bMajor and 1 or -1 end
+    if aMinor ~= bMinor then return aMinor > bMinor and 1 or -1 end
+    return 0
+end
+
+local function HandleVersionPing(payload, sender)
+    -- payload shape: "VER^<version>"
+    local tag, senderVersion = strsplit("^", payload)
+    if tag ~= "VER" or not senderVersion or senderVersion == "" then return end
+    dprint(string.format("[version] %s is on v%s (we're v%s)",
+        sender or "?", senderVersion, ADDON_VERSION))
+    if versionNotified then return end
+    -- v1.1.5: only notify on major.minor bumps. Patch-level bumps
+    -- (1.1.4 → 1.1.5) don't trigger the chat notification — small fixes
+    -- shipped between minor releases stay quiet across the mesh.
+    if CompareMajorMinor(senderVersion, ADDON_VERSION) <= 0 then return end
+    versionNotified = true
+    print(string.format("|cffffaa44ConLogs|r: newer version |cff00ff00v%s|r available (you're on v%s). Download: %s",
+        senderVersion, ADDON_VERSION, RELEASES_URL))
+end
+
+local function TrySendVersionPing()
+    if versionPingSent then return end
+    if now() < versionPingAt then return end
+    local channels = PickChannels()
+    if #channels == 0 then
+        -- Solo + no guild: no one to ping yet. Defer and try again.
+        versionPingAt = now() + VERSION_PING_RETRY
+        return
+    end
+    versionPingSent = true
+    msgCounter = msgCounter + 1
+    local msgID = string.format("V%x", msgCounter % 0xffff)
+    local body = string.format("%s^1^1^VER^%s", msgID, ADDON_VERSION)
+    for _, ch in ipairs(channels) do
+        outQueue[#outQueue + 1] = { ch = ch, body = body }
+    end
+    dprint(string.format("[version] pinging v%s on [%s]",
+        ADDON_VERSION, table.concat(channels, "+")))
+end
+
+-- v0.47: Peer refresh ping. Asks every guildmate running the addon to
+-- announce their identity + dbSize so the Scanners leaderboard refreshes
+-- without having to wait for organic gear-scan broadcasts. Triggered by
+-- the "Refresh Peers" button in the Scanners view (and /conlogs
+-- refreshpeers). Returns true on send; false + reason string on cooldown.
+local function BroadcastPeerPing()
+    local nowT = time()
+    local since = nowT - lastPeerPingSentAt
+    if since < PEER_PING_COOLDOWN then
+        local wait = PEER_PING_COOLDOWN - since
+        return false, "cooldown", wait
+    end
+    local channels = PickChannels()
+    if #channels == 0 then
+        return false, "nochannel"
+    end
+    msgCounter = msgCounter + 1
+    local msgID = string.format("P%x", msgCounter % 0xffff)
+    -- Identity field lets responders skip self-echoes if they happen to
+    -- have us configured as their own main alias (paranoia — sender-name
+    -- echo drop in OnAddonMessage already covers the normal case).
+    local body = string.format("%s^1^1^PEERPING^%s", msgID, MyIdentity())
+    for _, ch in ipairs(channels) do
+        outQueue[#outQueue + 1] = { ch = ch, body = body }
+    end
+    lastPeerPingSentAt = nowT
+    dprint(string.format("[peerping] sent on [%s]", table.concat(channels, "+")))
+    return true, table.concat(channels, "+")
+end
+
+-- v0.47: respond to an incoming PEERPING. Lightweight: announce identity,
+-- dbSize, version, current character name. Replies go on the SAME channel
+-- the request arrived on so requester gets them via the same chat envelope.
+-- Per-requester cooldown prevents looping if a misbehaving client spams.
+local function HandlePeerPing(payload, sender, channel)
+    if channel ~= "GUILD" and channel ~= "PARTY" and channel ~= "RAID" then return end
+    local tag, requester = strsplit("^", payload)
+    if tag ~= "PEERPING" then return end
+    requester = requester or sender or "?"
+    -- Per-SENDER cooldown (authenticated CHAT_MSG_ADDON sender, not the spoofable
+    -- wire `requester`, so rotating that field can't bypass the cooldown).
+    local cdKey = sender or requester
+    local last = lastPeerPongTo[cdKey] or 0
+    if (time() - last) < PEER_RESPONSE_COOLDOWN then
+        dprint(string.format("[peerping] decline %s — cooldown (%ds since last pong)",
+            requester, time() - last))
+        return
+    end
+    -- Compute our current dbSize
+    local dbSize = 0
+    if ConLogsDB and ConLogsDB.players then
+        for _ in pairs(ConLogsDB.players) do dbSize = dbSize + 1 end
+    end
+    local me = UnitName("player") or "?"
+    local identity = MyIdentity()
+    msgCounter = msgCounter + 1
+    local msgID = string.format("p%x", msgCounter % 0xffff)
+    -- PEERPONG^<identity>^<dbSize>^<version>^<charName>
+    local body = string.format("%s^1^1^PEERPONG^%s^%d^%s^%s",
+        msgID, identity, dbSize, ADDON_VERSION, me)
+    outQueue[#outQueue + 1] = { ch = channel, body = body }
+    lastPeerPongTo[cdKey] = time()
+    dprint(string.format("[peerping] replied to %s on %s (dbSize=%d, identity=%s)",
+        requester, channel, dbSize, identity))
+end
+
+-- v0.47: ingest an incoming PEERPONG. Updates peerInfo so the Scanners
+-- leaderboard reflects the responder's current dbSize + last-seen.
+local function HandlePeerPong(payload, sender)
+    local tag, identity, dbSizeStr, version, charName = strsplit("^", payload)
+    if tag ~= "PEERPONG" then return end
+    if not identity or identity == "" then identity = sender or "?" end
+    local dbSize = tonumber(dbSizeStr) or 0
+    ConLogsDB = ConLogsDB or {}
+    ConLogsDB.peerInfo = ConLogsDB.peerInfo or {}
+    ConLogsDB.peerInfo[identity] = {
+        dbSize       = dbSize,
+        lastSeen     = time(),
+        lastCharName = charName or sender,
+        version      = version,
+    }
+    dprint(string.format("[peerping] got pong from %s (identity=%s, dbSize=%d, v%s)",
+        sender or "?", identity, dbSize, version or "?"))
+end
+
+-- v0.46: build a compact manifest of "what we already have" for the
+-- requester side of syncfrom. Format: "guid:group:scanTime;..." per stored
+-- (player, set) tuple. Sent inside the SYNCREQ at position 5; the
+-- responder parses it and skips sending any (guid, group) entries the
+-- requester already has at >= our scanTime — eliminating the dominant
+-- "[store] SKIP: existing set is newer (T vs T)" duplicate-send waste.
+--
+-- Size: each entry ~30 bytes. 100 stored players × 1.5 sets avg ≈ 4.5 KB.
+-- Carries fine over the existing chunked addon-message pipeline.
+local function BuildSyncManifest()
+    if not (ConLogsDB and ConLogsDB.players) then return "" end
+    local pieces = {}
+    for guid, p in pairs(ConLogsDB.players) do
+        if guid and guid ~= "" and p.sets then
+            for setKey, set in pairs(p.sets) do
+                if set.scanTime and set.scanTime > 0 then
+                    pieces[#pieces + 1] = guid .. ":" .. tostring(setKey) .. ":" .. tostring(set.scanTime)
+                end
+            end
+        end
+    end
+    return table.concat(pieces, ";")
+end
+
+local function ParseSyncManifest(s)
+    local out = {}
+    if not s or s == "" then return out end
+    for entry in s:gmatch("([^;]+)") do
+        local guid, group, t = entry:match("^([^:]+):([^:]+):(%d+)$")
+        if guid and group and t then
+            out[guid] = out[guid] or {}
+            out[guid][group] = tonumber(t)
+        end
+    end
+    return out
+end
+
+-- v0.35: handle an incoming SYNCREQ. Only responds if:
+--   1. The request targets this client specifically (by name match)
+--   2. Arrived on GUILD channel (so we're not responding to random whispers)
+--   3. We haven't responded to this requester within SYNC_RESPONSE_COOLDOWN
+-- When responding, we iterate stored sets with scanTime > sinceTS and replay
+-- their raw wire payloads via the outQueue — bounded to
+-- SYNC_MAX_SETS_PER_RESPONSE to cap drain duration. The normal 2s broadcast
+-- stagger paces these so the guild channel isn't saturated.
+local function HandleSyncRequest(payload, sender, channel)
+    -- v0.37: accept from guild, party, or raid. Same trust envelope — WoW
+    -- fills in sender name on receive, and addon-messages on these channels
+    -- are only deliverable by peers actually in that group/guild.
+    if channel ~= "GUILD" and channel ~= "PARTY" and channel ~= "RAID" then
+        dprint(string.format("[sync] ignore request from %s — bad channel (%s)", sender or "?", channel or "?"))
+        return
+    end
+    -- v0.46: position 5 is an optional manifest "guid:group:scanTime;..."
+    -- Old (≤v0.45) requesters omit it → manifestStr is nil → ParseSyncManifest
+    -- returns empty table → behavior identical to v0.45 (send everything).
+    local tag, requester, target, sinceStr, manifestStr = strsplit("^", payload)
+    if tag ~= "SYNCREQ" then return end
+    if not target or target == "" then return end
+    -- v0.43: accept either our character name OR our configured main name.
+    -- Lets an admin do `syncfrom <main>` and reach whichever alt the user
+    -- is currently on with that mainName configured.
+    local me = UnitName("player")
+    local myMain = (ConLogsDB and ConLogsDB.config and ConLogsDB.config.mainName) or nil
+    if target ~= me and target ~= myMain then
+        -- Request is for someone else; silently ignore.
+        return
+    end
+    -- v0.37: user-toggleable opt-out. Default is to accept; syncoff disables
+    -- responding entirely for the rest of the session (until /reload or
+    -- re-toggle). Useful as emergency escape if getting sync-bombed.
+    if ConLogsDB and ConLogsDB.config and ConLogsDB.config.acceptSync == false then
+        dprint(string.format("[sync] decline %s — user has syncoff enabled", requester or "?"))
+        return
+    end
+    -- v0.37: global response cooldown — caps aggregate outQueue load even
+    -- when multiple attackers each have their own per-requester cooldown
+    -- slots. One response per 15 min across all requesters.
+    if (time() - lastSyncResponseAt) < SYNC_GLOBAL_COOLDOWN then
+        dprint(string.format("[sync] decline %s — global cooldown (%.1fm since last response)",
+            requester or "?", (time() - lastSyncResponseAt) / 60))
+        return
+    end
+    -- Rate-limit per SENDER (the authenticated CHAT_MSG_ADDON sender, not the
+    -- spoofable wire `requester` — keying on requester let an attacker bypass this
+    -- cooldown by rotating the field on every message).
+    local cdKey = sender or requester or ""
+    local last = lastSyncResponseTo[cdKey] or 0
+    if (time() - last) < SYNC_RESPONSE_COOLDOWN then
+        dprint(string.format("[sync] decline %s — responded %.1fh ago (cooldown 1h)",
+            requester or "?", (time() - last) / 3600))
+        return
+    end
+    local sinceTS = tonumber(sinceStr) or 0
+    if not (ConLogsDB and ConLogsDB.players) then return end
+
+    -- v0.46: parse manifest of what the requester already has. Skip any
+    -- (guid, setKey) where their stored scanTime >= ours — they would just
+    -- log "[store] SKIP: existing set is newer". Saves the bandwidth.
+    local requesterHas = ParseSyncManifest(manifestStr or "") -- Claude v0.46
+
+    local queued, skipped = 0, 0
+    for _, p in pairs(ConLogsDB.players) do
+        if queued >= SYNC_MAX_SETS_PER_RESPONSE then break end
+        if p.sets and p.guid then
+            local mineForGuid = requesterHas[p.guid]
+            for setKey, set in pairs(p.sets) do
+                if queued >= SYNC_MAX_SETS_PER_RESPONSE then break end
+                if set.rawPayload and (set.scanTime or 0) > sinceTS then
+                    -- v0.46: manifest-based dedup. setKey can be number (1/2/3)
+                    -- or "pvp" string; manifest entries are normalized via
+                    -- tostring on both sides.
+                    local theirT = mineForGuid and mineForGuid[tostring(setKey)]
+                    if theirT and theirT >= (set.scanTime or 0) then
+                        skipped = skipped + 1 -- Claude v0.46: skip duplicate
+                    else
+                        -- Chunk + enqueue with a fresh msgID so receivers see
+                        -- this as a new broadcast (different assembly key).
+                        msgCounter = msgCounter + 1
+                        local msgID = string.format("%x%x",
+                            math.floor(now() * 10) % 0xffff, msgCounter % 0xffff)
+                        local chunks = MakeChunks(set.rawPayload, msgID)
+                        for _, chunk in ipairs(chunks) do
+                            -- v0.53: WHISPER the requester directly instead
+                            -- of GUILD-broadcasting the response. Saves
+                            -- guild-wide noise (everyone else was ingesting
+                            -- the replays as a side-effect — useful but
+                            -- expensive for them). The trade-off is that
+                            -- only the requester catches up, not the whole
+                            -- guild. WHISPER target = `sender` (the actual
+                            -- character that sent the SYNCREQ — works even
+                            -- if requester is on an alt with mainName set).
+                            outQueue[#outQueue + 1] = {
+                                ch     = "WHISPER",
+                                target = sender,
+                                body   = chunk,
+                            }
+                        end
+                        queued = queued + 1
+                    end
+                end
+            end
+        end
+    end
+    lastSyncResponseTo[cdKey] = time()
+    lastSyncResponseAt = time() -- v0.37: stamp global cooldown
+    dprint(string.format("[sync] responding to %s (whisper to %s): queued %d, skipped %d (already fresh) since %s (max %d)",
+        requester or "?", sender or "?", queued, skipped,
+        sinceTS > 0 and date("%Y-%m-%d %H:%M", sinceTS) or "epoch",
+        SYNC_MAX_SETS_PER_RESPONSE))
+end
+
+local function OnAddonMessage(prefix, body, channel, sender)
+    if prefix ~= PREFIX then return end
+    -- Drop our own echoes. Addon messages broadcast on GUILD/PARTY/RAID always
+    -- round-trip back to the sender's client, and when we broadcast to multiple
+    -- channels (e.g. PARTY + GUILD) the payload echoes back once per channel.
+    -- We already direct-ingest our own scans in TryScanSelf / OnInspectReady
+    -- before broadcasting, so these echoes are pure spam — [recv] chunks,
+    -- [store] SKIP, and duplicate [version] self-pings.
+    if sender and sender == UnitName("player") then return end
+    if not body or body == "" then return end
+    local msgID, idx_s, total_s, data = body:match("^([^%^]+)%^([^%^]+)%^([^%^]+)%^(.*)$")
+    local idx = tonumber(idx_s)
+    local total = tonumber(total_s)
+    if not msgID or not idx or not total or not data then return end
+    -- Bound untrusted framing: reject implausible chunk counts / out-of-range
+    -- indices so a crafted addon message can't wedge a huge never-completing
+    -- reassembly buffer (e.g. "chunk 1 of 9999999") or index a garbage slot.
+    if total < 1 or total > MAX_REASM_CHUNKS or idx < 1 or idx > total then return end
+
+    local key = (sender or "?") .. "\001" .. msgID
+    local asm = assembly[key]
+    if not asm then
+        -- Cap concurrent reassembly buffers; evict the oldest if at the limit so a
+        -- peer rotating msgID every send can't grow `assembly` without bound. Only
+        -- runs on new-key creation (not per chunk), and the count is capped, so the
+        -- O(keys) scan here is cheap.
+        local n, oldestK, oldestT = 0, nil, nil
+        for k, v in pairs(assembly) do
+            n = n + 1
+            if not oldestT or v.firstSeen < oldestT then oldestK, oldestT = k, v.firstSeen end
+        end
+        if n >= MAX_REASM_KEYS and oldestK then assembly[oldestK] = nil end
+        asm = { chunks = {}, total = total, firstSeen = now() }
+        assembly[key] = asm
+        dprint(string.format("[recv] new scan from %s (chunk %d/%d, expecting %d more)",
+            sender or "?", idx, total, total - 1))
+    end
+    if asm.chunks[idx] then return end
+    asm.chunks[idx] = data
+
+    local have = 0
+    for i = 1, total do
+        if asm.chunks[i] then have = have + 1 end
+    end
+    if have == total then
+        local pieces = {}
+        for i = 1, total do pieces[i] = asm.chunks[i] end
+        local full = table.concat(pieces)
+        assembly[key] = nil
+        dprint(string.format("[recv] complete from %s — %d chunks assembled (%d bytes)",
+            sender or "?", total, #full))
+        -- Route VER pings separately from gear payloads; they share the reassembly
+        -- framing but decode to a different shape.
+        if full:sub(1, 4) == "VER^" then
+            HandleVersionPing(full, sender)
+        elseif full:sub(1, 8) == "SYNCREQ^" then
+            HandleSyncRequest(full, sender, channel)
+        elseif full:sub(1, 9) == "PEERPING^" then -- Claude v0.47
+            HandlePeerPing(full, sender, channel)
+        elseif full:sub(1, 9) == "PEERPONG^" then -- Claude v0.47
+            HandlePeerPong(full, sender)
+        else
+            Ingest(full, sender)
+        end
+    end
+end
+
+local function GCAssembly()
+    local cutoff = now() - ASSEMBLY_TIMEOUT
+    for k, v in pairs(assembly) do
+        if v.firstSeen < cutoff then
+            local have = 0
+            for i = 1, v.total do if v.chunks[i] then have = have + 1 end end
+            local senderName = k:match("^([^\001]+)") or "?"
+            dprint(string.format("[asm] dropped partial from %s: got %d/%d chunks after %ds",
+                senderName, have, v.total, ASSEMBLY_TIMEOUT))
+            assembly[k] = nil
+        end
+    end
+end
+
+-- ---------------- Scan queue + inspect driver ----------------
+
+local function AddUnit(unit)
+    if not UnitExists(unit) then return end
+    if UnitIsUnit(unit, "player") then return end
+    if not UnitIsPlayer(unit) then return end
+    local guid = UnitGUID(unit)
+    if not guid or guid == "" then return end
+    if inQueue[guid] then return end
+    local last = seen[guid]
+    if last and (now() - last) < INSPECT_COOLDOWN then return end
+    if HasFreshScan(guid) then return end -- someone in the mesh scanned this player <24h ago
+    if (UnitLevel(unit) or 0) < MIN_INSPECT_LEVEL then return end
+    queue[#queue + 1] = { guid = guid, unit = unit }
+    inQueue[guid] = true
+end
+
+local function ScanRoster()
+    lastRoster = now()
+    -- v1.1.7: gate auto-scan on Reality Recalibrators aura. Without it,
+    -- inspect data on Ascension is the player's transmog visuals (often
+    -- "naked" or low-level cosmetics), not real gear — bypass so we don't
+    -- pollute the mesh with junk scans. Show a one-time hint when the
+    -- user has groupmates we'd otherwise be scanning.
+    -- v1.4.1: gate conditional on REQUIRE_REALITY_AURA (test mode).
+    if REQUIRE_REALITY_AURA and not HasRealityAura() then
+        local hasGroup = (GetNumRaidMembers() > 0) or (GetNumPartyMembers() > 0)
+        -- v1.1.7+: skip the hint entirely during the post-zone-change
+        -- settle window. UnitBuff returns nothing for a few seconds after
+        -- PLAYER_ENTERING_WORLD even with an active aura — chat nags here
+        -- are just noise.
+        if InAuraSettleWindow() then
+            if hasGroup then dprint("[roster] aura check skipped — within settle window") end
+            return
+        end
+        -- Only nag users who've NEVER had the aura this session. If they
+        -- had it earlier, they obviously know about the system.
+        if hasGroup and not realityAuraHintShown and not everSawRealityAura then
+            print("|cffffaa44ConLogs|r: |cffff9966Reality Recalibrators|r aura not active — auto-inspect of groupmates is paused. Get the aura to scan their true gear (Ascension's transmog hides it otherwise). |cff888888Type /conlogs aura to recheck.|r")
+            realityAuraHintShown = true
+        elseif hasGroup then
+            dprint("[roster] skipped — Reality Recalibrators aura not active")
+        end
+        return
+    end
+    local before = #queue
+    if GetNumRaidMembers() > 0 then
+        for i = 1, 40 do AddUnit("raid" .. i) end
+    elseif GetNumPartyMembers() > 0 then
+        for i = 1, 4 do AddUnit("party" .. i) end
+    end
+    local added = #queue - before
+    if added > 0 then
+        dprint(string.format("[roster] +%d to queue (total %d pending)", added, #queue))
+    end
+end
+
+local function ClearCurrent()
+    current = nil
+    nextInspectAt = now() + INSPECT_INTERVAL
+end
+
+local function TryInspect()
+    if current then return end
+    if now() < nextInspectAt then return end
+    if #queue == 0 then return end
+    if InCombatLockdown() then return end
+    -- v1.1: pause auto-scanning while the user has the Blizzard inspect frame
+    -- open. NotifyInspect() retargets the global inspect slot, which would
+    -- silently replace the manual inspect's data — items in their open
+    -- inspect window become un-hoverable because the live links are now for
+    -- a different unit. InspectFrame is created lazily by Blizzard_InspectUI
+    -- (LoadOnDemand); the `and` short-circuits when the user has never opened
+    -- the inspect UI in this session.
+    if InspectFrame and InspectFrame:IsShown() then
+        -- Hold the queue without dropping items — once they close it we'll
+        -- resume from where we left off. Small delay before the next attempt
+        -- so we don't busy-loop the OnUpdate driver while it's open.
+        nextInspectAt = now() + 1
+        return
+    end
+    -- v1.1.7: defensive aura check. ScanRoster gates entry to the queue,
+    -- but if the aura wore off between queue-add and now, the inspect data
+    -- we'd capture would be transmog visuals. Drain the queue and bail.
+    -- v1.1.7+: skip the drain during the post-zone-change settle window
+    -- — UnitBuff briefly returns nothing after PLAYER_ENTERING_WORLD
+    -- even when the aura is active. Just hold the queue and retry next
+    -- tick; auras restore within a few seconds.
+    -- v1.4.1: gate conditional on REQUIRE_REALITY_AURA (test mode).
+    if REQUIRE_REALITY_AURA and not HasRealityAura() then
+        if InAuraSettleWindow() then
+            dprint("[inspect] aura check skipped — within settle window (queue held)")
+            nextInspectAt = now() + 1 -- recheck soon
+            return
+        end
+        if #queue > 0 then
+            dprint("[inspect] aura wore off — draining queue")
+            for _, q in ipairs(queue) do inQueue[q.guid] = nil end
+            wipe(queue)
+        end
+        return
+    end
+
+    local entry = table.remove(queue, 1)
+    inQueue[entry.guid] = nil
+    local name = UnitName(entry.unit) or "?"
+    if not UnitExists(entry.unit) or UnitGUID(entry.unit) ~= entry.guid then
+        dprint(string.format("[inspect] SKIP: %s — raid slot reshuffled since queue time", name))
+        return
+    end
+    if not CanInspect(entry.unit) then
+        markRetryIn(entry.guid, OUT_OF_RANGE_COOLDOWN)
+        dprint(string.format("[inspect] SKIP: %s — CanInspect=false (out of range / not visible). retry in %ds",
+            name, OUT_OF_RANGE_COOLDOWN))
+        return
+    end
+    current = { guid = entry.guid, unit = entry.unit, startedAt = now() }
+    NotifyInspect(entry.unit)
+    dprint(string.format("[inspect] START: %s L%d — NotifyInspect sent (%d left in queue)",
+        name, UnitLevel(entry.unit) or 0, #queue))
+end
+
+local function CheckTimeout()
+    if current and (now() - current.startedAt) > INSPECT_TIMEOUT then
+        dprint(string.format("[inspect] TIMEOUT: %s — no INSPECT_TALENT_READY after %ds, retry in %ds",
+            UnitName(current.unit) or "?", INSPECT_TIMEOUT, OUT_OF_RANGE_COOLDOWN))
+        markRetryIn(current.guid, OUT_OF_RANGE_COOLDOWN) -- transient fail, short retry (not 15 min)
+        ClearCurrent()
+    end
+end
+
+-- Claude: gear-read settle window — Ascension's transmog layer can return
+-- the cosmetic appearance item ID for ~290ms after INSPECT_TALENT_READY
+-- instead of the real equipped item. We defer BuildPayload by 400ms so
+-- the server has time to resolve the real item before we read the slots.
+local INSPECT_SETTLE_DELAY = 0.4 -- Claude: seconds to wait after INSPECT_TALENT_READY before reading gear
+
+-- Claude: vanity-flip verify pass. Even after the 400ms settle, the transmog
+-- layer can flip individual slot links non-deterministically for another
+-- second or two. We re-read the inspected unit's slots at +1.5s post-settle
+-- and, if the gear fingerprint changed, broadcast the corrected payload.
+-- Receivers' SelfFingerprint dedup means duplicate broadcasts are cheap;
+-- a real flip just replaces the cached entry with the corrected one.
+local INSPECT_VERIFY_DELAY = 1.5 -- Claude: seconds after settle to re-read and verify slot links
+
+-- Claude: build a slot fingerprint from a unit's GetInventoryItemLink reads.
+-- Shared between initial-read capture and verify-pass comparison.
+local function InspectSlotFingerprint(unit)
+    local parts = {}
+    for slot = 1, 19 do
+        parts[slot] = ItemStringFromLink(GetInventoryItemLink(unit, slot))
+    end
+    return table.concat(parts, "|")
+end
+
+-- Claude (audit fix v1.3.4): WoW frames are never GC'd — they live forever
+-- in the C-side frame registry. Allocating a fresh CreateFrame inside
+-- OnInspectReady leaked one frame per inspect (and one per verify pass).
+-- These two module-level frames are recycled across all inspects: when a
+-- timer fires it sets OnUpdate=nil, when a new inspect needs the timer it
+-- assigns a fresh closure to OnUpdate. Per-inspect closures still capture
+-- their own snapUnit/snapGuid/elapsed locals, so reuse is safe. The
+-- settleFrame is naturally serialized (current stays set during 0.4s, so
+-- no second inspect can start). The verifyFrame can be clobbered if a
+-- new verify starts within 1.5s of an old one — that just silently skips
+-- the old verify, which is acceptable (initial broadcast already went out).
+local INSPECT_SETTLE_FRAME = CreateFrame("Frame")
+local INSPECT_VERIFY_FRAME = CreateFrame("Frame")
+
+local function OnInspectReady()
+    if not current then return end
+    -- v1.1: If the user opened the Blizzard inspect frame between our
+    -- NotifyInspect call and this READY event, their manual NotifyInspect
+    -- may have replaced our target — meaning the data we'd read could be
+    -- theirs, not ours. Drop the result and retry our target later.
+    if InspectFrame and InspectFrame:IsShown() then
+        dprint(string.format("[inspect] READY for %s but user has manual inspect open — drop + retry",
+            UnitName(current.unit) or "?"))
+        local g = current.guid
+        ClearCurrent()
+        markRetryIn(g, OUT_OF_RANGE_COOLDOWN)
+        return
+    end
+    local c = current
+    if UnitGUID(c.unit) ~= c.guid then
+        dprint("[inspect] READY fired but current GUID no longer matches — dropping")
+        ClearCurrent()
+        return
+    end
+
+    -- Claude: snapshot the target identity before deferring, so we can
+    -- re-validate after the settle window even if 'current' changed
+    local snapUnit = c.unit
+    local snapGuid = c.guid
+
+    -- Claude: one-shot OnUpdate timer — fires after INSPECT_SETTLE_DELAY seconds,
+    -- then reads gear. 'current' stays set during the wait, which naturally
+    -- blocks TryInspect from starting a new inspect (it guards on 'if current then return end').
+    -- If CheckTimeout fires first (4s wall), it will ClearCurrent and our
+    -- re-validation below will safely discard the stale result.
+    local settleElapsed = 0
+    INSPECT_SETTLE_FRAME:SetScript("OnUpdate", function(self, elapsed) -- Claude: recycled module-level frame (no per-inspect leak)
+        settleElapsed = settleElapsed + elapsed
+        if settleElapsed < INSPECT_SETTLE_DELAY then return end
+        self:SetScript("OnUpdate", nil) -- Claude: cancel timer
+
+        -- Claude: re-validate — current may have been cleared by CheckTimeout
+        -- or replaced by a new inspect during the settle window
+        if not current or current.guid ~= snapGuid then
+            dprint(string.format("[inspect] settle: %s no longer current — dropping", snapGuid))
+            return
+        end
+        -- Claude: also guard unit-GUID match again after the settle window
+        if UnitGUID(snapUnit) ~= snapGuid then
+            dprint("[inspect] settle: GUID mismatch after settle — dropping")
+            ClearCurrent()
+            return
+        end
+
+        local tname = UnitName(snapUnit) or "?"
+        local tlvl = UnitLevel(snapUnit) or 0
+        local payload, info = BuildPayload(snapUnit, snapGuid) -- Claude: gear read after settle
+        if payload then
+            seen[snapGuid] = now()
+            MarkInspected(snapGuid, floor(time()))
+            dprint(string.format("[inspect] OK: %s L%d — %d slots equipped, payload %d bytes",
+                tname, tlvl, info, #payload))
+            EnqueueBroadcast(payload, tname)
+            -- direct-ingest our own scan so we save data even when no one
+            -- else is in our broadcast channels.
+            Ingest(payload, UnitName("player"))
+
+            -- Claude: vanity-flip verify pass. Snapshot the slot fingerprint we
+            -- just broadcast, then re-read at +1.5s. If transmog flipped any
+            -- slot in the meantime, broadcast the corrected payload.
+            local initialFP = InspectSlotFingerprint(snapUnit)
+            local verifyElapsed = 0
+            INSPECT_VERIFY_FRAME:SetScript("OnUpdate", function(self2, elapsed2) -- Claude: recycled module-level frame
+                verifyElapsed = verifyElapsed + elapsed2
+                if verifyElapsed < INSPECT_VERIFY_DELAY then return end
+                self2:SetScript("OnUpdate", nil)
+                -- Claude: target may have changed groups, gone out of range,
+                -- or been unspawned by now. UnitGUID guards all of that.
+                if UnitGUID(snapUnit) ~= snapGuid then return end
+                local verifyFP = InspectSlotFingerprint(snapUnit)
+                if verifyFP == initialFP then return end -- Claude: no flip detected
+                local payload2, info2 = BuildPayload(snapUnit, snapGuid)
+                if not payload2 then
+                    dprint(string.format("[inspect] verify: %s gear changed mid-pass but rebuild failed (%s) — keeping initial",
+                        tname, info2 or "unknown"))
+                    return
+                end
+                dprint(string.format("[inspect] verify: %s slot fingerprint changed — broadcasting corrected payload (%d slots, %d bytes)",
+                    tname, info2, #payload2))
+                EnqueueBroadcast(payload2, tname)
+                Ingest(payload2, UnitName("player"))
+            end)
+        else
+            -- incomplete inspect data (0-9 slots) is usually transient —
+            -- target moved out mid-response or server was slow. Short retry, not
+            -- the 15-min full cooldown which is reserved for successful scans.
+            markRetryIn(snapGuid, OUT_OF_RANGE_COOLDOWN)
+            dprint(string.format("[inspect] DROP: %s L%d — %s (retry in %ds)",
+                tname, tlvl, info or "unknown", OUT_OF_RANGE_COOLDOWN))
+        end
+        if ClearInspectPlayer then ClearInspectPlayer() end
+        ClearCurrent()
+    end)
+end
+
+-- ---------------- Self-scan ----------------
+-- scanning yourself is a free fast path — no NotifyInspect required,
+-- GetInventoryItemLink("player", slot) works immediately. Triggered by
+-- UNIT_INVENTORY_CHANGED (debounced 2s so equipping a set doesn't fire 19
+-- times) and once on PLAYER_LOGIN after a 3s warmup for talent data.
+
+local SELF_SCAN_DEBOUNCE = 2
+local SELF_SCAN_LOGIN_DELAY = 3
+
+local selfScanPending = false
+local selfScanAt = 0
+-- Fingerprint of the last successfully-broadcast self-scan (level + talents
+-- + gear itemStrings). On Ascension, UNIT_INVENTORY_CHANGED fires every ~15s
+-- for reasons unrelated to real gear swaps (durability ticks, aura procs,
+-- server-side refreshes), so without this check we'd rebroadcast the same
+-- payload over and over. The fingerprint changes only when something that
+-- actually matters to the mesh has changed.
+local lastSelfFingerprint = ""
+
+local function SelfFingerprint()
+    local parts = { tostring(UnitLevel("player") or 0) }
+    -- Spec points change on any talent shift → fingerprint differs → scan.
+    -- No need to also include an "active group" field; the point distribution
+    -- already captures what matters.
+    local s1, s2, s3 = ReadSpecPoints("player")
+    parts[#parts + 1] = string.format("%d:%d:%d", s1, s2, s3)
+    for slot = 1, 19 do
+        parts[#parts + 1] = ItemStringFromLink(GetInventoryItemLink("player", slot))
+    end
+    return table.concat(parts, "|")
+end
+
+local function RequestSelfScan(delay)
+    selfScanPending = true
+    selfScanAt = now() + (delay or SELF_SCAN_DEBOUNCE)
+end
+
+local function TryScanSelf()
+    if not selfScanPending then return end
+    if now() < selfScanAt then return end
+    if InCombatLockdown() then
+        selfScanAt = now() + SELF_SCAN_DEBOUNCE
+        return
+    end
+    selfScanPending = false
+
+    local playerGUID = UnitGUID("player")
+    if not playerGUID then return end
+
+    -- v0.43: don't waste mesh bandwidth on self-scans below MIN_STORE_LEVEL.
+    -- Receivers' ShouldStore would reject them anyway (level < 60), and
+    -- without this gate every peer sees a "[store] REJECT: <name> L33 —
+    -- level 33 < 60" debug line for every alt-broadcast cycle. Inspect-
+    -- side already gates via MIN_INSPECT_LEVEL in AddUnit; this matches
+    -- the symmetric self-side gate.
+    local myLevel = UnitLevel("player") or 0
+    if myLevel < MIN_STORE_LEVEL then
+        dprint(string.format("[self] skip — level %d < %d (no broadcast from low-level alts)",
+            myLevel, MIN_STORE_LEVEL))
+        return
+    end
+
+    -- Silent short-circuit: nothing meaningful has changed since our last
+    -- broadcast. UNIT_INVENTORY_CHANGED fires every ~15s on Ascension from
+    -- durability/aura noise; unchanged fingerprint → no log, no work.
+    -- Real changes (gear swap, respec, talent shift) bump the fingerprint
+    -- and fall through to the actual scan. v0.13's per-active-group 24h
+    -- gate is dropped — it was blocking legitimate respec scans because
+    -- Ascension's classless GetActiveTalentGroup reports 1 unchanged, so
+    -- the "active group" key never changed on a respec.
+    local fp = SelfFingerprint()
+    if fp == lastSelfFingerprint then return end
+
+    local payload, info = BuildPayload("player", playerGUID)
+    if not payload then
+        dprint(string.format("[self] scan skipped — %s", info or "unknown"))
+        return
+    end
+    lastSelfFingerprint = fp
+    local _s1, _s2, _s3 = ReadSpecPoints("player")
+    dprint(string.format("[self] scanned self — %d slots equipped, spec=%d/%d/%d tree=%d, payload %d bytes",
+        info, _s1, _s2, _s3, DominantTree({_s1, _s2, _s3}), #payload))
+    MarkInspected(playerGUID, floor(time()))
+    EnqueueBroadcast(payload, UnitName("player"))
+    Ingest(payload, UnitName("player"))
+end
+
+-- ---------------- Migration ----------------
+-- v0.14 normalizes the per-player data model:
+--   players[guid] = { name, realm, class, level,
+--                     sets = { [dominantTree] = { spec, gear, scanTime, zone, scannedBy } },
+--                     ...top-level mirror of latest set }
+--
+-- This runs once at login and handles two legacy shapes:
+--   (a) Pre-v0.13 flat: { name, realm, class, level, spec, gear, scanTime, zone, scannedBy }
+--       → wrap into sets[DominantTree(spec)].
+--   (b) v0.13 sets keyed by activeTalentGroup (usually always 1 on Ascension)
+--       → re-key by DominantTree(set.spec). If two entries collide, newest wins.
+local function MigratePlayers()
+    if not (ConLogsDB and ConLogsDB.players) then return end
+    local migrated = 0
+    for guid, p in pairs(ConLogsDB.players) do
+        -- v0.20: backfill guid on the record. Pre-v0.20 entries didn't store
+        -- it, so the UI's Delete button had nothing to pass to DeletePlayer.
+        if not p.guid then p.guid = guid end
+        if p.gear and not p.sets then
+            -- (a) pre-v0.13 flat
+            local tree = DominantTree(p.spec)
+            p.sets = {
+                [tree] = {
+                    spec      = p.spec or { 0, 0, 0 },
+                    gear      = p.gear,
+                    scanTime  = p.scanTime or 0,
+                    zone      = p.zone or "",
+                    scannedBy = p.scannedBy or "?",
+                }
+            }
+            migrated = migrated + 1
+        elseif p.sets then
+            -- (b) v0.13 sets → re-key under DominantTree if any entry's key
+            -- disagrees with its spec's dominant tree.
+            local rekeyed = {}
+            local changed = false
+            for oldKey, s in pairs(p.sets) do
+                local newKey = DominantTree(s.spec)
+                if newKey ~= oldKey then changed = true end
+                if (not rekeyed[newKey]) or ((rekeyed[newKey].scanTime or 0) < (s.scanTime or 0)) then
+                    rekeyed[newKey] = s
+                end
+            end
+            if changed then
+                p.sets = rekeyed
+                migrated = migrated + 1
+            end
+        end
+    end
+    if migrated > 0 then
+        dprint(string.format("[migrate] normalized %d player entries to DominantTree keys", migrated))
+    end
+end
+
+-- ---------------- Sync initiation (v1.5.1: shared by manual + auto) ----------------
+
+-- Claude (v1.5.1): the sync-start logic was originally inlined in the
+-- /conlogs syncfrom slash handler. Extracted so auto-sync can reuse
+-- the same wire path. Returns (ok, info, extra1, extra2):
+--   ok=true  → info=etaSeconds, extra1=channels, extra2=estimatedSets
+--   ok=false → info=reason ("active"/"capped"/"nochannel"), extra1=remaining-secs (for "active") or nil
+-- Persists peerInfo[name].lastSyncedFrom so the auto-sync 24h cooldown
+-- works across both /reload and re-login.
+local function StartSyncFromPeer(name, days)
+    CleanExpiredSyncs()
+    if activeSyncs[name] then
+        return false, "active", math.max(0, activeSyncs[name] - time())
+    end
+    if CountActiveSyncs() >= SYNC_MAX_CONCURRENT then
+        return false, "capped"
+    end
+    local channels = PickChannels()
+    if #channels == 0 then
+        return false, "nochannel"
+    end
+
+    local sinceTS = days > 0 and (time() - days * 86400) or 0
+    msgCounter = msgCounter + 1
+    local msgID = string.format("S%x", msgCounter % 0xffff)
+    local manifest = BuildSyncManifest()
+    local fullPayload = string.format("SYNCREQ^%s^%s^%d^%s",
+        MyIdentity(), name, sinceTS, manifest)
+    local chunks = MakeChunks(fullPayload, msgID)
+    for _, ch in ipairs(channels) do
+        for _, chunk in ipairs(chunks) do
+            outQueue[#outQueue + 1] = { ch = ch, body = chunk }
+        end
+    end
+
+    -- ETA estimation: ~2s per set + 30s buffer. Capped at SYNC_MAX_SETS_PER_RESPONSE.
+    local estimatedSets = SYNC_MAX_SETS_PER_RESPONSE
+    if ConLogsDB and ConLogsDB.peerInfo and ConLogsDB.peerInfo[name]
+       and ConLogsDB.peerInfo[name].dbSize then
+        estimatedSets = math.min(ConLogsDB.peerInfo[name].dbSize, SYNC_MAX_SETS_PER_RESPONSE)
+    end
+    local etaSeconds = estimatedSets * 2 + 30
+    activeSyncs[name] = time() + etaSeconds
+
+    -- Persist last-synced-from for auto-sync's per-peer cooldown. Whether
+    -- this sync was manual or automatic, the peer just got drained — no
+    -- point in the auto-sync ticker re-picking them within 24h.
+    if ConLogsDB then
+        ConLogsDB.peerInfo = ConLogsDB.peerInfo or {}
+        ConLogsDB.peerInfo[name] = ConLogsDB.peerInfo[name] or {}
+        ConLogsDB.peerInfo[name].lastSyncedFrom = time()
+    end
+
+    return true, etaSeconds, channels, estimatedSets, manifest, #chunks
+end
+
+-- Claude (v1.5.1): mirrors ConLogsUI's BuildReachableSet — names of
+-- characters that are currently in our guild (online) or current group.
+-- Plus main-name peers whose lastCharName is in that set, so consolidated
+-- alts resolve to their main identity.
+local function BuildAutoSyncReachable()
+    local charSet = {}
+    local me = UnitName("player")
+    if me then charSet[me] = true end
+    for i = 1, GetNumPartyMembers() do
+        local n = UnitName("party" .. i)
+        if n then charSet[n] = true end
+    end
+    for i = 1, GetNumRaidMembers() do
+        local n = UnitName("raid" .. i)
+        if n then charSet[n] = true end
+    end
+    if IsInGuild() and GetNumGuildMembers then
+        local n = GetNumGuildMembers() or 0
+        for i = 1, n do
+            local gname, _, _, _, _, _, _, _, online = GetGuildRosterInfo(i)
+            if gname and online then charSet[gname] = true end
+        end
+    end
+    local reachable = {}
+    for n in pairs(charSet) do reachable[n] = true end
+    if ConLogsDB and ConLogsDB.peerInfo then
+        for mainName, info in pairs(ConLogsDB.peerInfo) do
+            if info.lastCharName and charSet[info.lastCharName] then
+                reachable[mainName] = true
+            end
+        end
+    end
+    return reachable
+end
+
+-- Claude (v1.5.1): auto-sync ticker. Called from the main OnUpdate driver.
+-- Picks one stale-but-reachable peer every AUTO_SYNC_TICK_INTERVAL and
+-- starts a sync. Honors SYNC_MAX_CONCURRENT and the per-peer 24h cooldown.
+local function TryAutoSync()
+    if not (ConLogsDB and ConLogsDB.config and ConLogsDB.config.autoSync) then
+        return
+    end
+    if now() < lastAutoSyncAttemptAt + AUTO_SYNC_TICK_INTERVAL then return end
+    lastAutoSyncAttemptAt = now() -- always advance — even if no candidate, we don't want to busy-loop
+
+    if CountActiveSyncs() >= SYNC_MAX_CONCURRENT then return end
+    if #PickChannels() == 0 then return end -- solo + no guild → can't sync
+
+    -- Trigger guild roster fetch so the online flag is fresh. GuildRoster
+    -- itself is rate-limited by the client; safe to call every tick.
+    if IsInGuild() and GuildRoster then GuildRoster() end
+
+    local reachable = BuildAutoSyncReachable()
+    local now_t = time()
+    local me = MyIdentity()
+    local candidates = {}
+    if ConLogsDB and ConLogsDB.peerInfo then
+        for name, info in pairs(ConLogsDB.peerInfo) do
+            local lastSeen   = info.lastSeen or 0
+            local lastSynced = info.lastSyncedFrom or 0
+            local dbSize     = info.dbSize or 0
+            if name ~= me
+               and reachable[name]
+               and dbSize >= AUTO_SYNC_MIN_DBSIZE
+               and (now_t - lastSeen)   <= AUTO_SYNC_PEER_FRESHNESS
+               and (now_t - lastSynced) >= AUTO_SYNC_PEER_COOLDOWN
+               and not activeSyncs[name]
+            then
+                candidates[#candidates + 1] = { name = name, dbSize = dbSize }
+            end
+        end
+    end
+    if #candidates == 0 then return end
+
+    -- Prefer biggest-DB peers — most data to gain per sync.
+    table.sort(candidates, function(a, b) return a.dbSize > b.dbSize end)
+    local pick = candidates[1]
+
+    local ok, info, _, estimatedSets = StartSyncFromPeer(pick.name, AUTO_SYNC_DEFAULT_DAYS)
+    if ok then
+        dprint(string.format("[autosync] requested sync from %s (db=%d, ETA ~%dm)",
+            pick.name, pick.dbSize, math.ceil(info / 60)))
+        -- Refresh browser scanners view if it's open so the row dims.
+        if _G.ConLogsBrowserFrame and _G.ConLogsBrowserFrame:IsShown()
+            and _G.ConLogsBrowserFrame.Refresh then
+            _G.ConLogsBrowserFrame.Refresh()
+        end
+    else
+        dprint(string.format("[autosync] %s skipped — %s", pick.name, info))
+    end
+end
+
+-- Claude (v1.8.1): online-check cache. SendAddonMessage with channel
+-- "WHISPER" to an offline character triggers the system error message
+-- "No player named X is currently playing" — chat spam reported in
+-- the wild ("Brokuli" case, 2026-05-21; "Haxxorz/Pawgie" 2026-05-27).
+-- Most common path is a sync response: we queue up to
+-- SYNC_MAX_SETS_PER_RESPONSE (200) WHISPER chunks back to the
+-- requester, and if they log off mid-burst we fire one error per
+-- remaining chunk.
+--
+-- Cache the reachable-set for ~2s so the outQueue tick doesn't have
+-- to re-walk the guild roster every BROADCAST_STAGGER (0.5s).
+local _onlineCache, _onlineCacheAt = nil, 0
+local _ONLINE_CACHE_TTL = 2 -- seconds
+
+-- Claude (v1.11.3): defense-in-depth additions for the Pawgie/Haxxorz
+-- case. The IsCharOnline cache CAN BE WRONG: the underlying guild
+-- roster only refreshes when GuildRoster() is called (rate-limited to
+-- 10s, and our autosync only calls it every few minutes). So when a
+-- peer logs off mid-sync-response, the cache may still report them
+-- online for a long time → we keep sending WHISPERs → keep erroring.
+--
+-- Two layers of belt-and-suspenders:
+--
+-- 1. _knownOffline: a name → timestamp map populated by the chat
+--    filter below when we catch the offline-target system error.
+--    IsCharOnline checks this FIRST so a recently-erroring name stays
+--    "offline" for 60s regardless of cache state.
+--
+-- 2. CHAT_MSG_SYSTEM filter catches the system error string itself,
+--    suppresses it from chat (no spam visible to the user), records
+--    the name as known-offline, AND drains the outQueue for that
+--    target so we don't repeat the same SendAddonMessage 200 more
+--    times.
+local _knownOffline = {}                -- name → GetTime() when error caught
+local _KNOWN_OFFLINE_TTL = 60           -- treat as offline for this many seconds
+
+local function IsCharOnline(name)
+    if not name or name == "" then return false end
+    -- v1.11.3: chat-filter-caught offline names override the cache.
+    local offlineAt = _knownOffline[name]
+    if offlineAt and (GetTime() - offlineAt) < _KNOWN_OFFLINE_TTL then
+        return false
+    end
+    local t = now()
+    if not _onlineCache or (t - _onlineCacheAt) > _ONLINE_CACHE_TTL then
+        _onlineCache = BuildAutoSyncReachable()
+        _onlineCacheAt = t
+    end
+    return _onlineCache[name] == true
+end
+
+-- Claude (v1.8.1): when we detect a WHISPER target went offline mid-burst,
+-- drain all remaining queued chunks targeting the same player. Without
+-- this we'd hit the offline-target system error once per remaining chunk
+-- (one outQueue pop per BROADCAST_STAGGER). Returns drop count for log.
+local function DrainWhispersTo(targetName)
+    if not targetName then return 0 end
+    local dropped = 0
+    local i = #outQueue
+    while i > 0 do
+        local item = outQueue[i]
+        if item.ch == "WHISPER" and item.target == targetName then
+            table.remove(outQueue, i)
+            dropped = dropped + 1
+        end
+        i = i - 1
+    end
+    return dropped
+end
+
+-- Claude (v1.11.3): CHAT_MSG_SYSTEM filter for the offline-target error.
+-- WoW's client emits a localized string like "No player named 'X' is
+-- currently playing." when SendAddonMessage (or SendChatMessage) WHISPER
+-- targets an offline character. We match the English form here; if Epoch
+-- ever ships localized clients the pattern can be expanded.
+--
+-- When matched: suppress the message from chat (return true), mark the
+-- name as known-offline so IsCharOnline returns false for it going
+-- forward, AND drain any remaining WHISPERs to that target so we don't
+-- pop+error 199 more chunks.
+ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", function(self, event, msg, ...)
+    if type(msg) ~= "string" then return false end
+    -- Pattern matches both quoted ("'Pawgie'") and unquoted (Pawgie) forms
+    -- defensively. Lua's character class catches alphanumeric WoW names.
+    local name = msg:match("^No player named '?([%w_%-]+)'? is currently playing%.$")
+    if not name then return false end
+    -- Only suppress when WE are demonstrably the cause:
+    --   (a) The outQueue currently has a pending WHISPER for this name, OR
+    --   (b) We caught an error for this name within the last 5 seconds
+    --       (handles the race where the queue was just drained but a
+    --       trailing system message hasn't reached the chat frame yet).
+    -- Manual `/w SomeoneWhoLogged off` from the user goes through neither
+    -- path → falls through, user sees their error normally.
+    local queueHasName = false
+    for _, item in ipairs(outQueue) do
+        if item.ch == "WHISPER" and item.target == name then
+            queueHasName = true
+            break
+        end
+    end
+    local recentlyCaught = _knownOffline[name] and (GetTime() - _knownOffline[name]) < 5
+    if not (queueHasName or recentlyCaught) then return false end
+    _knownOffline[name] = GetTime()
+    DrainWhispersTo(name)
+    return true -- suppress the system message
+end)
+
+-- ---------------- Main loop + events ----------------
+
+local acc, gcAcc = 0, 0
+local f = CreateFrame("Frame")
+f:SetScript("OnUpdate", function(self, elapsed)
+    acc = acc + elapsed
+    if acc < 0.25 then return end
+    acc = 0
+
+    if (now() - lastRoster) > ROSTER_TICK then ScanRoster() end
+
+    if #outQueue > 0 and now() >= nextSendAt then
+        local item = table.remove(outQueue, 1)
+        -- v0.53: WHISPER channel needs a target character name as 4th arg.
+        -- Other channels (PARTY/RAID/GUILD/BATTLEGROUND) ignore the 4th arg
+        -- so passing item.target = nil is harmless for non-whisper sends.
+        --
+        -- v1.8.1: guard WHISPER sends against offline targets to avoid
+        -- the "No player named X is currently playing" system error spam
+        -- (see IsCharOnline + DrainWhispersTo comments above).
+        if item.ch == "WHISPER" and item.target and not IsCharOnline(item.target) then
+            local dropped = DrainWhispersTo(item.target)
+            dprint(string.format("[whisper-guard] %s offline - dropped this chunk + %d others queued for same target",
+                item.target, dropped))
+        else
+            SendAddonMessage(PREFIX, item.body, item.ch, item.target)
+        end
+        nextSendAt = now() + BROADCAST_STAGGER
+    end
+
+    CheckTimeout()
+    TryInspect()
+    TryScanSelf()
+    TryCachePending()
+    TrySendVersionPing()
+    TryAutoSync() -- Claude (v1.5.1)
+
+    gcAcc = gcAcc + 0.25
+    if gcAcc >= 10 then gcAcc = 0; GCAssembly() end
+end)
+
+f:RegisterEvent("PLAYER_LOGIN")
+f:RegisterEvent("PLAYER_ENTERING_WORLD")
+f:RegisterEvent("PARTY_MEMBERS_CHANGED")
+f:RegisterEvent("RAID_ROSTER_UPDATE")
+f:RegisterEvent("INSPECT_TALENT_READY")
+f:RegisterEvent("CHAT_MSG_ADDON")
+f:RegisterEvent("UNIT_INVENTORY_CHANGED") -- self gear changes trigger a rescan of "player"
+f:RegisterEvent("PLAYER_TALENT_UPDATE")   -- respec / dual-spec switch triggers a rescan of "player"
+
+f:SetScript("OnEvent", function(self, event, ...)
+    if event == "PLAYER_LOGIN" then
+        ConLogsDB = ConLogsDB or { meta = { version = 1, created = time() }, players = {}, lastScanned = {}, config = {} }
+        ConLogsDB.players     = ConLogsDB.players     or {}
+        ConLogsDB.lastScanned = ConLogsDB.lastScanned or {}
+        ConLogsDB.config      = ConLogsDB.config      or {}
+        ConLogsDB.peerInfo    = ConLogsDB.peerInfo    or {}
+
+        -- Claude (ConLogs): one-time import of the legacy EpogArmory database.
+        -- ConLogs-CoA is EpogArmory renamed; SavedVariables are per-addon, so the
+        -- old EpogArmoryDB is only readable while the EpogArmory addon is STILL
+        -- installed (its SV loads these globals). Whenever it's present and we haven't
+        -- imported yet, MERGE its data in per-guid (never clobbering newer ConLogs
+        -- entries) and mark done. If EpogArmory isn't installed we leave the flag
+        -- unset and retry on a later login, so the user can do it any time. Schema is
+        -- identical (same addon), so it's a straight merge — MigratePlayers reshapes
+        -- imported records like any other.
+        if not ConLogsDB._epogMigrated and type(_G.EpogArmoryDB) == "table" then
+            local function copy(t)
+                if type(t) ~= "table" then return t end
+                local o = {}; for k, v in pairs(t) do o[k] = copy(v) end; return o
+            end
+            local src = _G.EpogArmoryDB
+            local imported = 0
+            if type(src.players) == "table" then
+                for guid, prec in pairs(src.players) do
+                    if ConLogsDB.players[guid] == nil then
+                        ConLogsDB.players[guid] = copy(prec); imported = imported + 1
+                    end
+                end
+            end
+            if type(src.lastScanned) == "table" then
+                for g, ts in pairs(src.lastScanned) do
+                    if ConLogsDB.lastScanned[g] == nil then ConLogsDB.lastScanned[g] = ts end
+                end
+            end
+            if type(src.peerInfo) == "table" then
+                for n, info in pairs(src.peerInfo) do
+                    if ConLogsDB.peerInfo[n] == nil then ConLogsDB.peerInfo[n] = copy(info) end
+                end
+            end
+            if type(src.config) == "table" then
+                for k, v in pairs(src.config) do
+                    if ConLogsDB.config[k] == nil then ConLogsDB.config[k] = copy(v) end
+                end
+            end
+            if type(_G.EpogItemCacheDB) == "table" then
+                ConLogsItemCacheDB = ConLogsItemCacheDB or {}
+                for id, e in pairs(_G.EpogItemCacheDB) do
+                    if ConLogsItemCacheDB[id] == nil then ConLogsItemCacheDB[id] = copy(e) end
+                end
+            end
+            if type(_G.EpogTalentTreeDB) == "table" then
+                ConLogsTalentTreeDB = ConLogsTalentTreeDB or {}
+                for k, e in pairs(_G.EpogTalentTreeDB) do
+                    if ConLogsTalentTreeDB[k] == nil then ConLogsTalentTreeDB[k] = copy(e) end
+                end
+            end
+            ConLogsDB._epogMigrated = true
+            print(string.format("|cffffaa44ConLogs-CoA|r: imported |cff00ff66%d|r player(s) from your previous EpogArmory database.", imported))
+        end
+
+        -- v0.43: track every character that's logged into this account so
+        -- /conlogs main can validate against the list. SavedVariables is
+        -- account-scoped, so this set accumulates across alts naturally.
+        ConLogsDB.knownChars  = ConLogsDB.knownChars  or {}
+        local me = UnitName("player")
+        if me and me ~= "" then ConLogsDB.knownChars[me] = true end
+        -- v0.40: zone restriction removed; any lingering requireInstance
+        -- in old SavedVariables is just a vestigial dead field.
+        ConLogsDB.config.requireInstance = nil
+        -- v0.37: responder-side sync opt-in defaults to true.
+        if ConLogsDB.config.acceptSync == nil then
+            ConLogsDB.config.acceptSync = true
+        end
+        -- Claude (v1.5.1): auto-sync default-on. Background catch-up from
+        -- reachable peers. Toggle via /conlogs autosync on|off.
+        if ConLogsDB.config.autoSync == nil then
+            ConLogsDB.config.autoSync = true
+        end
+        -- Claude (v1.5.1): defer the first auto-sync attempt by ~90s after
+        -- login so the guild roster, peer pings, and outQueue have time to
+        -- settle. Subsequent attempts happen every AUTO_SYNC_TICK_INTERVAL.
+        lastAutoSyncAttemptAt = now() + AUTO_SYNC_INITIAL_DELAY - AUTO_SYNC_TICK_INTERVAL
+        -- v0.43: optional main-name identity. When set, all broadcasts from
+        -- this client carry it at wire position 39. Receivers use it as the
+        -- canonical scanner identity, consolidating alts under the main.
+        -- Default nil = use character name (no consolidation, current behavior).
+        --
+        -- v0.45: auto-default mainName to the FIRST L60 character to log in.
+        -- Most users want consolidation; auto-defaulting on the first L60
+        -- saves them from having to discover and run /conlogs main. Once
+        -- set, it sticks (account-wide via SavedVariables) — subsequent
+        -- logins on different characters don't change it.
+        if not ConLogsDB.config.mainName then
+            local lvl = UnitLevel("player") or 0
+            if me and me ~= "" and lvl >= MIN_STORE_LEVEL then
+                ConLogsDB.config.mainName = me
+                print(string.format("|cffffaa44ConLogs|r: auto-set main identity to |cff00ff66%s|r (first L60 to log in). Change with /conlogs main.",
+                    me))
+            end
+        end
+
+        -- v0.45: auto-prune peerInfo entries that haven't been heard from
+        -- in 30+ days. Keeps the Scanners view focused on currently-active
+        -- peers and prevents the table from accumulating orphan rows
+        -- forever. Contributor-only entries (no peerInfo) are filtered
+        -- by AggregateScanners at display time using the same cutoff.
+        local staleCutoff = time() - 30 * 86400
+        local pruned = 0
+        for name, info in pairs(ConLogsDB.peerInfo) do
+            if (info.lastSeen or 0) < staleCutoff then
+                ConLogsDB.peerInfo[name] = nil
+                pruned = pruned + 1
+            end
+        end
+        if pruned > 0 then
+            dprint(string.format("[migrate] pruned %d stale peerInfo entries (>30d)", pruned))
+        end
+
+        ConLogsItemCacheDB = ConLogsItemCacheDB or {}
+        ConLogsTalentTreeDB = ConLogsTalentTreeDB or {} -- v1.3: per-class talent metadata
+        MigratePlayers() -- wrap pre-v0.13 flat entries into sets[1]
+        PruneStoredData() -- cap ConLogsDB.players / lastScanned / item cache (block-too-big guard)
+        RequestSelfScan(SELF_SCAN_LOGIN_DELAY) -- initial self-scan after talent data warms up
+        versionPingAt = now() + VERSION_PING_DELAY -- one-shot version broadcast, 2min after login
+        return
+    end
+    if event == "CHAT_MSG_ADDON" then
+        OnAddonMessage(...)
+    elseif event == "INSPECT_TALENT_READY" then
+        OnInspectReady()
+    elseif event == "UNIT_INVENTORY_CHANGED" then
+        local unit = ...
+        if unit == "player" then RequestSelfScan() end
+    elseif event == "PLAYER_TALENT_UPDATE" then
+        RequestSelfScan()
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        -- v1.1.7+: zone transitions (BG exit, instance load, login)
+        -- briefly clear all visible buffs from UnitBuff's perspective
+        -- before the server re-asserts them ~3-6s later. Open a settle
+        -- window during which the aura check defers gracefully — no
+        -- false-positive hints, no queue drain — until auras restore.
+        auraSettleUntil = now() + AURA_SETTLE_WINDOW
+        ScanRoster()
+        -- Claude: on instance entry, clear the 15-min in-memory cooldown for
+        -- all current group members so they get fresh inspects this run.
+        -- The 24-hour DB gate (ConLogsDB.lastScanned) is preserved so
+        -- mesh-wide dedup still works — this only refreshes our own client.
+        local inInst = IsInInstance()
+        if inInst then
+            local numRaid = GetNumRaidMembers()
+            local numParty = GetNumPartyMembers()
+            if numRaid > 0 then
+                for i = 1, numRaid do -- Claude: clear seen[] for each raid member
+                    local rUnit = "raid" .. i
+                    local rGuid = UnitGUID(rUnit)
+                    if rGuid then seen[rGuid] = nil end
+                end
+            elseif numParty > 0 then
+                for i = 1, numParty do -- Claude: clear seen[] for each party member
+                    local pUnit = "party" .. i
+                    local pGuid = UnitGUID(pUnit)
+                    if pGuid then seen[pGuid] = nil end
+                end
+            end
+            dprint("[world] instance entry — cleared seen[] for group, fresh inspects queued")
+        end
+    else
+        ScanRoster()
+    end
+end)
+
+-- ---------------- Slash ----------------
+
+local function CountStored()
+    if not ConLogsDB or not ConLogsDB.players then return 0 end
+    local n = 0
+    for _ in pairs(ConLogsDB.players) do n = n + 1 end
+    return n
+end
+
+local function CountTracked()
+    if not ConLogsDB or not ConLogsDB.lastScanned then return 0 end
+    local n = 0
+    for _ in pairs(ConLogsDB.lastScanned) do n = n + 1 end
+    return n
+end
+
+local function CountAssembly()
+    local n = 0
+    for _ in pairs(assembly) do n = n + 1 end
+    return n
+end
+
+local function CountCache()
+    if not ConLogsItemCacheDB then return 0 end
+    local n = 0
+    for _ in pairs(ConLogsItemCacheDB) do n = n + 1 end
+    return n
+end
+
+local function CountPending()
+    local n = 0
+    for _ in pairs(pendingCache) do n = n + 1 end
+    return n
+end
+
+-- Public namespace — used by the UI for cross-file access to helpers that
+-- need to live in ConLogs.lua (for scoping / state reasons).
+_G.ConLogs = _G.ConLogs or {}
+
+-- Runtime version for the UI (minimap tooltip). Reflects the loaded build on every
+-- /reload, unlike GetAddOnMetadata which is cached at client launch.
+_G.ConLogs.VERSION = ADDON_VERSION
+
+-- v0.37: expose sync-state accessors for the UI's Scanners view.
+_G.ConLogs.IsPeerSyncActive = function(name)
+    CleanExpiredSyncs()
+    return activeSyncs[name] ~= nil
+end
+_G.ConLogs.SyncEndTimeFor = function(name)
+    CleanExpiredSyncs()
+    return activeSyncs[name]
+end
+_G.ConLogs.ActiveSyncCount = function()
+    return CountActiveSyncs()
+end
+_G.ConLogs.SyncMaxConcurrent = SYNC_MAX_CONCURRENT
+-- v0.47: Refresh Peers button calls this. Returns (true, channels) on send,
+-- (false, "cooldown", secondsRemaining) on cooldown, (false, "nochannel") if
+-- not in guild/group.
+_G.ConLogs.RequestPeerRefresh = function() -- Claude v0.47
+    return BroadcastPeerPing()
+end
+-- v0.52: expose MyIdentity so the UI can detect "is this leaderboard row me"
+-- and inject our own DB count (peerInfo never tracks self by design).
+_G.ConLogs.MyIdentity = function() return MyIdentity() end
+-- v1.2: expose Reality Recalibrators aura state so the Browser + minimap
+-- can render a clear "auto-inspect ON/OFF" banner. Required because
+-- without the aura, inspect APIs return Ascension's transmog visuals
+-- instead of true gear, so we pause auto-scanning when missing.
+_G.ConLogs.HasRealityAura = HasRealityAura
+_G.ConLogs.RealityAuraName = REALITY_AURA_NAME
+-- Claude (v1.4.1 test): expose the test-mode flag so UI surfaces can
+-- accurately describe inspect behaviour when the aura is missing.
+_G.ConLogs.RequiresRealityAura = function() return REQUIRE_REALITY_AURA end
+-- Also resets the 24h HasFreshScan gate for this GUID (by wiping
+-- lastScanned[guid]) and the in-memory 15min inspect cooldown (seen[guid]),
+-- so *this client* can re-inspect immediately if they're in range. If the
+-- user is deleting their own entry, force a fresh self-scan by clearing the
+-- fingerprint and queueing RequestSelfScan.
+_G.ConLogs = _G.ConLogs or {}
+_G.ConLogs.DeletePlayer = function(guid)
+    if not guid or guid == "" then return end
+    local name = "?"
+    if ConLogsDB and ConLogsDB.players and ConLogsDB.players[guid] then
+        name = ConLogsDB.players[guid].name or "?"
+        ConLogsDB.players[guid] = nil
+    end
+    if ConLogsDB and ConLogsDB.lastScanned then
+        ConLogsDB.lastScanned[guid] = nil
+    end
+    seen[guid] = nil
+    if guid == UnitGUID("player") then
+        lastSelfFingerprint = ""
+        RequestSelfScan()
+    end
+    dprint(string.format("[delete] removed %s (%s) from local DB", name, guid))
+end
+
+-- iterate all stored players and feed every itemID through the cache.
+-- Anything not cached locally gets queued for a SetHyperlink-triggered server
+-- fetch; the OnUpdate poll picks them up over the next few seconds.
+local function CacheBuildAll()
+    if not ConLogsDB or not ConLogsDB.players then return 0, 0, 0 end
+    local tried, hit, pended = 0, 0, 0
+    local function processGear(gear)
+        for slot = 1, 19 do
+            local raw = gear[slot]
+            if raw and raw ~= "" then
+                local iid = tonumber(raw:match("^(%d+)"))
+                if iid and iid > 0 then
+                    tried = tried + 1
+                    local link = "item:" .. raw
+                    -- v11: pass slot for equipLoc verification
+                    if CacheItemInfo(iid, link, slot) then
+                        hit = hit + 1
+                    else
+                        MarkPendingCache(iid, link, slot)
+                        pended = pended + 1
+                    end
+                end
+            end
+        end
+    end
+    for _, p in pairs(ConLogsDB.players) do
+        -- v0.22: walk per-spec sets so stats get captured for every loadout,
+        -- not just the latest-mirror p.gear. The CacheItemInfo dedup makes
+        -- redundant calls cheap (early-out on ConLogsItemCacheDB[itemID]).
+        if p.sets then
+            for _, s in pairs(p.sets) do
+                if s.gear then processGear(s.gear) end
+            end
+        elseif p.gear then
+            processGear(p.gear)
+        end
+    end
+    return tried, hit, pended
+end
+
+local function ShowHelp()
+    print("|cffffaa44ConLogs|r commands:")
+    print("  /conlogs show <name>   — open paperdoll for a stored player (or target + /conlogs show)")
+    print("  /conlogs browse        — open the searchable armory browser")
+    print("  /conlogs status        — queue / broadcast / storage state")
+    print("  /conlogs debug         — toggle verbose chat logging")
+    print("  /conlogs list          — print every stored player")
+    print("  /conlogs wipe          — clear stored players (keeps config)")
+    print("  /conlogs cache         — show item-info cache size")
+    print("  /conlogs cachebuild    — fill the cache from all stored players' gear (names/quality/ilvl)")
+    print("  /conlogs cachewipe     — clear the item-info cache")
+    print("  /conlogs main [name]   — set/show your main-character identity (consolidates alts in the mesh)")
+    print("  /conlogs merge <newname> <alias1> [alias2] ... — locally re-attribute scans from peer aliases to one canonical name")
+    print("  /conlogs refreshpeers  — ping guildmates for fresh identity + DB-size info (Scanners-view leaderboard)")
+    print("  /conlogs autosync [on|off|status] — background catch-up sync from reachable peers (default: on, 24h per-peer cooldown)")
+    print("  /conlogs dummy         — toggle the Training Dummy parse-validator frame (auto-opens when targeting a dummy in a city)")
+    print("  /conlogs testvalidate  — jump straight to the Validate button to test the marker mechanism (no full 1:30 fight needed)")
+    print("  /conlogs dungeon       — toggle the Dungeon speedrun status frame (auto-opens when entering a tracked dungeon)")
+    print("  /conlogs raidlog [on|off|status] — auto-start /combatlog on raid entry (default: on; raids tracked: Onyxia's Lair)")
+    print("  /conlogs aura          — check if Reality Recalibrators aura is active (gates auto-inspect of groupmates)")
+    print("  /conlogs dump <name>   — diagnostic dump of every layer (itemstring, GetItemInfo, GetItemStats, cache) for each slot of a stored player")
+    print("|cff888888  Source + releases: github.com/Defcons/ConLogsApp|r")
+    -- dumpspec left in place but not advertised — internal diagnostic.
+end
+
+SLASH_CONLOGS1 = "/conlogs"
+SLASH_CONLOGS2 = "/epogarmory"
+SlashCmdList["CONLOGS"] = function(msg)
+    msg = (msg or ""):lower()
+    if msg == "debug" then
+        ConLogsDebug = not ConLogsDebug
+        print("|cffffaa44ConLogs|r debug:",
+            ConLogsDebug and "|cff00ff00ON|r" or "|cffff0000OFF|r")
+    elseif msg == "status" then
+        print(string.format("|cffffaa44ConLogs|r stored=%d tracked=%d cache=%d cachePending=%d queue=%d outPending=%d asm=%d currentInspect=%s inCombat=%s zone=%s",
+            CountStored(), CountTracked(), CountCache(), CountPending(),
+            #queue, #outQueue, CountAssembly(),
+            current and UnitName(current.unit) or "none",
+            tostring(InCombatLockdown()),
+            ZoneType()))
+        -- v1.2: surface aura status as part of the standard status output
+        if HasRealityAura() then
+            print(string.format("  |cff00ff66%s aura: ACTIVE|r — auto-inspect enabled", REALITY_AURA_NAME))
+        elseif REQUIRE_REALITY_AURA then
+            print(string.format("  |cffff6666%s aura: NOT ACTIVE|r — auto-inspect of groupmates paused (transmog hides true gear)", REALITY_AURA_NAME))
+        else
+            -- Claude (v1.4.1 test): aura interlock disabled, scanning anyway to test settle+verify
+            print(string.format("  |cffffaa00%s aura: NOT ACTIVE|r — |cffff9966TEST MODE|r: scanning anyway (settle+verify validation)", REALITY_AURA_NAME))
+        end
+    elseif msg == "cache" then
+        print(string.format("|cffffaa44ConLogs|r cache: %d items known, %d pending client fetch",
+            CountCache(), CountPending()))
+    elseif msg == "cachebuild" then
+        local tried, hit, pended = CacheBuildAll()
+        print(string.format("|cffffaa44ConLogs|r cachebuild: %d items scanned, %d already known, %d queued for fetch (check /conlogs cache in ~15s)",
+            tried, hit, pended))
+    elseif msg == "cachewipe" then
+        ConLogsItemCacheDB = {}
+        pendingCache = {}
+        print("|cffffaa44ConLogs|r: wiped item-info cache")
+    elseif msg == "wipe" then
+        local kept = ConLogsDB and ConLogsDB.config or {}
+        ConLogsDB = { meta = { version = 1, created = time() }, players = {}, lastScanned = {}, config = kept }
+        -- Clear in-memory self-scan dedup state too, otherwise the next scan
+        -- short-circuits on a fingerprint match against the pre-wipe state and
+        -- your own player never gets re-added to the freshly-wiped DB.
+        lastSelfFingerprint = ""
+        RequestSelfScan()
+        print("|cffffaa44ConLogs|r: wiped players + lastScanned (kept config) — self-scan queued")
+    elseif msg == "list" then
+        if not ConLogsDB or not ConLogsDB.players then print("empty") return end
+        for guid, p in pairs(ConLogsDB.players) do
+            print(string.format("  %s %s L%d [%s] — by %s at %s",
+                p.class or "?", p.name or "?", p.level or 0, p.zone or "?",
+                p.scannedBy or "?", date("%Y-%m-%d %H:%M", p.scanTime or 0)))
+        end
+    elseif msg:sub(1, 4) == "dump" then
+        -- v1.2: forensic diagnostic. Dumps every layer of what we know about
+        -- a stored player's gear so we can find where transmog data is
+        -- bleeding through. For each of the 19 slots, prints:
+        --   - the raw itemstring (and how many `:`-separated fields it has;
+        --     standard format is 9, anything more = Ascension custom field)
+        --   - GetItemInfo(itemID) result
+        --   - GetItemInfo(fullLink) result (compared to above; if they
+        --     differ, the link's extra fields are altering the lookup)
+        --   - GetItemStats(fullLink) — every stat key/value
+        --   - ConLogsItemCacheDB entry (what we have cached)
+        -- Output is verbose but designed for chat scrollback. Run on a
+        -- known-affected player and share the output to investigate.
+        local nameArg = msg:match("^dump%s+(.+)$")
+        if not nameArg or nameArg == "" then
+            print("|cffffaa44ConLogs|r: usage — /conlogs dump <playerName>")
+            return
+        end
+        nameArg = nameArg:gsub("^%s+", ""):gsub("%s+$", "")
+        nameArg = nameArg:sub(1, 1):upper() .. nameArg:sub(2):lower()
+        local target
+        if ConLogsDB and ConLogsDB.players then
+            for _, p in pairs(ConLogsDB.players) do
+                if (p.name or "") == nameArg then target = p; break end
+            end
+        end
+        if not target then
+            print(string.format("|cffffaa44ConLogs|r: no stored player named %s", nameArg))
+            return
+        end
+        local SLOT_LABEL = {
+            "head", "neck", "shoulder", "shirt", "chest", "waist", "legs", "feet",
+            "wrist", "hands", "finger1", "finger2", "trinket1", "trinket2",
+            "back", "mainhand", "offhand", "ranged", "tabard",
+        }
+        local function dumpSet(setKey, set)
+            print(string.format("|cffffaa44=== %s [set %s] ===|r scanned by %s at %s, zone %s",
+                target.name, tostring(setKey), set.scannedBy or "?",
+                date("%Y-%m-%d %H:%M:%S", set.scanTime or 0), set.zone or "?"))
+            -- v1.1.2: PvP detection trace. For each trinket slot, show
+            -- exactly what we'd resolve, whether it matches any pattern,
+            -- and what the final routing decision would be. Then flag
+            -- if the stored setKey disagrees.
+            local function classifyTrinket(slot)
+                local str = set.gear and set.gear[slot]
+                if not str or str == "" then return "(empty)", nil, false end
+                local iid = tonumber(str:match("^(%d+)"))
+                if not iid then return string.format("(unparseable: %s)", str), nil, false end
+                local name = GetItemInfo(iid)
+                if not name then return string.format("(GetItemInfo(%d)=nil — not in client cache)", iid), iid, false end
+                for _, pat in ipairs(PVP_TRINKET_NAME_PATTERNS) do
+                    if name:find(pat, 1, true) then
+                        return string.format("\"%s\" — matches pattern \"%s\" → PvP", name, pat), iid, true
+                    end
+                end
+                return string.format("\"%s\" — no PvP pattern match", name), iid, false
+            end
+            local desc13, _, isPvP13 = classifyTrinket(13)
+            local desc14, _, isPvP14 = classifyTrinket(14)
+            local liveSaysPvP = isPvP13 or isPvP14
+            print(string.format("  |cff999999PvP detection trace (live, using current patterns):|r"))
+            print(string.format("    slot 13 (trinket1): %s", desc13))
+            print(string.format("    slot 14 (trinket2): %s", desc14))
+            print(string.format("    live verdict: would route to |cff66ffcc%s|r",
+                liveSaysPvP and "sets[\"pvp\"]" or string.format("sets[%s] (dominant tree)", tostring(setKey))))
+            local storedKey = tostring(setKey)
+            local liveExpectedKey = liveSaysPvP and "pvp" or storedKey -- can't infer dominant tree from set alone
+            if liveSaysPvP and storedKey ~= "pvp" then
+                print("    |cffff6666MISMATCH:|r stored as set " .. storedKey ..
+                    " but live detection says PvP. Likely cause: scan was made before v0.33 (PvP routing didn't exist), OR GetItemInfo returned nil for the trinket at scan time. Fix: rescan with the trinket equipped.")
+            elseif (not liveSaysPvP) and storedKey == "pvp" then
+                print("    |cffffaa44NOTE:|r stored as PvP set but live trinket lookup doesn't match any PvP pattern. May be intentional (older scan, custom trinket) or pattern coverage gap.")
+            end
+            for slot = 1, 19 do
+                local itemstring = set.gear and set.gear[slot]
+                if not itemstring or itemstring == "" then
+                    print(string.format("  slot %d (%s): |cff666666(empty)|r", slot, SLOT_LABEL[slot] or "?"))
+                else
+                    -- Count `:` fields. Standard 3.3.5 itemstring is 9 fields:
+                    -- item:itemID:enchant:gem1:gem2:gem3:gem4:suffix:unique:level
+                    -- Anything more suggests Ascension server-side extension
+                    -- (custom stats, reforge, transmog, etc.).
+                    local fields = {}
+                    for f in (itemstring .. ":"):gmatch("([^:]*):") do
+                        fields[#fields + 1] = f
+                    end
+                    local itemID = tonumber(fields[2])
+                    local extraNote = ""
+                    if #fields > 10 then
+                        extraNote = string.format(" |cffff9966[%d fields, %d extras beyond standard]|r",
+                            #fields, #fields - 10)
+                    end
+                    print(string.format("  slot %d (%s): %s%s",
+                        slot, SLOT_LABEL[slot] or "?", itemstring, extraNote))
+                    if #fields > 10 then
+                        local extras = {}
+                        for i = 11, #fields do
+                            extras[#extras + 1] = string.format("[%d]=%s", i, fields[i])
+                        end
+                        print("    extras: " .. table.concat(extras, " "))
+                    end
+                    if itemID then
+                        local n, _, q, ilvl, _, t, st, _, eq = GetItemInfo(itemID)
+                        if n then
+                            print(string.format("    GetItemInfo(id): \"%s\" Q%d ilvl%d %s/%s @ %s",
+                                n, q or 0, ilvl or 0, t or "?", st or "?", eq or "?"))
+                        else
+                            print("    GetItemInfo(id): nil (not in client cache yet)")
+                        end
+                        local n2, _, q2, ilvl2 = GetItemInfo(itemstring)
+                        if n2 and (n2 ~= n or q2 ~= q or ilvl2 ~= ilvl) then
+                            print(string.format("    |cffff9966GetItemInfo(link) DIFFERS:|r \"%s\" Q%d ilvl%d",
+                                n2, q2 or 0, ilvl2 or 0))
+                        end
+                        if GetItemStats then
+                            local stats = GetItemStats(itemstring)
+                            if stats and next(stats) then
+                                local pairs_ = {}
+                                for k, v in pairs(stats) do
+                                    if type(v) == "number" and v ~= 0 then
+                                        pairs_[#pairs_ + 1] = string.format("%s=%s", k, tostring(v))
+                                    end
+                                end
+                                if #pairs_ > 0 then
+                                    print("    GetItemStats: " .. table.concat(pairs_, ", "))
+                                end
+                            end
+                        end
+                        if ConLogsItemCacheDB and ConLogsItemCacheDB[itemID] then
+                            local c = ConLogsItemCacheDB[itemID]
+                            local verifyStr = ""
+                            if c.verified == true then
+                                verifyStr = " |cff66ff66✓verified|r"
+                            elseif c.verified == false then
+                                verifyStr = string.format(" |cffff6666✗unverified|r (attempts=%d, equipLoc=%s)",
+                                    c.verifyAttempts or 0, c.equipLoc or "?")
+                            end
+                            print(string.format("    Cache: \"%s\" Q%d ilvl%d icon=%s v=%s%s",
+                                c.name or "?", c.quality or 0, c.itemLevel or 0,
+                                c.icon or "?", tostring(c.v), verifyStr))
+                        else
+                            print("    Cache: |cff666666(not cached)|r")
+                        end
+                    end
+                end
+            end
+        end
+        if target.sets then
+            for setKey, set in pairs(target.sets) do dumpSet(setKey, set) end
+        else
+            print("(no sets stored)")
+        end
+    elseif msg == "dumpspec" or msg == "specs" then
+        -- Diagnostic: shows every talent-API variant's read for each of the
+        -- player's 3 tabs. Tells us which call style actually returns real
+        -- points-spent on this Ascension client.
+        print("|cffffaa44ConLogs|r talent-read diagnostics for self:")
+        local gatg = GetActiveTalentGroup and GetActiveTalentGroup() or nil
+        local gntg = GetNumTalentGroups and GetNumTalentGroups() or nil
+        print(string.format("  GetActiveTalentGroup() = %s    GetNumTalentGroups() = %s",
+            tostring(gatg), tostring(gntg)))
+        for tab = 1, 3 do
+            local name1, _, pts1 = GetTalentTabInfo(tab)
+            local name2, _, pts2 = GetTalentTabInfo(tab, nil)
+            local _,     _, pts3 = GetTalentTabInfo(tab, nil, nil, 1)
+            local _,     _, pts4 = GetTalentTabInfo(tab, nil, nil, 2)
+            local nt = (GetNumTalents and GetNumTalents(tab)) or 0
+            local sumDefault = 0
+            for i = 1, nt do
+                local _, _, _, _, spent = GetTalentInfo(tab, i)
+                sumDefault = sumDefault + (spent or 0)
+            end
+            local sumGroup1 = 0
+            for i = 1, nt do
+                local _, _, _, _, spent = GetTalentInfo(tab, i, nil, nil, 1)
+                sumGroup1 = sumGroup1 + (spent or 0)
+            end
+            print(string.format("  Tab %d [%s]: GTTI(1-arg)=%s  GTTI(nil)=%s  GTTI(grp=1)=%s  GTTI(grp=2)=%s  GTI-sum(default)=%d  GTI-sum(grp=1)=%d  over %d talents",
+                tab, tostring(name1 or "?"),
+                tostring(pts1 or "nil"), tostring(pts2 or "nil"),
+                tostring(pts3 or "nil"), tostring(pts4 or "nil"),
+                sumDefault, sumGroup1, nt))
+        end
+        local s1, s2, s3 = ReadSpecPoints("player")
+        print(string.format("  ReadSpecPoints(player) = %d / %d / %d → DominantTree = %d",
+            s1, s2, s3, DominantTree({s1, s2, s3})))
+    elseif msg == "aura" then
+        -- v1.1.7: explicit aura status check. Also resets the
+        -- realityAuraHintShown flag so the one-time hint can fire again
+        -- next time ScanRoster sees a group without the aura — useful if
+        -- the user toggles the aura off/on across sessions.
+        if HasRealityAura() then
+            print(string.format("|cffffaa44ConLogs|r: |cff00ff66%s|r aura |cff00ff66ACTIVE|r — auto-inspect of groupmates enabled.",
+                REALITY_AURA_NAME))
+        elseif REQUIRE_REALITY_AURA then
+            print(string.format("|cffffaa44ConLogs|r: |cffff9966%s|r aura |cffff6666NOT ACTIVE|r — auto-inspect of groupmates is paused.",
+                REALITY_AURA_NAME))
+            print("|cff888888  Without the aura, Ascension's transmog hides true gear from inspect. Self-scans still work normally.|r")
+            realityAuraHintShown = false
+        else
+            -- Claude (v1.4.1 test): aura interlock disabled
+            print(string.format("|cffffaa44ConLogs|r: |cffff9966%s|r aura |cffff6666NOT ACTIVE|r — |cffffaa00TEST MODE|r: scanning anyway.",
+                REALITY_AURA_NAME))
+            print("|cff888888  v1.4.1 test build: validating whether the 400ms settle + 1.5s verify pass is enough on its own to filter out transmog visual reads. Self-scans always work.|r")
+        end
+    elseif msg == "dummy" then
+        -- Claude (v1.6.1 internal, future v1.7.0 release): toggle the dummy-parse frame. Frame also auto-opens
+        -- when targeting a Training Dummy in a rested area; this is the
+        -- manual fallback if the user closed it.
+        if _G.ConLogsDummy_Toggle then
+            _G.ConLogsDummy_Toggle()
+        else
+            print("|cffffaa44ConLogs|r: dummy module not loaded")
+        end
+    elseif msg == "testvalidate" then
+        -- Claude (v1.7.1): jump straight into the validate-button state
+        -- so the user can test the marker mechanism without a full
+        -- 1:30 dummy parse. Skips aura validation + post-combat
+        -- timeout; just exercises the click-to-CLEU round-trip.
+        if _G.ConLogsDummy_TestValidate then
+            _G.ConLogsDummy_TestValidate()
+        else
+            print("|cffffaa44ConLogs|r: dummy module not loaded")
+        end
+    elseif msg == "dungeon" then
+        -- Claude (v1.7.3): toggle the Dungeon speedrun status frame.
+        -- Frame also auto-opens when entering a tracked dungeon.
+        if _G.ConLogsDungeon_Toggle then
+            _G.ConLogsDungeon_Toggle()
+        else
+            print("|cffffaa44ConLogs|r: dungeon module not loaded")
+        end
+    elseif msg == "dungeondebug" then
+        -- Claude (v1.7.3): dump detection state. Use when auto-open
+        -- isn't firing — tells us what GetInstanceInfo returns and
+        -- whether the name matches the DUNGEONS table.
+        if _G.ConLogsDungeon_Debug then
+            _G.ConLogsDungeon_Debug()
+        else
+            print("|cffffaa44ConLogs|r: dungeon module not loaded")
+        end
+    elseif msg == "raidlog" or msg:sub(1, 8) == "raidlog " then
+        -- Claude (v1.7.7): toggle raid auto-log (start /combatlog
+        -- automatically on entering a raid instance, e.g. Onyxia's
+        -- Lair). 5-man dungeons keep their Yes/No prompt behavior.
+        ConLogsDB = ConLogsDB or {}
+        ConLogsDB.config = ConLogsDB.config or {}
+        local arg = msg:sub(9):lower():match("^%s*(%S*)%s*$") or ""
+        if arg == "" or arg == "status" then
+            local enabled = ConLogsDB.config.raidAutoLog
+            print(string.format("|cffffaa44ConLogs|r raidlog: %s",
+                enabled and "|cff00ff00ON|r" or "|cffff0000OFF|r"))
+            print("  When ON, /combatlog starts automatically the moment you enter a raid instance (currently: Onyxia's Lair).")
+            print("  Toggle: /conlogs raidlog on  |  /conlogs raidlog off")
+        elseif arg == "on" or arg == "true" or arg == "1" then
+            ConLogsDB.config.raidAutoLog = true
+            print("|cffffaa44ConLogs|r raidlog: |cff00ff00ON|r - /combatlog will auto-start on raid entry.")
+        elseif arg == "off" or arg == "false" or arg == "0" then
+            ConLogsDB.config.raidAutoLog = false
+            print("|cffffaa44ConLogs|r raidlog: |cffff0000OFF|r - raid entry will prompt Yes/No like dungeons.")
+        else
+            print("|cffffaa44ConLogs|r raidlog: unknown arg '" .. arg .. "'. Use on / off / status.")
+        end
+    elseif msg == "autosync" or msg:sub(1, 9) == "autosync " then
+        -- Claude (v1.5.1): toggle background auto-sync. Same wire path as
+        -- /syncfrom but ticks itself; cap is SYNC_MAX_CONCURRENT (3) and
+        -- cooldown is AUTO_SYNC_PEER_COOLDOWN (24h) per peer.
+        ConLogsDB = ConLogsDB or {}
+        ConLogsDB.config = ConLogsDB.config or {}
+        local arg = msg:sub(10):lower():match("^%s*(%S*)%s*$") or ""
+        if arg == "" or arg == "status" then
+            local enabled = ConLogsDB.config.autoSync
+            print(string.format("|cffffaa44ConLogs|r autosync: %s",
+                enabled and "|cff00ff00ON|r" or "|cffff0000OFF|r"))
+            local nextIn = math.max(0, (lastAutoSyncAttemptAt + AUTO_SYNC_TICK_INTERVAL) - now())
+            print(string.format("|cff888888  next attempt in ~%ds  ·  active syncs: %d/%d  ·  per-peer cooldown: %dh|r",
+                math.ceil(nextIn), CountActiveSyncs(), SYNC_MAX_CONCURRENT,
+                math.ceil(AUTO_SYNC_PEER_COOLDOWN / 3600)))
+            -- Show eligible candidates (helpful diagnostic)
+            local reachable = BuildAutoSyncReachable()
+            local now_t = time()
+            local me = MyIdentity()
+            local elig, blocked = 0, 0
+            if ConLogsDB.peerInfo then
+                for name, info in pairs(ConLogsDB.peerInfo) do
+                    if name ~= me and reachable[name] and (info.dbSize or 0) >= AUTO_SYNC_MIN_DBSIZE
+                       and (now_t - (info.lastSeen or 0)) <= AUTO_SYNC_PEER_FRESHNESS then
+                        if (now_t - (info.lastSyncedFrom or 0)) >= AUTO_SYNC_PEER_COOLDOWN
+                           and not activeSyncs[name] then
+                            elig = elig + 1
+                        else
+                            blocked = blocked + 1
+                        end
+                    end
+                end
+            end
+            print(string.format("|cff888888  eligible peers: %d  ·  on cooldown / active: %d|r",
+                elig, blocked))
+        elseif arg == "on" then
+            ConLogsDB.config.autoSync = true
+            print("|cffffaa44ConLogs|r autosync: |cff00ff00ON|r")
+        elseif arg == "off" then
+            ConLogsDB.config.autoSync = false
+            print("|cffffaa44ConLogs|r autosync: |cffff0000OFF|r")
+        else
+            print("|cffffaa44ConLogs|r: usage — /conlogs autosync [on|off|status]")
+        end
+    elseif msg == "refreshpeers" or msg == "refresh" then
+        -- v0.47: ask everyone in guild/group "give me your latest info".
+        -- Each peer running v0.47+ replies with identity + dbSize + version
+        -- so the Scanners leaderboard gets fresh data without having to
+        -- wait for organic gear-scan broadcasts.
+        local ok, info, extra = BroadcastPeerPing()
+        if ok then
+            print(string.format("|cffffaa44ConLogs|r: peer refresh sent on %s — responses will arrive over the next ~5s.", info))
+        elseif info == "cooldown" then
+            print(string.format("|cffffaa44ConLogs|r: peer refresh on cooldown (%ds remaining).", extra))
+        elseif info == "nochannel" then
+            print("|cffffaa44ConLogs|r: peer refresh requires being in a guild or group.")
+        end
+    elseif msg:sub(1, 8) == "syncfrom" then
+        -- Hidden admin command: request another peer to replay their recent
+        -- stored scans. v0.37: extended to party + raid + guild channels.
+        -- Usage:
+        --   /conlogs syncfrom <playerName>         (default: last 7 days)
+        --   /conlogs syncfrom <playerName> 30      (last 30 days)
+        --   /conlogs syncfrom <playerName> 0       (everything the peer has)
+        -- Capped at SYNC_MAX_CONCURRENT (3) simultaneous active syncs so the
+        -- inbound data stream stays manageable.
+        local argStr = msg:sub(10) -- everything after "syncfrom "
+        local name, daysStr = argStr:match("^%s*(%S+)%s*(%S*)%s*$")
+        if not name or name == "" then
+            print("|cffffaa44ConLogs|r: usage — /conlogs syncfrom <playerName> [days]")
+            return
+        end
+        -- Canonical name casing (peer compares UnitName("player") == name exactly)
+        name = name:sub(1, 1):upper() .. name:sub(2):lower()
+        local days = tonumber(daysStr) or 7
+        -- Claude (v1.5.1): delegate to the shared StartSyncFromPeer so
+        -- auto-sync and manual /syncfrom take the same code path.
+        local ok, info, channels, estimatedSets, manifest, chunkCount = StartSyncFromPeer(name, days)
+        if not ok then
+            if info == "active" then
+                print(string.format("|cffffaa44ConLogs|r: already syncing from |cff00ff00%s|r — ~%dm remaining",
+                    name, math.ceil((channels or 0) / 60))) -- 'channels' carries remaining-secs in this branch
+            elseif info == "capped" then
+                print(string.format("|cffffaa44ConLogs|r: already at %d concurrent syncs. Wait for one to finish (varies by peer DB size — see Scanners view for countdowns).",
+                    SYNC_MAX_CONCURRENT))
+            elseif info == "nochannel" then
+                print("|cffffaa44ConLogs|r: sync requires being in a guild or group (request is sent via addon-message channel)")
+            end
+            return
+        end
+        local etaMinutes = math.max(1, math.ceil(info / 60))
+        print(string.format("|cffffaa44ConLogs|r: requested sync from |cff00ff00%s|r (last %d days) via %s. ETA ~%d min (peer has ~%d entries).",
+            name, days, table.concat(channels, "+"), etaMinutes, estimatedSets))
+        local manifestEntries = 0
+        if manifest ~= "" then
+            local _, n = manifest:gsub(";", ";")
+            manifestEntries = n + 1
+        end
+        dprint(string.format("[sync] sent SYNCREQ in %d chunk(s), manifest = %d bytes (%d entries)",
+            chunkCount, #manifest, manifestEntries))
+        if _G.ConLogsBrowserFrame and _G.ConLogsBrowserFrame:IsShown()
+            and _G.ConLogsBrowserFrame.Refresh then
+            _G.ConLogsBrowserFrame.Refresh()
+        end
+    elseif msg == "main" or msg:sub(1, 5) == "main " then
+        -- v0.43: pick which of your characters is your "main" identity.
+        -- v0.44: account-wide persistence (SavedVariables already is, just
+        -- makes that clear in messaging). On rename, retro-rewrite local
+        -- DB scannedBy/peerInfo entries from the old main (or any of your
+        -- known characters) to the new main, so the Scanners view
+        -- consolidates instead of continuing to show stale separate rows.
+        ConLogsDB = ConLogsDB or {}
+        ConLogsDB.config = ConLogsDB.config or {}
+        ConLogsDB.knownChars = ConLogsDB.knownChars or {}
+        local arg = msg:match("^main%s+(.+)$")
+
+        local function knownList()
+            local names = {}
+            for n, _ in pairs(ConLogsDB.knownChars) do names[#names + 1] = n end
+            table.sort(names)
+            return names
+        end
+
+        if not arg then
+            local current = ConLogsDB.config.mainName
+            local me = UnitName("player") or "?"
+            if current then
+                print(string.format("|cffffaa44ConLogs|r: main identity = |cff00ff66%s|r |cff888888(account-wide, persists across all your characters)|r",
+                    current))
+            else
+                print(string.format("|cffffaa44ConLogs|r: main identity = |cffff9966NOT SET|r |cff888888— broadcasts will attribute to whichever character is currently logged in (now: %s).|r",
+                    me))
+            end
+            print("|cff888888  Your known characters:|r " .. table.concat(knownList(), ", "))
+            print("|cff888888  Set:|r /conlogs main <character>   |cff888888|   Clear:|r /conlogs main clear")
+        elseif arg == "clear" or arg == "none" then
+            local oldMain = ConLogsDB.config.mainName
+            ConLogsDB.config.mainName = nil
+            print("|cffffaa44ConLogs|r: main identity cleared — broadcasts now attribute to current character name")
+            if oldMain then
+                print(string.format("|cff888888  Past scans attributed to '%s' keep that name. Future broadcasts use current character name.|r",
+                    oldMain))
+            end
+        else
+            local pick = arg:sub(1, 1):upper() .. arg:sub(2):lower()
+            if not ConLogsDB.knownChars[pick] then
+                print(string.format("|cffffaa44ConLogs|r: |cffff6666%s|r isn't one of your known characters. Log in once on that character first.",
+                    pick))
+                print("|cff888888  Your known:|r " .. table.concat(knownList(), ", "))
+                return
+            end
+            local oldMain = ConLogsDB.config.mainName
+            ConLogsDB.config.mainName = pick
+
+            -- v0.44: consolidate prior scans under the new main. Rewrite any
+            -- scannedBy and peerInfo entries that match (a) the previous
+            -- mainName or (b) any of YOUR known character names — these all
+            -- represent "you" in the mesh, just under different names.
+            -- Other players' scannedBy values are NOT rewritten; this is
+            -- purely a local reattribution of YOUR contributions.
+            local rewriteSet = {}
+            if oldMain and oldMain ~= pick then rewriteSet[oldMain] = true end
+            for charName in pairs(ConLogsDB.knownChars) do
+                if charName ~= pick then rewriteSet[charName] = true end
+            end
+
+            local rewroteScans = 0
+            if ConLogsDB.players then
+                for _, p in pairs(ConLogsDB.players) do
+                    if p.sets then
+                        for _, s in pairs(p.sets) do
+                            if s.scannedBy and rewriteSet[s.scannedBy] then
+                                s.scannedBy = pick
+                                rewroteScans = rewroteScans + 1
+                            end
+                        end
+                    end
+                end
+            end
+
+            local mergedPeers = 0
+            if ConLogsDB.peerInfo then
+                for aliasName in pairs(rewriteSet) do
+                    local info = ConLogsDB.peerInfo[aliasName]
+                    if info then
+                        ConLogsDB.peerInfo[pick] = ConLogsDB.peerInfo[pick] or { dbSize = 0, lastSeen = 0 }
+                        local target = ConLogsDB.peerInfo[pick]
+                        if (info.dbSize or 0) > (target.dbSize or 0) then
+                            target.dbSize = info.dbSize
+                        end
+                        if (info.lastSeen or 0) > (target.lastSeen or 0) then
+                            target.lastSeen = info.lastSeen
+                            target.lastCharName = info.lastCharName or aliasName
+                        end
+                        ConLogsDB.peerInfo[aliasName] = nil
+                        mergedPeers = mergedPeers + 1
+                    end
+                end
+            end
+
+            -- Force fresh self-scan so the new identity hits the wire on the
+            -- next broadcast cycle without waiting for a fingerprint change.
+            lastSelfFingerprint = ""
+            RequestSelfScan()
+
+            print(string.format("|cffffaa44ConLogs|r: main identity = |cff00ff66%s|r |cff888888(account-wide; broadcasts from any of your characters will attribute to this name)|r",
+                pick))
+            if rewroteScans > 0 or mergedPeers > 0 then
+                print(string.format("|cff888888  Consolidated: %d stored scans + %d peer entries from your alts → %s|r",
+                    rewroteScans, mergedPeers, pick))
+            end
+            if _G.ConLogsBrowserFrame and _G.ConLogsBrowserFrame:IsShown()
+                and _G.ConLogsBrowserFrame.Refresh then
+                _G.ConLogsBrowserFrame.Refresh()
+            end
+        end
+    elseif msg:sub(1, 6) == "merge " or msg == "merge" then
+        -- v0.44: admin tool — locally consolidate multiple peer aliases under
+        -- one canonical name. Useful when you can see "Yippee" / "Yippie" /
+        -- "Yiippee" in the Scanners view and know they're the same player
+        -- but they haven't set their main yet. Only affects YOUR local DB.
+        local args = {}
+        for word in (msg:sub(7) or ""):gmatch("%S+") do
+            args[#args + 1] = word
+        end
+        if #args < 2 then
+            print("|cffffaa44ConLogs|r: usage — /conlogs merge <newname> <alias1> [alias2] ...")
+            print("|cff888888  Example:|r /conlogs merge Yippie Yiippee Yippee")
+            print("|cff888888  Locally rewrites scannedBy + peerInfo from aliases into <newname>. Other guildies still see the original names until they run merge too.|r")
+            return
+        end
+        local newName = args[1]:sub(1, 1):upper() .. args[1]:sub(2):lower()
+        local rewriteSet = {}
+        for i = 2, #args do
+            local alias = args[i]:sub(1, 1):upper() .. args[i]:sub(2):lower()
+            if alias ~= newName then rewriteSet[alias] = true end
+        end
+        local rewroteScans = 0
+        if ConLogsDB and ConLogsDB.players then
+            for _, p in pairs(ConLogsDB.players) do
+                if p.sets then
+                    for _, s in pairs(p.sets) do
+                        if s.scannedBy and rewriteSet[s.scannedBy] then
+                            s.scannedBy = newName
+                            rewroteScans = rewroteScans + 1
+                        end
+                    end
+                end
+            end
+        end
+        local mergedPeers = 0
+        if ConLogsDB and ConLogsDB.peerInfo then
+            for aliasName in pairs(rewriteSet) do
+                local info = ConLogsDB.peerInfo[aliasName]
+                if info then
+                    ConLogsDB.peerInfo[newName] = ConLogsDB.peerInfo[newName] or { dbSize = 0, lastSeen = 0 }
+                    local target = ConLogsDB.peerInfo[newName]
+                    if (info.dbSize or 0) > (target.dbSize or 0) then
+                        target.dbSize = info.dbSize
+                    end
+                    if (info.lastSeen or 0) > (target.lastSeen or 0) then
+                        target.lastSeen = info.lastSeen
+                        target.lastCharName = info.lastCharName or aliasName
+                    end
+                    ConLogsDB.peerInfo[aliasName] = nil
+                    mergedPeers = mergedPeers + 1
+                end
+            end
+        end
+        print(string.format("|cffffaa44ConLogs|r: merged %d scan attributions + %d peer entries → |cff00ff66%s|r",
+            rewroteScans, mergedPeers, newName))
+        print("|cff888888  Local-only — other guildies still see the original names until they merge too.|r")
+        if _G.ConLogsBrowserFrame and _G.ConLogsBrowserFrame:IsShown()
+            and _G.ConLogsBrowserFrame.Refresh then
+            _G.ConLogsBrowserFrame.Refresh()
+        end
+    elseif msg == "syncoff" or msg == "syncon" then
+        -- Toggle the responder-side opt-out. When "off", we refuse any
+        -- incoming SYNCREQ regardless of requester. Persists in
+        -- ConLogsDB.config.acceptSync.
+        ConLogsDB = ConLogsDB or {}
+        ConLogsDB.config = ConLogsDB.config or {}
+        if msg == "syncoff" then
+            ConLogsDB.config.acceptSync = false
+            print("|cffffaa44ConLogs|r: sync-response |cffff6666OFF|r — will refuse incoming SYNCREQ. /conlogs syncon to re-enable.")
+        else
+            ConLogsDB.config.acceptSync = true
+            print("|cffffaa44ConLogs|r: sync-response |cff00ff66ON|r — accepting incoming SYNCREQ again.")
+        end
+        if _G.ConLogsBrowserFrame and _G.ConLogsBrowserFrame:IsShown()
+            and _G.ConLogsBrowserFrame.Refresh then
+            _G.ConLogsBrowserFrame.Refresh()
+        end
+    elseif msg:sub(1, 9) == "dumpstats" then
+        -- Diagnostic: print GetItemStats + tooltip lines for equipped slots.
+        -- Lets us see exactly which keys Ascension's client returns for a
+        -- problem item (e.g. items with percent-based custom stats that might
+        -- or might not be in the standard ITEM_MOD_* enum). Usage:
+        --   /conlogs dumpstats        → all 19 slots
+        --   /conlogs dumpstats 10     → just hands
+        local arg = msg:match("^dumpstats%s+(%d+)")
+        local target = tonumber(arg)
+        local slots = target and { target } or {1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19} -- skip 4=shirt
+        local tip = CreateFrame("GameTooltip", "ConLogsDumpStatsTip", UIParent, "GameTooltipTemplate")
+        tip:SetOwner(UIParent, "ANCHOR_NONE")
+        for _, slot in ipairs(slots) do
+            local link = GetInventoryItemLink("player", slot)
+            if link then
+                local name = GetItemInfo(link) or "?"
+                print(string.format("|cffffaa44ConLogs|r slot %d [%s]", slot, name))
+                local stats = GetItemStats and GetItemStats(link)
+                if stats then
+                    local anyKey = false
+                    for k, v in pairs(stats) do
+                        anyKey = true
+                        print(string.format("    GetItemStats: %s = %s", tostring(k), tostring(v)))
+                    end
+                    if not anyKey then print("    GetItemStats: <empty table>") end
+                else
+                    print("    GetItemStats: <nil>")
+                end
+                -- Tooltip-line scan for comparison. Captures lines that
+                -- include a percent or a common stat keyword.
+                tip:ClearLines()
+                tip:SetHyperlink(link)
+                local dumped = 0
+                for i = 2, tip:NumLines() do -- skip line 1 (item name, already printed)
+                    local fs = _G["ConLogsDumpStatsTipTextLeft" .. i]
+                    local text = fs and fs:GetText() or ""
+                    if text ~= "" and (text:find("%%") or text:lower():find("rating") or text:lower():find("increas") or text:lower():find("reduc") or text:lower():find("improv") or text:find("^%+%d")) then
+                        print(string.format("    tip%2d: %s", i, text))
+                        dumped = dumped + 1
+                    end
+                end
+                if dumped == 0 then print("    tooltip: <no stat-like lines matched>") end
+            end
+        end
+        tip:Hide()
+    else
+        ShowHelp()
+    end
+end
