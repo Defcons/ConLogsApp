@@ -67,6 +67,7 @@ local BU_PREFIX     = "[[CL_BU_v1_"   -- buff snapshot (pre-pull auras: self + o
 local LT_PREFIX     = "[[CL_LT_v1_"   -- loot drops (item id/qty/quality/timestamp per row)
 local VR_PREFIX     = "[[CL_VR_v1_"   -- addon version string (one tiny chunk per session)
 local PO_PREFIX     = "[[CL_PO_v1_"   -- pet->owner (deterministic UnitGUID scan; petGUID^owner^ownerGUID rows)
+local DI_PREFIX     = "[[CL_DI_v1_"   -- CoA difficulty context (instance/keystone/affixes/flex) per run
 local LOOT_FLUSH_DELAY = 3.0          -- seconds to batch loot events into one chunk
 local TELEMETRY_INTERVAL = 3.0        -- Claude (v2.5.1): 2.0 -> 3.0s between position snapshots (less per-tick overhead; POS_TTL=5 still covers it)
 local BUFF_POLL_INTERVAL = 3.0        -- seconds between buff-aura polls (catches juju/totem up/down edges)
@@ -142,7 +143,7 @@ local queue = {}
 -- queue[1] is what the next failed cast carries — so new chunks insert among positions 2..N only.
 -- Claude (v2.6.0): PO added at priority 1 (just under VR) — one tiny chunk per snapshot whose
 -- correctness payoff (deterministic pet->owner) is high, so it must not wait behind loot/gear.
-local PRIO_VR, PRIO_PO, PRIO_LT, PRIO_CI, PRIO_BU, PRIO_TS = 0, 1, 2, 3, 4, 5
+local PRIO_VR, PRIO_DI, PRIO_PO, PRIO_LT, PRIO_CI, PRIO_BU, PRIO_TS = 0, 0, 1, 2, 3, 4, 5
 local function enqueue(chunk, onLand, prio)
     prio = prio or PRIO_BU
     local entry = { chunk = chunk, exp = (time() or 0) + CHUNK_TTL, onLand = onLand, prio = prio }
@@ -386,6 +387,68 @@ local function enqueueVersion()
     local ver = (GetAddOnMetadata and GetAddOnMetadata("ConLogs-CoA", "Version")) or "0"
     enqueue(string.format("%s%s_%d_%d/%d]]%s", VR_PREFIX, session, 1, 1, 1, b64encode(ver)),
         function() versionRelayed = true end, PRIO_VR)
+end
+
+--==========================================================================--
+-- difficulty producer (DI) — CoA ONLY. Relays the RUN's difficulty context so the
+-- server can rank a log by instance + keystone level + affixes + flex size. CoA
+-- backports a retail Mythic+ API (C_MythicPlus / MythicPlusUtil / C_Keystones);
+-- GetInstanceInfo alone does NOT distinguish CoA tiers (difficultyName was empty in
+-- a normal Deadmines). All getters are pcall-guarded → if a getter is absent it just
+-- degrades to the GetInstanceInfo fields. Land-gated dedup on CONTENT (not timestamp),
+-- so it relays once per distinct context and re-relays only on change (e.g. keystone
+-- activates, group size changes for flex). Tiny → top priority (PRIO_DI).
+-- Payload: DI|<getTimeMs>|<unixSec>|<name>^<type>^<giDiff>^<maxPlayers>^<group>^<keyActive>^<keyLevel>^<affixCSV>
+-- NOTE: getter RETURN SHAPES (esp. GetCurrentAffixes) are confirmed only for the
+-- empty/out-of-keystone case; refine once a live-keystone `spike coa` run lands.
+--==========================================================================--
+local function safeCall1(tbl, fn) -- returns the FIRST return value of _G[tbl][fn](), or nil
+    local t = _G[tbl]
+    if type(t) == "table" and type(t[fn]) == "function" then
+        local ok, a = pcall(t[fn])
+        if ok then return a end
+    end
+    return nil
+end
+
+local relayedDI = nil
+local diSnapId  = 0
+local function enqueueDifficulty(force)
+    local name, itype, giDiff, maxP = "", "", 0, 0
+    if type(GetInstanceInfo) == "function" then
+        local n, ty, d, _dn, mp = GetInstanceInfo()
+        name, itype, giDiff, maxP = n or "", ty or "", d or 0, mp or 0
+    end
+    if name == "" then return 0 end -- not in an instance → nothing to relay
+    local groupN = (GetNumRaidMembers and GetNumRaidMembers()) or 0
+    if groupN == 0 then groupN = ((GetNumPartyMembers and GetNumPartyMembers()) or 0) + 1 end
+    local keyActive = safeCall1("C_MythicPlus", "IsKeystoneActive") and 1 or 0
+    local kl = safeCall1("MythicPlusUtil", "GetActiveKeystoneLevel")
+    local keyLevel = (type(kl) == "number") and kl or 0
+    -- affixes: shape TBD → defensively collect numeric ids from the returned table
+    local affixes, aff = {}, safeCall1("C_MythicPlus", "GetCurrentAffixes")
+    if type(aff) == "table" then
+        for _, v in ipairs(aff) do
+            if type(v) == "number" then affixes[#affixes + 1] = v
+            elseif type(v) == "table" then
+                local id = v.id or v.affixID or v.affixId or v[1]
+                if type(id) == "number" then affixes[#affixes + 1] = id end
+            end
+        end
+    end
+    local key = string.format("%s^%s^%d^%d^%d^%d^%d^%s",
+        name, tostring(itype), giDiff, maxP, groupN, keyActive, keyLevel, table.concat(affixes, ","))
+    if not force and key == relayedDI then return 0 end
+    local body = string.format("DI|%d|%d|%s", math.floor((GetTime() or 0) * 1000), time() or 0, key)
+    diSnapId = diSnapId + 1
+    local committed, b64 = key, b64encode(body)
+    local total = math.max(1, math.ceil(#b64 / CHUNK_BODY))
+    for i = 1, total do
+        local piece = b64:sub((i - 1) * CHUNK_BODY + 1, i * CHUNK_BODY)
+        enqueue(string.format("%s%s_%d_%d/%d]]%s", DI_PREFIX, session, diSnapId, i, total, piece),
+            (i == total) and function() relayedDI = committed end or nil, PRIO_DI)
+    end
+    return total
 end
 
 --==========================================================================--
@@ -1177,7 +1240,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
         -- pet->owner snapshot too (deterministic attribution; dedup keeps it cheap).
         -- Claude (v3.0.0): startRaidConsumeScan() only ARMS the spread scan — the OnUpdate drains
         -- it a few units/frame, so the pull frame itself no longer eats the whole-raid aura read.
-        if active then enqueueGroupCI(false); enqueueBuffs(false); startRaidConsumeScan(); enqueueVersion(); enqueuePetOwners(false) end
+        if active then enqueueGroupCI(false); enqueueBuffs(false); startRaidConsumeScan(); enqueueVersion(); enqueuePetOwners(false); enqueueDifficulty(false) end
     elseif event == "UNIT_PET" or event == "RAID_ROSTER_UPDATE" or event == "PARTY_MEMBERS_CHANGED" then
         -- Claude (v2.6.0): a pet was summoned/dismissed/resummoned (new GUID) or the roster
         -- changed (a member's pet may now be readable, or a new petN slot appeared) — re-scan
