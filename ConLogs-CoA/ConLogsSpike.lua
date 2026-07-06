@@ -561,7 +561,7 @@ local function cmdCoa()
         end
     end
     table.sort(gHits)
-    out("keystone/mythic/affix/challenge globals: " .. (#gHits > 0 and table.concat(gHits, ", ") or "(none)"))
+    out("keystone/mythic/affix globals: " .. #gHits .. " found (full list stored to SV)")
 
     -- Enumerate the CoA M+ API surface (method names) AND auto-call the likely no-arg
     -- getters (pcall-guarded) so one run reveals how to read keystone level / affixes /
@@ -595,9 +595,10 @@ local function cmdCoa()
             end
             table.sort(keys)
             apiMethods[tn] = keys
-            out(tn .. ": " .. (#keys > 0 and table.concat(keys, ", ") or "(empty)"))
+            out("  " .. tn .. ": " .. #keys .. " methods (stored)")
         end
     end
+    -- The getter RETURNS are the useful bit — keep these in chat (short).
     for name, ret in pairs(apiCalls) do out("  call " .. name .. "() -> " .. ret) end
 
     ConLogsSpikeDB = ConLogsSpikeDB or {}
