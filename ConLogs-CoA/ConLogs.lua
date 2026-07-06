@@ -770,6 +770,10 @@ end
 -- disregarded as cosmetic. Slot 17 (offhand) is conditionally required:
 -- only when slot 16 doesn't hold a 2-hand weapon.
 local REQUIRED_GEAR_SLOTS = { 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18 }
+-- CoA fork: don't require a COMPLETE set — leveling characters have empty slots, and we
+-- want their gear captured at any level. Just require a modest minimum of equipped slots
+-- so a naked/near-naked scan isn't stored. (Tunable.)
+local COA_MIN_EQUIPPED_SLOTS = 5
 local GEAR_SLOT_NAMES = {
     [1] = "head",     [2] = "neck",     [3] = "shoulder",
     [5] = "chest",    [6] = "waist",    [7] = "legs",     [8] = "feet",
@@ -830,19 +834,16 @@ end
 -- swapping titan grip configs etc. Also gates on average ilvl > 55 to
 -- keep leveling-gear scans out of the mesh.
 local function CheckFullSet(gearLookup)
+    -- CoA: count equipped required slots instead of demanding a full set, and DROP the
+    -- avg-ilvl floor — leveling gear is valid data here. Only a near-naked scan is skipped.
+    local filled = 0
     for _, slot in ipairs(REQUIRED_GEAR_SLOTS) do
         local v = gearLookup(slot)
-        if not v or v == "" then
-            return false, string.format("missing %s (slot %d)",
-                GEAR_SLOT_NAMES[slot] or "?", slot)
-        end
+        if v and v ~= "" then filled = filled + 1 end
     end
-    -- ilvl gate. If we have enough valid ilvl reads (≥10 slots), enforce
-    -- the average minimum. Sparser reads (cache miss on most items) skip
-    -- the check defensively — next scan will catch it once items resolve.
-    local avg, samples = AverageIlvl(gearLookup)
-    if samples >= 10 and avg < MIN_AVG_ILVL then
-        return false, string.format("avg ilvl %.1f < %d (leveling gear)", avg, MIN_AVG_ILVL)
+    if filled < COA_MIN_EQUIPPED_SLOTS then
+        return false, string.format("only %d/%d required slots equipped (< %d)",
+            filled, #REQUIRED_GEAR_SLOTS, COA_MIN_EQUIPPED_SLOTS)
     end
     return true
 end
