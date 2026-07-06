@@ -430,6 +430,8 @@ local addonStartedLog    = false
 -- v1.7.11: tracks the instance-type from the previous zone change so we
 -- can detect "left a raid instance" transitions. Set by the event handler.
 local wasInRaid          = false
+local wasInInstance      = false        -- CoA: track ANY instance (party/raid) so auto-log starts on entry + stops on leave
+local wasGrouped         = false        -- CoA: track group membership so leaving a group stops auto-log (but solo runs aren't)
 local logStartTime       = nil          -- v1.7.5: GetTime() when StartLogging was called; nil = never started this run
 local logEndTime         = nil          -- v1.7.5: GetTime() when StopLogging was called; used to freeze the timer at the stopped value
 local promptShown        = false        -- per-run flag: have we already shown the Yes/No prompt?
@@ -1391,11 +1393,26 @@ end
 -- Event wiring
 -- ============================================================================
 
+-- CoA: stop a /combatlog WE auto-started (only ours — never a user's manual log).
+local function StopAutoLog(reason)
+    if not addonStartedLog then return end
+    if LoggingCombat then LoggingCombat(false) end
+    loggingActive   = false
+    addonStartedLog = false
+    ConLogsDB = ConLogsDB or {}
+    ConLogsDB.session = ConLogsDB.session or {}
+    ConLogsDB.session.addonStartedLog = false
+    logEndTime = GetTime()
+    print(string.format("|cffffd200ConLogs|r |cffff9966AUTO-LOG STOPPED|r |cff888888(%s) — /combatlog closed.|r", tostring(reason)))
+end
+
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
 eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 eventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 eventFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+eventFrame:RegisterEvent("PARTY_MEMBERS_CHANGED") -- CoA: stop auto-log on leaving group
+eventFrame:RegisterEvent("RAID_ROSTER_UPDATE")    -- CoA: stop auto-log on leaving raid group
 
 eventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "PLAYER_LOGIN" then
@@ -1437,26 +1454,28 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         -- were in a raid and now aren't, stop the log if WE started it
         -- (addonStartedLog). Done BEFORE the dungeon-detect branch so
         -- the order is: detect-leave-raid first, then maybe enter-new.
-        local _, currentInstanceType = nil, nil
-        if IsInInstance then
-            _, currentInstanceType = IsInInstance()
-        end
-        local nowInRaid = (currentInstanceType == "raid")
-        if wasInRaid and not nowInRaid and addonStartedLog then
-            -- We own the running /combatlog and have just exited the
-            -- raid. Stop it.
-            if LoggingCombat then LoggingCombat(false) end
-            loggingActive = false
-            addonStartedLog = false
-            ConLogsDB = ConLogsDB or {}
+        -- CoA auto-log: log EVERY instance (party or raid) — CoA has no per-dungeon
+        -- roster to gate on, and difficulty rides the DI relay chunk instead. Auto-START
+        -- on entering an instance, auto-STOP on leaving it. Only ever touches a log WE
+        -- started (addonStartedLog); a user's manual /combatlog is left alone.
+        local inInst, itype = false, nil
+        if IsInInstance then inInst, itype = IsInInstance() end
+        local nowInInstance = inInst and (itype == "party" or itype == "raid")
+        if nowInInstance and not wasInInstance and not addonStartedLog
+           and ConLogsDB and ConLogsDB.config and ConLogsDB.config.raidAutoLog
+           and not IsLoggingActive() then
+            if LoggingCombat then LoggingCombat(true) end
+            loggingActive   = true
+            addonStartedLog = true
             ConLogsDB.session = ConLogsDB.session or {}
-            ConLogsDB.session.addonStartedLog = false
-            print("|cffffaa44=======================================|r")
-            print("|cffffd200ConLogs|r |cffff9966RAID AUTO-LOG STOPPED|r")
-            print("  |cff888888Left raid instance - /combatlog closed.|r")
-            print("|cffffaa44=======================================|r")
+            ConLogsDB.session.addonStartedLog = true
+            logStartTime = GetTime()
+            print("|cffffd200ConLogs|r |cff66ff66AUTO-LOG STARTED|r |cff888888(instance) — auto-stops on leaving the instance or group. /conlogs raidlog off to disable.|r")
+        elseif not nowInInstance and wasInInstance and addonStartedLog then
+            StopAutoLog("left the instance")
         end
-        wasInRaid = nowInRaid
+        wasInInstance = nowInInstance
+        wasInRaid = (itype == "raid") -- kept for any legacy references
 
         local detected = DetectDungeon()
         if detected then
@@ -1470,6 +1489,18 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             if currentDungeon then OnLeaveDungeon() end
         end
         if frame and frame:IsShown() then frame.UpdateUI() end
+        return
+    end
+
+    if event == "PARTY_MEMBERS_CHANGED" or event == "RAID_ROSTER_UPDATE" then
+        -- CoA: leaving the group entirely stops an auto-log we started. Edge-triggered
+        -- (grouped -> ungrouped) so a SOLO instance run isn't stopped by this.
+        local grouped = (((GetNumRaidMembers and GetNumRaidMembers()) or 0) > 0)
+            or (((GetNumPartyMembers and GetNumPartyMembers()) or 0) > 0)
+        if wasGrouped and not grouped and addonStartedLog then
+            StopAutoLog("left the group")
+        end
+        wasGrouped = grouped
         return
     end
 
