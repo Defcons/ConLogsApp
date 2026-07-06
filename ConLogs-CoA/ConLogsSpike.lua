@@ -563,14 +563,52 @@ local function cmdCoa()
     table.sort(gHits)
     out("keystone/mythic/affix/challenge globals: " .. (#gHits > 0 and table.concat(gHits, ", ") or "(none)"))
 
+    -- Enumerate the CoA M+ API surface (method names) AND auto-call the likely no-arg
+    -- getters (pcall-guarded) so one run reveals how to read keystone level / affixes /
+    -- difficulty and what they return. Run in an ACTUAL M+ keystone dungeon for live values.
+    local API_TABLES = { "C_Challenge", "C_Keystones", "C_MythicPlus", "ChallengeUtil",
+        "MythicPlusUtil", "WeeklyKeystoneMixin", "KeystoneAffixMixin" }
+    local apiMethods, apiCalls = {}, {}
+    local function briefret(r)
+        local parts = {}
+        for i = 2, math.min(#r, 8) do
+            local v = r[i]
+            parts[#parts + 1] = (type(v) == "table") and "{table}" or tostring(v)
+        end
+        return "(" .. table.concat(parts, ", ") .. ")"
+    end
+    for _, tn in ipairs(API_TABLES) do
+        local t = _G[tn]
+        if type(t) == "table" then
+            local keys = {}
+            for k, v in pairs(t) do
+                keys[#keys + 1] = tostring(k) .. "(" .. type(v) .. ")"
+                if type(v) == "function" then
+                    local lk = tostring(k):lower()
+                    if lk:find("keystone",1,true) or lk:find("affix",1,true) or lk:find("active",1,true)
+                        or lk:find("level",1,true) or lk:find("current",1,true) or lk:find("difficult",1,true)
+                        or lk:find("owned",1,true) or lk:find("map",1,true) then
+                        local r = { pcall(v) }
+                        if r[1] and #r > 1 then apiCalls[tn .. "." .. tostring(k)] = briefret(r) end
+                    end
+                end
+            end
+            table.sort(keys)
+            apiMethods[tn] = keys
+            out(tn .. ": " .. (#keys > 0 and table.concat(keys, ", ") or "(empty)"))
+        end
+    end
+    for name, ret in pairs(apiCalls) do out("  call " .. name .. "() -> " .. ret) end
+
     ConLogsSpikeDB = ConLogsSpikeDB or {}
     ConLogsSpikeDB.coaProbe = {
         when = date and date("%Y-%m-%d %H:%M:%S") or time(),
         realm = realm, zone = zone, groupSize = groupN,
         instance = { name = iname, type = itype, difficulty = idiff, difficultyName = idiffName, maxPlayers = imax },
         bagKeystones = keyHits, affixAuras = auraHits, globals = gHits,
+        apiMethods = apiMethods, apiCalls = apiCalls,
     }
-    out("Stored to ConLogsSpikeDB.coaProbe. Re-run at each difficulty + a flex raid, then /conlogs spike dump + send me the SV file.")
+    out("Stored to ConLogsSpikeDB.coaProbe. Best run: inside an ACTIVE M+ keystone dungeon (+ a heroic/mythic raid). Then /conlogs spike dump + send me the SV file.")
 end
 
 local function spikeHelp()
