@@ -398,7 +398,7 @@ end
 -- degrades to the GetInstanceInfo fields. Land-gated dedup on CONTENT (not timestamp),
 -- so it relays once per distinct context and re-relays only on change (e.g. keystone
 -- activates, group size changes for flex). Tiny → top priority (PRIO_DI).
--- Payload: DI|<getTimeMs>|<unixSec>|<name>^<type>^<giDiff>^<maxPlayers>^<group>^<keyActive>^<keyLevel>^<affixCSV>
+-- Payload: DI|<getTimeMs>|<unixSec>|<name>^<type>^<giDiff>^<maxPlayers>^<group>^<keyActive>^<keyLevel>^<affixCSV>^<mapAreaID>^<dungeonID>
 -- NOTE: getter RETURN SHAPES (esp. GetCurrentAffixes) are confirmed only for the
 -- empty/out-of-keystone case; refine once a live-keystone `spike coa` run lands.
 --==========================================================================--
@@ -422,27 +422,27 @@ local function enqueueDifficulty(force)
     if name == "" then return 0 end -- not in an instance → nothing to relay
     local groupN = (GetNumRaidMembers and GetNumRaidMembers()) or 0
     if groupN == 0 then groupN = ((GetNumPartyMembers and GetNumPartyMembers()) or 0) + 1 end
-    local keyActive = safeCall1("C_MythicPlus", "IsKeystoneActive") and 1 or 0
-    local kl = safeCall1("MythicPlusUtil", "GetActiveKeystoneLevel")
-    local keyLevel = (type(kl) == "number") and kl or 0
-    -- Affixes only apply to an ACTIVE keystone. GetCurrentAffixes returns the WEEKLY
-    -- pool regardless (confirmed: it populated on a normal run), so only include them
-    -- when keyActive — else a normal/heroic run would falsely carry affixes.
-    local affixes = {}
-    if keyActive == 1 then
-        local aff = safeCall1("C_MythicPlus", "GetCurrentAffixes")
-        if type(aff) == "table" then
-            for _, v in ipairs(aff) do
-                if type(v) == "number" then affixes[#affixes + 1] = v
-                elseif type(v) == "table" then
-                    local id = v.id or v.affixID or v.affixId or v[1]
-                    if type(id) == "number" then affixes[#affixes + 1] = id end
-                end
+    -- CoA M+: GetActiveKeystoneInfo() returns { keystoneLevel, dungeonID, rewardMultiplier,
+    -- activeAffixes={ids} } (confirmed shape). One clean call for level + dungeon + affixes;
+    -- level/dungeonID are 0 outside a keystone. Affixes only apply to an ACTIVE keystone.
+    local keyLevel, dungeonID, affixes = 0, 0, {}
+    local info = safeCall1("C_MythicPlus", "GetActiveKeystoneInfo")
+    if type(info) == "table" then
+        keyLevel  = tonumber(info.keystoneLevel) or 0
+        dungeonID = tonumber(info.dungeonID) or 0
+        if keyLevel > 0 and type(info.activeAffixes) == "table" then
+            for _, v in ipairs(info.activeAffixes) do
+                if type(v) == "number" then affixes[#affixes + 1] = v end
             end
         end
     end
-    local key = string.format("%s^%s^%d^%d^%d^%d^%d^%s",
-        name, tostring(itype), giDiff, maxP, groupN, keyActive, keyLevel, table.concat(affixes, ","))
+    local keyActive = (keyLevel > 0) and 1 or (safeCall1("C_MythicPlus", "IsKeystoneActive") and 1 or 0)
+    -- mapAreaID identifies the current area/wing (e.g. SM Library) so the server can resolve
+    -- the run's GOAL/final boss from static CoA data — the API doesn't expose it for normals.
+    local mapAreaID = (type(GetCurrentMapAreaID) == "function" and GetCurrentMapAreaID()) or 0
+    local key = string.format("%s^%s^%d^%d^%d^%d^%d^%s^%s^%s",
+        name, tostring(itype), giDiff, maxP, groupN, keyActive, keyLevel,
+        table.concat(affixes, ","), tostring(mapAreaID), tostring(dungeonID))
     if not force and key == relayedDI then return 0 end
     local body = string.format("DI|%d|%d|%s", math.floor((GetTime() or 0) * 1000), time() or 0, key)
     diSnapId = diSnapId + 1
