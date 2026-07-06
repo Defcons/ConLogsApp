@@ -91,8 +91,10 @@ local INSPECT_INTERVAL      = 2.5
 local BROADCAST_STAGGER     = 0.5
 local MAX_CHUNK_BODY        = 200
 local ROSTER_TICK           = 10
-local MIN_INSPECT_LEVEL     = 60
-local MIN_STORE_LEVEL       = 60
+-- CoA fork: no level gate (was 60 on Epoch). CoA content is done/scaled below the
+-- old cap, so gear data is worth capturing at any level. Set to 1 to save/scan all.
+local MIN_INSPECT_LEVEL     = 1
+local MIN_STORE_LEVEL       = 1
 -- Claude: MIN_STORE_EQUIPPED removed in v1.3.3 — replaced by the per-slot
 -- CheckFullSet gate (defined near ItemStringFromLink), which requires every
 -- "useful" slot rather than a numeric threshold.
@@ -266,7 +268,10 @@ local REALITY_AURA_NAME = "Reality Recalibrators"
 -- Flag kept (rather than removed) so we can re-test if server behavior
 -- changes — flipping false is a one-line revert. Diagnostic surfaces
 -- (status command, browser banner, minimap tooltip) still honor the flag.
-local REQUIRE_REALITY_AURA = true
+-- CoA fork: FALSE — Conquest of Azeroth has no Reality Recalibrators / transmog
+-- gate, so auto-inspect always runs and the aura UI is suppressed (see the
+-- `if REQUIRE_REALITY_AURA` guards on the tooltip + status/aura command).
+local REQUIRE_REALITY_AURA = false
 
 -- v1.1.7+: track whether we've ever seen the aura active this session.
 -- Used to suppress the "aura not active" hint for users who clearly
@@ -3729,14 +3734,14 @@ SlashCmdList["CONLOGS"] = function(msg)
             current and UnitName(current.unit) or "none",
             tostring(InCombatLockdown()),
             ZoneType()))
-        -- v1.2: surface aura status as part of the standard status output
-        if HasRealityAura() then
-            print(string.format("  |cff00ff66%s aura: ACTIVE|r — auto-inspect enabled", REALITY_AURA_NAME))
-        elseif REQUIRE_REALITY_AURA then
-            print(string.format("  |cffff6666%s aura: NOT ACTIVE|r — auto-inspect of groupmates paused (transmog hides true gear)", REALITY_AURA_NAME))
-        else
-            -- Claude (v1.4.1 test): aura interlock disabled, scanning anyway to test settle+verify
-            print(string.format("  |cffffaa00%s aura: NOT ACTIVE|r — |cffff9966TEST MODE|r: scanning anyway (settle+verify validation)", REALITY_AURA_NAME))
+        -- v1.2: surface aura status as part of the standard status output.
+        -- CoA has no Reality Recalibrators gate → skip this line entirely.
+        if REQUIRE_REALITY_AURA then
+            if HasRealityAura() then
+                print(string.format("  |cff00ff66%s aura: ACTIVE|r — auto-inspect enabled", REALITY_AURA_NAME))
+            else
+                print(string.format("  |cffff6666%s aura: NOT ACTIVE|r — auto-inspect of groupmates paused (transmog hides true gear)", REALITY_AURA_NAME))
+            end
         end
     elseif msg == "cache" then
         print(string.format("|cffffaa44ConLogs|r cache: %d items known, %d pending client fetch",
@@ -3956,19 +3961,17 @@ SlashCmdList["CONLOGS"] = function(msg)
         -- realityAuraHintShown flag so the one-time hint can fire again
         -- next time ScanRoster sees a group without the aura — useful if
         -- the user toggles the aura off/on across sessions.
-        if HasRealityAura() then
+        if not REQUIRE_REALITY_AURA then
+            -- CoA: no transmog gate — auto-inspect always runs at any level.
+            print("|cffffaa44ConLogs|r: Reality Recalibrators gate is not used on CoA — auto-inspect of groupmates is always enabled.")
+        elseif HasRealityAura() then
             print(string.format("|cffffaa44ConLogs|r: |cff00ff66%s|r aura |cff00ff66ACTIVE|r — auto-inspect of groupmates enabled.",
                 REALITY_AURA_NAME))
-        elseif REQUIRE_REALITY_AURA then
+        else
             print(string.format("|cffffaa44ConLogs|r: |cffff9966%s|r aura |cffff6666NOT ACTIVE|r — auto-inspect of groupmates is paused.",
                 REALITY_AURA_NAME))
             print("|cff888888  Without the aura, Ascension's transmog hides true gear from inspect. Self-scans still work normally.|r")
             realityAuraHintShown = false
-        else
-            -- Claude (v1.4.1 test): aura interlock disabled
-            print(string.format("|cffffaa44ConLogs|r: |cffff9966%s|r aura |cffff6666NOT ACTIVE|r — |cffffaa00TEST MODE|r: scanning anyway.",
-                REALITY_AURA_NAME))
-            print("|cff888888  v1.4.1 test build: validating whether the 400ms settle + 1.5s verify pass is enough on its own to filter out transmog visual reads. Self-scans always work.|r")
         end
     elseif msg == "dummy" then
         -- Claude (v1.6.1 internal, future v1.7.0 release): toggle the dummy-parse frame. Frame also auto-opens

@@ -1504,17 +1504,16 @@ local function BuildBrowser()
         -- doesn't mislead users when the gate is disabled for testing.
         local requires = (_G.ConLogs and _G.ConLogs.RequiresRealityAura
             and _G.ConLogs.RequiresRealityAura()) or false
-        if has then
+        if not requires then
+            -- CoA: no Reality Recalibrators / transmog gate → hide the banner entirely.
+            f.auraStatus:SetText("")
+        elseif has then
             f.auraStatus:SetText(string.format(
                 "|cff66ff66✓ %s active|r |cff888888— auto-inspect enabled|r",
                 auraName))
-        elseif requires then
-            f.auraStatus:SetText(string.format(
-                "|cffff6666✗ %s missing|r |cffff9966— auto-inspect paused (transmog hides true gear)|r",
-                auraName))
         else
             f.auraStatus:SetText(string.format(
-                "|cffff6666✗ %s missing|r |cffffaa00— TEST MODE: scanning anyway|r",
+                "|cffff6666✗ %s missing|r |cffff9966— auto-inspect paused (transmog hides true gear)|r",
                 auraName))
         end
     end
@@ -2604,27 +2603,23 @@ local function BuildMinimapButton()
             GameTooltip:AddLine("nothing is being recorded — type /combatlog", 1, 0.7, 0.4)
             GameTooltip:AddLine("(auto-starts on raid entry)", 0.6, 0.6, 0.6)
         end
-        GameTooltip:AddLine(" ")
-        -- v1.2: prominent aura status line so users see at-a-glance whether
-        -- auto-inspect is functional just by hovering the minimap button.
-        local has = (_G.ConLogs and _G.ConLogs.HasRealityAura
-            and _G.ConLogs.HasRealityAura()) or false
-        local auraName = (_G.ConLogs and _G.ConLogs.RealityAuraName) or "Reality Recalibrators"
-        -- Claude (v1.4.1 test): honor the aura interlock flag so the tooltip
-        -- doesn't claim "auto-inspect paused" when the gate is disabled.
+        -- Reality Recalibrators status — only shown when the gate is required
+        -- (Epoch). CoA has no transmog gate, so this block is skipped entirely.
         local requires = (_G.ConLogs and _G.ConLogs.RequiresRealityAura
             and _G.ConLogs.RequiresRealityAura()) or false
-        if has then
-            GameTooltip:AddLine(string.format("%s: ACTIVE", auraName), 0.4, 1, 0.4)
-            GameTooltip:AddLine("auto-inspect of groupmates enabled", 0.6, 0.6, 0.6)
-        elseif requires then
-            GameTooltip:AddLine(string.format("%s: NOT ACTIVE", auraName), 1, 0.4, 0.4)
-            GameTooltip:AddLine("auto-inspect paused — Ascension transmog", 1, 0.6, 0.4)
-            GameTooltip:AddLine("hides true gear without this aura", 1, 0.6, 0.4)
-        else
-            GameTooltip:AddLine(string.format("%s: NOT ACTIVE", auraName), 1, 0.4, 0.4)
-            GameTooltip:AddLine("TEST MODE — scanning anyway", 1, 0.7, 0.3)
-            GameTooltip:AddLine("(v1.4.1 settle+verify validation)", 0.6, 0.6, 0.6)
+        if requires then
+            local has = (_G.ConLogs and _G.ConLogs.HasRealityAura
+                and _G.ConLogs.HasRealityAura()) or false
+            local auraName = (_G.ConLogs and _G.ConLogs.RealityAuraName) or "Reality Recalibrators"
+            GameTooltip:AddLine(" ")
+            if has then
+                GameTooltip:AddLine(string.format("%s: ACTIVE", auraName), 0.4, 1, 0.4)
+                GameTooltip:AddLine("auto-inspect of groupmates enabled", 0.6, 0.6, 0.6)
+            else
+                GameTooltip:AddLine(string.format("%s: NOT ACTIVE", auraName), 1, 0.4, 0.4)
+                GameTooltip:AddLine("auto-inspect paused — Ascension transmog", 1, 0.6, 0.4)
+                GameTooltip:AddLine("hides true gear without this aura", 1, 0.6, 0.4)
+            end
         end
         GameTooltip:AddLine(" ")
         GameTooltip:AddLine("Left-click: open the armory browser", 1, 1, 1)
