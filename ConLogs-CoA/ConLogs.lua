@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.2.1"
+local ADDON_VERSION = "0.2.2"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -1404,6 +1404,48 @@ local function ParseTalentRanks(s)
     return out
 end
 
+-- Claude (v0.2.2): CoA Character Advancement build capture. CoA does NOT use
+-- the legacy 3.3.5 talent API (GetTalentInfo/GetTalentTabInfo return empty for
+-- CoA classes — that's the {0,0,0} the legacy ReadSpecPoints/BuildTalentRanks
+-- produce) and it does NOT use retail Dragonflight C_Traits. It uses
+-- Ascension's custom C_CharacterAdvancement essence/loadout system (the same
+-- one that powers ascension.gg/v2/builder/coa). We capture the real build:
+--   * self  → C_CharacterAdvancement.ExportBuild(true): the compact build
+--             string the ascension.gg/coalogs builder decodes. Prefixed "E:".
+--   * other → C_CharacterAdvancement.GetInspectedBuild(unit, spec): a list of
+--             {EntryId, Rank} learned entries. Encoded "L:id:rank,id:rank,...".
+-- Returns build, spec (both strings; "" when CA is unavailable or has no data).
+-- Non-player units require a prior C_CharacterAdvancement.InspectUnit(unit)
+-- (fired at NotifyInspect time in TryInspect); if that async query hasn't
+-- resolved by the settle-window BuildPayload, the build comes back "" and the
+-- next inspect cycle captures it. Legacy field 41 (BuildTalentRanks) is left
+-- in place for backward-compat; on CoA classes it just carries empty tabs.
+local function EncodeCABuild(unit)
+    local CA = C_CharacterAdvancement
+    if type(CA) ~= "table" then return "", "" end
+    -- Strip wire-control chars (^ separator, | item-link escape) defensively.
+    local function clean(s) return (tostring(s or "")):gsub("[%^|]", "") end
+    if UnitIsUnit(unit, "player") then
+        local spec = CA.GetActiveSpecID and CA.GetActiveSpecID() or ""
+        if not CA.ExportBuild then return "", tostring(spec) end
+        local build = CA.ExportBuild(true)
+        if not build or build == "" then return "", tostring(spec) end
+        return "E:" .. clean(build), tostring(spec)
+    else
+        if not (CA.GetInspectInfo and CA.GetInspectedBuild) then return "", "" end
+        local spec = CA.GetInspectInfo(unit)
+        if not spec then return "", "" end
+        local build = CA.GetInspectedBuild(unit, spec)
+        if type(build) ~= "table" then return "", tostring(spec) end
+        local parts = {}
+        for _, e in ipairs(build) do
+            if e.EntryId then parts[#parts + 1] = e.EntryId .. ":" .. (e.Rank or 1) end
+        end
+        if #parts == 0 then return "", tostring(spec) end
+        return "L:" .. table.concat(parts, ","), tostring(spec)
+    end
+end
+
 -- v1.3: capture per-class talent tree METADATA (name, icon, tier, column,
 -- maxRank for each talent) into a new account-wide SavedVariable. The
 -- broadcast wire only carries ranks (position 41) — metadata is too big
@@ -1830,6 +1872,16 @@ local function BuildPayload(unit, guid)
     -- Append-only: pre-v2.5 receivers ignore the trailing field.
     local _, raceFile = UnitRace(unit)
     parts[#parts + 1] = raceFile or ""
+    -- Claude (v0.2.2): wire positions 45/46 — CoA Character Advancement build.
+    -- Field 45 = active CA spec id; field 46 = the build (self: "E:"+ExportBuild
+    -- compact string; inspected units: "L:"+id:rank list). This is the REAL
+    -- talent/ability build for CoA classes, replacing the dead legacy talent
+    -- read (field 41 stays empty on CoA). Server-side decode powers coalogs.com.
+    -- Append-only: pre-v0.2.2 receivers ignore the trailing fields. See
+    -- EncodeCABuild.
+    local caBuild, caSpec = EncodeCABuild(unit)
+    parts[#parts + 1] = caSpec
+    parts[#parts + 1] = caBuild
     -- v1.3: capture talent metadata locally for this class (name, icon,
     -- tier, column, maxRank per talent). Stored in ConLogsTalentTreeDB.
     -- Doesn't go on the wire — it's bulky and stable per-class. Each
@@ -2077,6 +2129,13 @@ local function ParsePayload(payload)
     if t[44] and t[44] ~= "" then
         entry.race = t[44]
     end
+    -- Claude (v0.2.2): wire positions 45/46 — CoA Character Advancement build.
+    -- 45 = active CA spec id, 46 = encoded build ("E:"+compact for self scans,
+    -- "L:"+id:rank list for inspected units). Stored raw on the set; server-side
+    -- decode into coalogs.com maps entry IDs → talents via the CoA node DB.
+    -- Absent on pre-v0.2.2 / non-CoA payloads.
+    if t[45] and t[45] ~= "" then entry.caSpec = t[45] end
+    if t[46] and t[46] ~= "" then entry.caBuild = t[46] end
     if entry.name == "" or entry.guid == "" then return nil end
     return entry
 end
@@ -2238,6 +2297,13 @@ local function Ingest(payload, sender)
         -- website's interactive talent tree. Receiver maps talent index →
         -- name/tier/column via class talent tree metadata.
         talentRanks = entry.talentRanks,
+        -- Claude (v0.2.2): CoA Character Advancement build (wire pos 45/46) —
+        -- the real talent/ability build for CoA classes. caBuild = "E:"+compact
+        -- ExportBuild string (self scans) or "L:"+id:rank list (inspected). The
+        -- server decodes this into coalogs.com; the raw wire is also replayable
+        -- verbatim via rawPayload above.
+        caSpec  = entry.caSpec,
+        caBuild = entry.caBuild,
         -- Claude (v1.4.4): live character stats from UnitStat-derived
         -- snapshot at scan time (wire pos 43). Lets the Stats panel show
         -- real character-pane values (base + items + buffs + talents)
@@ -2786,6 +2852,15 @@ local function TryInspect()
     end
     current = { guid = entry.guid, unit = entry.unit, startedAt = now() }
     NotifyInspect(entry.unit)
+    -- Claude (v0.2.2): warm the CoA Character Advancement inspect data in
+    -- parallel with the gear inspect, so GetInspectedBuild(unit, ...) has data
+    -- by the settle-window BuildPayload. Best-effort — the result arrives
+    -- asynchronously via INSPECT_CHARACTER_ADVANCEMENT_RESULT; if it hasn't
+    -- landed by settle time the CA build is absent this scan and the next
+    -- inspect cycle captures it. See EncodeCABuild.
+    if type(C_CharacterAdvancement) == "table" and C_CharacterAdvancement.InspectUnit then
+        C_CharacterAdvancement.InspectUnit(entry.unit)
+    end
     dprint(string.format("[inspect] START: %s L%d — NotifyInspect sent (%d left in queue)",
         name, UnitLevel(entry.unit) or 0, #queue))
 end
@@ -3952,8 +4027,22 @@ SlashCmdList["CONLOGS"] = function(msg)
                 sumDefault, sumGroup1, nt))
         end
         local s1, s2, s3 = ReadSpecPoints("player")
-        print(string.format("  ReadSpecPoints(player) = %d / %d / %d → DominantTree = %d",
+        print(string.format("  ReadSpecPoints(player) = %d / %d / %d → DominantTree = %d  |cff888888(legacy API — empty on CoA classes)|r",
             s1, s2, s3, DominantTree({s1, s2, s3})))
+        -- Claude (v0.2.2): CoA Character Advancement read — the real talent
+        -- source on this client. Confirms EncodeCABuild captures a build.
+        local CA = C_CharacterAdvancement
+        if type(CA) == "table" then
+            local activeSpec = CA.GetActiveSpecID and CA.GetActiveSpecID() or "?"
+            local nEntries = CA.GetAllEntries and #CA.GetAllEntries() or 0
+            local caBuild, caSpec = EncodeCABuild("player")
+            print(string.format("  |cff44ff88C_CharacterAdvancement|r present: activeSpec=%s  totalEntries=%d",
+                tostring(activeSpec), nEntries))
+            print(string.format("  EncodeCABuild(player) spec=%s  build(%d bytes)=%s",
+                tostring(caSpec), #caBuild, caBuild == "" and "(empty)" or caBuild:sub(1, 120) .. (#caBuild > 120 and "…" or "")))
+        else
+            print("  |cffff4444C_CharacterAdvancement NOT present|r — this client has no CoA talent API")
+        end
     elseif msg == "aura" then
         -- v1.1.7: explicit aura status check. Also resets the
         -- realityAuraHintShown flag so the one-time hint can fire again
