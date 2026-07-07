@@ -398,7 +398,13 @@ end
 -- degrades to the GetInstanceInfo fields. Land-gated dedup on CONTENT (not timestamp),
 -- so it relays once per distinct context and re-relays only on change (e.g. keystone
 -- activates, group size changes for flex). Tiny → top priority (PRIO_DI).
--- Payload: DI|<getTimeMs>|<unixSec>|<name>^<type>^<giDiff>^<maxPlayers>^<group>^<keyActive>^<keyLevel>^<affixCSV>^<mapAreaID>^<dungeonID>
+-- Payload: DI|<getTimeMs>|<unixSec>|<name>^<type>^<giDiff>^<maxPlayers>^<group>^<keyActive>^<keyLevel>^<affixCSV>^<mapAreaID>^<dungeonID>^<difficultyName>
+-- Claude (v2.7.1): difficultyName appended as the LAST field. On CoA the named tier
+-- (Normal/Heroic/Mythic/Ascended) is picked at a portal/NPC, so GetInstanceInfo's 4th
+-- return (difficultyName) carries it — the server reads it directly, no giDiff mapping.
+-- Empty for content with no tier choice (e.g. a plain normal dungeon) → server falls
+-- back to prompting the uploader. Appended last so older servers ignoring extra fields
+-- keep parsing; the empty-string case is a valid trailing field.
 -- NOTE: getter RETURN SHAPES (esp. GetCurrentAffixes) are confirmed only for the
 -- empty/out-of-keystone case; refine once a live-keystone `spike coa` run lands.
 --==========================================================================--
@@ -414,10 +420,13 @@ end
 local relayedDI = nil
 local diSnapId  = 0
 local function enqueueDifficulty(force)
-    local name, itype, giDiff, maxP = "", "", 0, 0
+    local name, itype, giDiff, maxP, diffName = "", "", 0, 0, ""
     if type(GetInstanceInfo) == "function" then
-        local n, ty, d, _dn, mp = GetInstanceInfo()
+        -- Claude (v2.7.1): capture difficultyName (4th return) — CoA's named tier. Was
+        -- discarded here; it's the field the server uses to auto-fill difficulty.
+        local n, ty, d, dn, mp = GetInstanceInfo()
         name, itype, giDiff, maxP = n or "", ty or "", d or 0, mp or 0
+        diffName = dn or ""
     end
     if name == "" then return 0 end -- not in an instance → nothing to relay
     local groupN = (GetNumRaidMembers and GetNumRaidMembers()) or 0
@@ -440,9 +449,9 @@ local function enqueueDifficulty(force)
     -- mapAreaID identifies the current area/wing (e.g. SM Library) so the server can resolve
     -- the run's GOAL/final boss from static CoA data — the API doesn't expose it for normals.
     local mapAreaID = (type(GetCurrentMapAreaID) == "function" and GetCurrentMapAreaID()) or 0
-    local key = string.format("%s^%s^%d^%d^%d^%d^%d^%s^%s^%s",
+    local key = string.format("%s^%s^%d^%d^%d^%d^%d^%s^%s^%s^%s",
         name, tostring(itype), giDiff, maxP, groupN, keyActive, keyLevel,
-        table.concat(affixes, ","), tostring(mapAreaID), tostring(dungeonID))
+        table.concat(affixes, ","), tostring(mapAreaID), tostring(dungeonID), diffName)
     if not force and key == relayedDI then return 0 end
     local body = string.format("DI|%d|%d|%s", math.floor((GetTime() or 0) * 1000), time() or 0, key)
     diSnapId = diSnapId + 1

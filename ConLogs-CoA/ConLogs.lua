@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.1.0"
+local ADDON_VERSION = "0.2.1"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -3710,10 +3710,7 @@ local function ShowHelp()
     print("  /conlogs merge <newname> <alias1> [alias2] ... — locally re-attribute scans from peer aliases to one canonical name")
     print("  /conlogs refreshpeers  — ping guildmates for fresh identity + DB-size info (Scanners-view leaderboard)")
     print("  /conlogs autosync [on|off|status] — background catch-up sync from reachable peers (default: on, 24h per-peer cooldown)")
-    print("  /conlogs dummy         — toggle the Training Dummy parse-validator frame (auto-opens when targeting a dummy in a city)")
-    print("  /conlogs testvalidate  — jump straight to the Validate button to test the marker mechanism (no full 1:30 fight needed)")
-    print("  /conlogs dungeon       — toggle the Dungeon speedrun status frame (auto-opens when entering a tracked dungeon)")
-    print("  /conlogs raidlog [on|off|status] — auto-start /combatlog on raid entry (default: on; raids tracked: Onyxia's Lair)")
+    print("  /conlogs raidlog [on|off|status] — auto-start /combatlog on entering any instance (default: on; auto-stops on leaving the instance/group)")
     print("  /conlogs aura          — check if Reality Recalibrators aura is active (gates auto-inspect of groupmates)")
     print("  /conlogs dump <name>   — diagnostic dump of every layer (itemstring, GetItemInfo, GetItemStats, cache) for each slot of a stored player")
     print("|cff888888  Source + releases: github.com/Defcons/ConLogsApp|r")
@@ -3974,42 +3971,7 @@ SlashCmdList["CONLOGS"] = function(msg)
             print("|cff888888  Without the aura, Ascension's transmog hides true gear from inspect. Self-scans still work normally.|r")
             realityAuraHintShown = false
         end
-    elseif msg == "dummy" then
-        -- Claude (v1.6.1 internal, future v1.7.0 release): toggle the dummy-parse frame. Frame also auto-opens
-        -- when targeting a Training Dummy in a rested area; this is the
-        -- manual fallback if the user closed it.
-        if _G.ConLogsDummy_Toggle then
-            _G.ConLogsDummy_Toggle()
-        else
-            print("|cffffaa44ConLogs|r: dummy module not loaded")
-        end
-    elseif msg == "testvalidate" then
-        -- Claude (v1.7.1): jump straight into the validate-button state
-        -- so the user can test the marker mechanism without a full
-        -- 1:30 dummy parse. Skips aura validation + post-combat
-        -- timeout; just exercises the click-to-CLEU round-trip.
-        if _G.ConLogsDummy_TestValidate then
-            _G.ConLogsDummy_TestValidate()
-        else
-            print("|cffffaa44ConLogs|r: dummy module not loaded")
-        end
-    elseif msg == "dungeon" then
-        -- Claude (v1.7.3): toggle the Dungeon speedrun status frame.
-        -- Frame also auto-opens when entering a tracked dungeon.
-        if _G.ConLogsDungeon_Toggle then
-            _G.ConLogsDungeon_Toggle()
-        else
-            print("|cffffaa44ConLogs|r: dungeon module not loaded")
-        end
-    elseif msg == "dungeondebug" then
-        -- Claude (v1.7.3): dump detection state. Use when auto-open
-        -- isn't firing — tells us what GetInstanceInfo returns and
-        -- whether the name matches the DUNGEONS table.
-        if _G.ConLogsDungeon_Debug then
-            _G.ConLogsDungeon_Debug()
-        else
-            print("|cffffaa44ConLogs|r: dungeon module not loaded")
-        end
+    -- (CoA: dungeon-run tracker + training-dummy commands removed — not applicable.)
     elseif msg == "raidlog" or msg:sub(1, 8) == "raidlog " then
         -- Claude (v1.7.7): toggle raid auto-log (start /combatlog
         -- automatically on entering a raid instance, e.g. Onyxia's
@@ -4021,14 +3983,14 @@ SlashCmdList["CONLOGS"] = function(msg)
             local enabled = ConLogsDB.config.raidAutoLog
             print(string.format("|cffffaa44ConLogs|r raidlog: %s",
                 enabled and "|cff00ff00ON|r" or "|cffff0000OFF|r"))
-            print("  When ON, /combatlog starts automatically the moment you enter a raid instance (currently: Onyxia's Lair).")
+            print("  When ON, /combatlog auto-starts on entering any instance and auto-stops on leaving the instance or group.")
             print("  Toggle: /conlogs raidlog on  |  /conlogs raidlog off")
         elseif arg == "on" or arg == "true" or arg == "1" then
             ConLogsDB.config.raidAutoLog = true
-            print("|cffffaa44ConLogs|r raidlog: |cff00ff00ON|r - /combatlog will auto-start on raid entry.")
+            print("|cffffaa44ConLogs|r raidlog: |cff00ff00ON|r - /combatlog auto-starts on entering any instance.")
         elseif arg == "off" or arg == "false" or arg == "0" then
             ConLogsDB.config.raidAutoLog = false
-            print("|cffffaa44ConLogs|r raidlog: |cffff0000OFF|r - raid entry will prompt Yes/No like dungeons.")
+            print("|cffffaa44ConLogs|r raidlog: |cffff0000OFF|r - instances will no longer auto-start /combatlog.")
         else
             print("|cffffaa44ConLogs|r raidlog: unknown arg '" .. arg .. "'. Use on / off / status.")
         end

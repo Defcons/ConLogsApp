@@ -2553,20 +2553,7 @@ local function BuildMinimapButton()
         -- Falls through to the slash command if the module global isn't
         -- loaded (defensive — module files might not have parsed if a
         -- Lua error halted them).
-        add("Open Dummy parse", function()
-            if _G.ConLogsDummy_Toggle then
-                _G.ConLogsDummy_Toggle()
-            else
-                SlashCmdList["CONLOGS"]("dummy")
-            end
-        end)
-        add("Open Dungeon run", function()
-            if _G.ConLogsDungeon_Toggle then
-                _G.ConLogsDungeon_Toggle()
-            else
-                SlashCmdList["CONLOGS"]("dungeon")
-            end
-        end)
+        -- (CoA: dungeon-run + training-dummy menu entries removed — features not applicable.)
         add("Status",       function() SlashCmdList["CONLOGS"]("status") end)
         add("Toggle Debug", function() SlashCmdList["CONLOGS"]("debug") end)
         add("Help",         function() SlashCmdList["CONLOGS"]("") end)

@@ -1,14 +1,13 @@
 ## Interface: 30300
 ## Title: ConLogs-CoA
-## Notes: ConLogs for Conquest of Azeroth (CoA). Sibling of ConLogs-Epoch. Mesh gear inspector + combat-log relay (gear/talents/buffs/positions/loot). CoA difficulty/keystone/flex support in progress.
+## Notes: ConLogs for Conquest of Azeroth (CoA). Sibling of ConLogs-Epoch. Mesh gear inspector + combat-log relay (gear/talents/buffs/positions/loot + CoA difficulty/keystone). Auto-logs instances.
 ## X-Credits: Made by Defcon
 ## Author: Defcon
-## Version: 0.1.0
+## Version: 0.2.1
 ## SavedVariables: ConLogsDB, ConLogsItemCacheDB, ConLogsTalentTreeDB, ConLogsSpikeDB
 
 ConLogs.lua
 ConLogsUI.lua
-ConLogsDummy.lua
-ConLogsDungeon.lua
+ConLogsAutoLog.lua
 ConLogsRelay.lua
 ConLogsSpike.lua
