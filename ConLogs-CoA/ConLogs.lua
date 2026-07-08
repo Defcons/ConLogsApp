@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.2.7"
+local ADDON_VERSION = "0.2.8"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -4256,6 +4256,41 @@ SlashCmdList["CONLOGS"] = function(msg)
                                 merged[#merged + 1] = e
                                 extra = extra + 1
                             end
+                        end
+                    end
+                end
+            end
+        end
+        -- GetTalentsByClass returns TALENT nodes only; a build also contains
+        -- ABILITY nodes, which neither it nor GetAllEntries may include. Resolve
+        -- any node id that appears in a captured build — this char's live builds
+        -- (all specs) plus every stored caBuild in ConLogsDB — directly via
+        -- GetEntryByInternalID, so picked nodes always have map metadata. The
+        -- map thus grows to cover whatever the mesh has actually seen picked.
+        if CA.GetEntryByInternalID then
+            local function addID(id)
+                id = tonumber(id)
+                if id and not seen[id] then
+                    local ok, e = pcall(CA.GetEntryByInternalID, id)
+                    if ok and type(e) == "table" and e.ID then
+                        seen[id] = true
+                        merged[#merged + 1] = e
+                        extra = extra + 1
+                    end
+                end
+            end
+            local function scanList(s)
+                if type(s) == "string" then for id in s:gmatch("(%d+):%d+") do addID(id) end end
+            end
+            if CA.GetInspectedBuild then
+                CoaBuild.Warm()
+                for spec = 1, 6 do scanList(CoaBuild.InspectedList(CA.GetInspectedBuild("player", spec))) end
+            end
+            if ConLogsDB and type(ConLogsDB.players) == "table" then
+                for _, p in pairs(ConLogsDB.players) do
+                    if type(p) == "table" and type(p.sets) == "table" then
+                        for _, s in pairs(p.sets) do
+                            if type(s) == "table" then scanList(s.caBuild) end
                         end
                     end
                 end
