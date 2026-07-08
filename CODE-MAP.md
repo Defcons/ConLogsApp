@@ -154,7 +154,9 @@ Load order is set by each addon's `.toc`. Epoch: `ConLogs.lua` → `ConLogsUI.lu
   Bearskin/Natural Efficiency) swept over all DBC class×spec combos, ∪ `GetAllEntries` ∪
   `GetEntryByInternalID` over every seen pick. Per node: id, name, icon(basename), nodeType, x/y
   (custom classes, integer grid 0–10 × 0–9) or col/row (default), **`connected[]` = THE tree edges**
-  (from `entry.ConnectedNodes`; `parent`/`requires` are near-empty — NOT the edges), `group` (choice).
+  (from `entry.ConnectedNodes`; `parent`/`requires` are near-empty — NOT the edges), `group` (choice),
+  `desc`. **`entry.Description` is EMPTY on CoA** → `desc` is resolved via `GetSpellDescription(spells[1])`
+  at export (v0.3.5); in-game tooltips get it free from `SetSpellByID`, so this is export-only.
   `tools/extract_coa_talent_tree.py` → `coa_talent_tree.json` for the site; `COA_TALENTS_CONTRACT.md`.
 - **<coa-ingame-tree>**: `ConLogsUI.lua` `RenderCoA`/`RenderCoATab`/`coaNodeSet`/`coaApplyShape` draw
   the node-graph in the Talents panel (source: `coaExport`, live `GetEntriesByClass` fallback),
