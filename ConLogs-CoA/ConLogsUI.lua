@@ -994,30 +994,36 @@ local function BuildTalentFrame()
         end
     end
 
-    -- Claude (v0.2.9): CoA (Character Advancement) render path. CoA classes
-    -- have no legacy talentRanks (wire field 41 is empty) — their build is
-    -- set.caBuild ("L:nodeId:rank,..."). We resolve each picked node LIVE via
-    -- C_CharacterAdvancement.GetEntryByInternalID (always available in-game for
-    -- any id, incl. classes GetAllEntries omits like Wildwalker), group by the
-    -- node's spec tab, and flow the picked talents into a per-spec icon grid.
-    -- Independent of the legacy tier/column grid above.
-    local COA_COLS = 5
+    -- Claude (v0.2.9→v0.3.0): CoA (Character Advancement) render path. CoA
+    -- classes have no legacy talentRanks (wire field 41 is empty) — their build
+    -- is set.caBuild ("L:nodeId:rank,..."). We render the actual spec tree:
+    -- fetch the full node set for the character's class+spec LIVE via
+    -- C_CharacterAdvancement.GetTalentsByClass (works for any class incl.
+    -- Wildwalker), position each node on its real x/y grid, draw the connecting
+    -- lines from each node's ConnectedNodes, and highlight the character's picks
+    -- (from caBuild). Independent of the legacy tier/column grid above.
+    local COA_NODE = 26          -- node icon size
+    local COA_COLW = 30          -- x-grid column pitch (x: 0..10)
+    local COA_ROWH = 46          -- y-grid row pitch (y: 0..9)
+    local COA_AREA_X = 18        -- grid origin from frame TOPLEFT
+    local COA_AREA_Y = -84
     t.coaPool = {}
+    t.coaEdges = {}
     local function coaCell(i)
         local c = t.coaPool[i]
         if c then return c end
         c = CreateFrame("Frame", nil, t)
         c:EnableMouse(true)
-        c:SetWidth(t._CELL); c:SetHeight(t._CELL)
-        c.bg = c:CreateTexture(nil, "BACKGROUND")
+        c:SetWidth(COA_NODE); c:SetHeight(COA_NODE)
+        c.bg = c:CreateTexture(nil, "BORDER")
         c.bg:SetAllPoints(c)
         c.bg:SetTexture("Interface\\Buttons\\WHITE8X8")
         c.icon = c:CreateTexture(nil, "ARTWORK")
         c.icon:SetPoint("TOPLEFT", 2, -2)
         c.icon:SetPoint("BOTTOMRIGHT", -2, 2)
         c.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-        c.rankText = c:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        c.rankText:SetPoint("BOTTOMRIGHT", c, "BOTTOMRIGHT", -1, 2)
+        c.rankText = c:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        c.rankText:SetPoint("BOTTOMRIGHT", c, "BOTTOMRIGHT", -1, 1)
         c.rankText:SetShadowOffset(1, -1)
         c:SetScript("OnEnter", function(self)
             if not self.talentName then return end
@@ -1027,7 +1033,8 @@ local function BuildTalentFrame()
             else
                 GameTooltip:SetText(self.talentName, 1, 1, 1)
             end
-            GameTooltip:AddLine(string.format("Rank %d / %d", self.talentRank or 0, self.talentMaxRank or 0), 0.4, 1, 0.4)
+            GameTooltip:AddLine(string.format("Rank %d / %d", self.talentRank or 0, self.talentMaxRank or 0),
+                0.4, 1, 0.4)
             GameTooltip:Show()
         end)
         c:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1035,99 +1042,151 @@ local function BuildTalentFrame()
         return c
     end
 
-    -- Parse "L:id:rank,..." → byTab { [tabName] = { {name,icon,rank,maxRank,spellID}, } }, ordered tab list.
+    -- Parse "L:id:rank,..." → pickRank { [id]=rank } plus the ordered list of the
+    -- character's (classDBC, specDBC, displayName) tabs, derived from the picked
+    -- entries themselves via GetEntryByInternalID.
     function t.ResolveCoA(caBuild)
         local CA = C_CharacterAdvancement
         if type(caBuild) ~= "string" or type(CA) ~= "table" or not CA.GetEntryByInternalID then return nil end
-        local byTab, order = {}, {}
+        local pick, tabs, seen = {}, {}, {}
         for idStr, rankStr in caBuild:gmatch("(%d+):(%d+)") do
             local id, rank = tonumber(idStr), tonumber(rankStr)
+            pick[id] = rank
             local e = CA.GetEntryByInternalID(id)
-            if e then
-                local spells = e.Spells
-                if type(spells) == "string" then
-                    local tt = {}; for s in spells:gmatch("%d+") do tt[#tt + 1] = tonumber(s) end; spells = tt
-                elseif type(spells) == "number" then spells = { spells } end
-                local spellID = spells and (spells[rank] or spells[1])
-                local icon = spellID and GetSpellInfo and select(3, GetSpellInfo(spellID)) or nil
-                local tab = e.Tab or "?"
-                if not byTab[tab] then byTab[tab] = {}; order[#order + 1] = tab end
-                local list = byTab[tab]
-                list[#list + 1] = { name = e.Name or ("#" .. id), icon = icon, rank = rank, maxRank = (spells and #spells) or 1, spellID = spellID }
+            if e and e.Class and e.Tab then
+                local key = e.Class .. "|" .. e.Tab
+                if not seen[key] then
+                    seen[key] = true
+                    tabs[#tabs + 1] = { class = e.Class, tab = e.Tab, name = e.Tab }
+                end
             end
         end
-        if #order == 0 then return nil end
-        return byTab, order
+        if not next(pick) then return nil end
+        return pick, tabs
+    end
+
+    local function coaSpells(raw)
+        if type(raw) == "table" then return raw end
+        if type(raw) == "number" then return { raw } end
+        if type(raw) == "string" then
+            local tt = {}; for s in raw:gmatch("%d+") do tt[#tt + 1] = tonumber(s) end; return tt
+        end
+        return nil
     end
 
     function t.RenderCoATab(idx)
         for _, c in ipairs(t.coaPool) do c:Hide() end
+        for _, ln in ipairs(t.coaEdges) do ln:Hide() end
         for i, tb in ipairs(t.tabBtns) do
             if tb:IsShown() then if i == idx then tb:LockHighlight() else tb:UnlockHighlight() end end
         end
-        local order = t._coaOrder
-        if not order then return end
-        local tab = order[idx]
-        local list = tab and t._coaByTab[tab]
-        if not list then return end
-        t.subtitle:SetText(string.format("|cffffd200%s|r |cff888888%d talents|r", tostring(tab), #list))
-        local CELL = t._CELL
-        local GAP, startX, startY = 8, 24, -86
-        for i, node in ipairs(list) do
-            local cell = coaCell(i)
-            local coln = (i - 1) % COA_COLS
-            local rown = math.floor((i - 1) / COA_COLS)
-            cell:ClearAllPoints()
-            cell:SetPoint("TOPLEFT", t, "TOPLEFT", startX + coln * (CELL + GAP), startY - rown * (CELL + GAP))
-            cell.talentName, cell.talentRank, cell.talentMaxRank, cell.spellID =
-                node.name, node.rank, node.maxRank, node.spellID
-            cell.icon:SetTexture((node.icon and node.icon ~= "") and node.icon or "Interface\\Icons\\INV_Misc_QuestionMark")
-            cell.icon:SetDesaturated(false)
-            if node.maxRank and node.maxRank > 1 then
-                cell.rankText:SetText(tostring(node.rank))
-                if node.rank >= node.maxRank then
-                    cell.bg:SetVertexColor(1.0, 0.78, 0.18, 1); cell.rankText:SetTextColor(1, 0.95, 0.55)
+        local info = t._coaTabs and t._coaTabs[idx]
+        if not info then return end
+        local CA = C_CharacterAdvancement
+        local full = CA.GetTalentsByClass and CA.GetTalentsByClass(info.class, info.tab, true)
+        if type(full) ~= "table" then
+            t.subtitle:SetText(string.format("|cffffd200%s|r |cff888888(tree unavailable)|r", tostring(info.name)))
+            return
+        end
+        local pick = t._coaPick or {}
+        local spent = 0
+        local center = {} -- id → {cx, cy} node centers for edge drawing
+        local ci = 0
+        for _, e in ipairs(full) do
+            if e.ID then
+                local x = e.PositionX or e.Column or 0
+                local y = e.PositionY or e.Row or 0
+                local cx = COA_AREA_X + x * COA_COLW
+                local cy = COA_AREA_Y - y * COA_ROWH
+                ci = ci + 1
+                local cell = coaCell(ci)
+                cell:ClearAllPoints()
+                cell:SetPoint("TOPLEFT", t, "TOPLEFT", cx, cy)
+                local spells = coaSpells(e.Spells)
+                local rank = pick[e.ID]
+                local maxRank = (spells and #spells) or 1
+                local spellID = spells and (spells[rank or 1] or spells[1])
+                cell.talentName = e.Name or ("#" .. e.ID)
+                cell.talentRank = rank or 0
+                cell.talentMaxRank = maxRank
+                cell.spellID = spellID
+                cell.icon:SetTexture(spellID and GetSpellInfo and select(3, GetSpellInfo(spellID))
+                    or "Interface\\Icons\\INV_Misc_QuestionMark")
+                if rank and rank > 0 then
+                    cell.icon:SetDesaturated(false)
+                    spent = spent + rank
+                    if maxRank > 1 then
+                        cell.rankText:SetText(tostring(rank))
+                        if rank >= maxRank then cell.bg:SetVertexColor(1.0, 0.78, 0.18, 1); cell.rankText:SetTextColor(1, 0.95, 0.55)
+                        else cell.bg:SetVertexColor(0.18, 0.78, 0.22, 1); cell.rankText:SetTextColor(0.5, 1, 0.5) end
+                    else
+                        cell.rankText:SetText("")
+                        cell.bg:SetVertexColor(0.9, 0.72, 0.2, 1)
+                    end
                 else
-                    cell.bg:SetVertexColor(0.18, 0.78, 0.22, 1); cell.rankText:SetTextColor(0.5, 1, 0.5)
+                    cell.icon:SetDesaturated(true)
+                    cell.rankText:SetText("")
+                    cell.bg:SetVertexColor(0.14, 0.14, 0.14, 1)
                 end
-            else
-                cell.rankText:SetText("")
-                cell.bg:SetVertexColor(0.25, 0.5, 0.9, 1) -- ability (single-rank) = blue edge
+                cell:Show()
+                center[e.ID] = { cx + COA_NODE / 2, cy - COA_NODE / 2 }
             end
-            cell:Show()
+        end
+        t.subtitle:SetText(string.format("|cffffd200%s|r |cff888888%d points|r", tostring(info.name), spent))
+        -- connecting lines from each node's ConnectedNodes. Requires the modern
+        -- Line object (frame:CreateLine) — backported on this client; if absent
+        -- we skip edges and just show positioned nodes.
+        if t.CreateLine then
+            local ei = 0
+            for _, e in ipairs(full) do
+                local a = e.ID and center[e.ID]
+                local conn = e.ConnectedNodes
+                if a and type(conn) == "table" then
+                    for _, tid in ipairs(conn) do
+                        local b = center[tid]
+                        if b then
+                            ei = ei + 1
+                            local ln = t.coaEdges[ei]
+                            if not ln then ln = t:CreateLine(nil, "ARTWORK"); t.coaEdges[ei] = ln end
+                            if ln.SetThickness then ln:SetThickness(2) end
+                            if ln.SetColorTexture then ln:SetColorTexture(0.85, 0.78, 0.4, 0.85) end
+                            ln:ClearAllPoints()
+                            ln:SetStartPoint("TOPLEFT", t, a[1], a[2])
+                            ln:SetEndPoint("TOPLEFT", t, b[1], b[2])
+                            ln:Show()
+                        end
+                    end
+                end
+            end
         end
     end
 
     function t.RenderCoA(caBuild)
         t.coaMode = true
-        -- hide every legacy visual
         for _, c in pairs(t.gridCells) do c:Hide() end
         t._hideAllArrows()
         for _, lbl in ipairs(t.tierLabels) do lbl:Hide() end
         t.bgLeft:Hide(); t.bgRight:Hide()
         t.emptyText:Hide()
-        local byTab, order = t.ResolveCoA(caBuild)
-        t._coaByTab, t._coaOrder = byTab, order
-        if not byTab then
+        local pick, tabs = t.ResolveCoA(caBuild)
+        t._coaPick, t._coaTabs = pick, tabs
+        if not pick or not tabs or #tabs == 0 then
             for _, tb in ipairs(t.tabBtns) do tb:Hide() end
             for _, c in ipairs(t.coaPool) do c:Hide() end
+            for _, ln in ipairs(t.coaEdges) do ln:Hide() end
             t.subtitle:SetText("")
             t.emptyText:SetText("No CoA talent data resolved for this character.")
             t.emptyText:Show()
             return
         end
         for i, tb in ipairs(t.tabBtns) do
-            local name = order[i]
-            if name then
-                local lbl = name; if #lbl > 9 then lbl = lbl:sub(1, 8) .. "." end
+            local info = tabs[i]
+            if info then
+                local lbl = info.name; if #lbl > 9 then lbl = lbl:sub(1, 8) .. "." end
                 tb:SetText(lbl); tb:Show()
             else
                 tb:Hide()
             end
-        end
-        if #order > #t.tabBtns then
-            -- more specs than tab buttons (rare) — the extra ones aren't shown
-            t.title:SetText(t.title:GetText()) -- no-op guard; extras simply omitted
         end
         t.RenderCoATab(1)
     end
