@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.3.4"
+local ADDON_VERSION = "0.3.5"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -4306,12 +4306,21 @@ SlashCmdList["CONLOGS"] = function(msg)
         for _, e in ipairs(merged) do
             if e.ID then
                 local spells = spellList(e.Spells)
+                -- Tooltip text for the website. entry.Description is empty on
+                -- CoA, so resolve the spell's real description via
+                -- GetSpellDescription (rank-1 spell). In-game tooltips already
+                -- get this from SetSpellByID; this is only for the export.
+                local desc = e.Description
+                if (not desc or desc == "") and spells and spells[1] and GetSpellDescription then
+                    local d = GetSpellDescription(spells[1])
+                    if d and d ~= "" then desc = d end
+                end
                 n = n + 1
                 nodes[n] = {
                     id       = e.ID,
                     name     = e.Name,
                     icon     = iconKey(spells and spells[1]),
-                    desc     = e.Description,
+                    desc     = desc,
                     type     = e.Type,           -- "Talent" / "Ability"
                     nodeType = e.NodeType,        -- shape (square/circle/choice/…)
                     maxRank  = spells and #spells or 1,
