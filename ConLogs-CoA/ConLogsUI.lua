@@ -1095,7 +1095,8 @@ local function BuildTalentFrame()
             if #out > 0 then return out end
         end
         local CA = C_CharacterAdvancement
-        local live = CA.GetTalentsByClass and CA.GetTalentsByClass(classDBC, tabDBC, true)
+        local byClass = CA.GetEntriesByClass or CA.GetTalentsByClass
+        local live = byClass and byClass(classDBC, tabDBC, false)
         if type(live) ~= "table" then return nil end
         local out = {}
         for _, e in ipairs(live) do

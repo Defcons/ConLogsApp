@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.3.2"
+local ADDON_VERSION = "0.3.3"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -4245,10 +4245,16 @@ SlashCmdList["CONLOGS"] = function(msg)
         for _, e in ipairs(CA.GetAllEntries()) do
             if e.ID and not seen[e.ID] then seen[e.ID] = true; merged[#merged + 1] = e end
         end
-        if CA.GetTalentsByClass then
+        -- Sweep GetEntriesByClass (the API the in-game tree itself uses — it
+        -- returns the FULL node set for a class/tab: talents AND abilities).
+        -- GetTalentsByClass returns talents only, which silently dropped ability
+        -- nodes like "Bearskin"/"Natural Efficiency". Fall back to
+        -- GetTalentsByClass on clients without GetEntriesByClass.
+        local byClass = CA.GetEntriesByClass or CA.GetTalentsByClass
+        if byClass then
             for _, c in ipairs(CA_CLASSES) do
                 for _, s in ipairs(CA_SPECS) do
-                    local ok, list = pcall(CA.GetTalentsByClass, c, s, true)
+                    local ok, list = pcall(byClass, c, s, false)
                     if ok and type(list) == "table" then
                         for _, e in ipairs(list) do
                             if e.ID and not seen[e.ID] then
