@@ -3843,7 +3843,12 @@ SlashCmdList["CONLOGS"] = function(msg)
                 p.class or "?", p.name or "?", p.level or 0, p.zone or "?",
                 p.scannedBy or "?", date("%Y-%m-%d %H:%M", p.scanTime or 0)))
         end
-    elseif msg:sub(1, 4) == "dump" then
+    elseif msg == "dump" or msg:sub(1, 5) == "dump " then
+        -- Claude (v0.2.2): guard tightened from `msg:sub(1,4)=="dump"` — the
+        -- bare 4-char prefix swallowed every dump* command (dumpspec, dumpstats,
+        -- dumpentries), routing them here and printing the usage error instead
+        -- of reaching their own handlers below. Now only the real `dump <name>`
+        -- command matches.
         -- v1.2: forensic diagnostic. Dumps every layer of what we know about
         -- a stored player's gear so we can find where transmog data is
         -- bleeding through. For each of the 19 slots, prints:
