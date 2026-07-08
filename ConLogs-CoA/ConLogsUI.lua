@@ -1120,20 +1120,19 @@ local function BuildTalentFrame()
         end
         local info = t._coaTabs and t._coaTabs[idx]
         if not info then return end
-        -- spec background art (mountain scene), behind everything
-        if not t.coaBg then
-            t.coaBg = t:CreateTexture(nil, "BACKGROUND")
-            t.coaBg:SetPoint("TOPLEFT", t, "TOPLEFT", 12, -78)
-            t.coaBg:SetPoint("BOTTOMRIGHT", t, "BOTTOMRIGHT", -12, 14)
-            t.coaBg:SetAlpha(0.5)
+        -- background scene (behind everything), shared across all this
+        -- character's tabs — computed once in RenderCoA (see there for why).
+        if not t.coaBgTex then
+            t.coaBgTex = t:CreateTexture(nil, "BACKGROUND")
+            t.coaBgTex:SetPoint("TOPLEFT", t, "TOPLEFT", 12, -78)
+            t.coaBgTex:SetPoint("BOTTOMRIGHT", t, "BOTTOMRIGHT", -12, 14)
+            t.coaBgTex:SetAlpha(0.5)
         end
-        local cau = CharacterAdvancementUtil
-        local atlas
-        if cau and cau.GetBackgroundAtlas and cau.GetClassFileByDBC and cau.GetSpecFileByDBC and t.coaBg.SetAtlas then
-            local cf, sf = cau.GetClassFileByDBC(info.class), cau.GetSpecFileByDBC(info.tab)
-            if cf and sf then atlas = cau.GetBackgroundAtlas(cf, sf) end
+        if t._coaBgAtlas and t.coaBgTex.SetAtlas then
+            t.coaBgTex:SetAtlas(t._coaBgAtlas); t.coaBgTex:Show()
+        else
+            t.coaBgTex:Hide()
         end
-        if atlas then t.coaBg:SetAtlas(atlas); t.coaBg:Show() else t.coaBg:Hide() end
 
         local nodes = coaNodeSet(info.class, info.tab)
         if not nodes then
@@ -1230,6 +1229,22 @@ local function BuildTalentFrame()
                 tb:SetText(lbl); tb:Show()
             else
                 tb:Hide()
+            end
+        end
+        -- Pick ONE background scene for the character and share it across all
+        -- tabs. Real specs (Primal/Geomancy/…) have a talents-background atlas;
+        -- the Class/General tabs don't, but the in-game UI shows the spec's
+        -- scene behind them too — and without a background the greyed/unpicked
+        -- nodes are invisible against the dark panel (which read as "missing").
+        t._coaBgAtlas = nil
+        local cau = CharacterAdvancementUtil
+        if cau and cau.GetClassFileByDBC and cau.GetSpecFileByDBC and AtlasUtil and AtlasUtil.AtlasExists then
+            for _, info in ipairs(tabs) do
+                local cf, sf = cau.GetClassFileByDBC(info.class), cau.GetSpecFileByDBC(info.tab)
+                if cf and sf then
+                    local name = "talents-background-" .. cf:lower() .. "-" .. sf:lower()
+                    if AtlasUtil:AtlasExists(name) then t._coaBgAtlas = name; break end
+                end
             end
         end
         t.RenderCoATab(1)
