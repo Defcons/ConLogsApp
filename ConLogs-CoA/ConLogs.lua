@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.2.6"
+local ADDON_VERSION = "0.2.7"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -4204,8 +4204,65 @@ SlashCmdList["CONLOGS"] = function(msg)
             local f = Enum.CharacterAdvancementFlag[key]
             return (f and bit.contains(flags, f)) or false
         end
-        local nodes, n = {}, 0
+        -- Collect entries from BOTH GetAllEntries (bulk) AND GetTalentsByClass
+        -- over every class/spec DBC combo, unioned + deduped by entry id.
+        -- GetAllEntries omits some custom classes ENTIRELY (e.g. Wildwalker/
+        -- Primalist, so its Geomancy spec never appeared) — but the game reads
+        -- those via GetTalentsByClass(dbcClass, dbcSpec, ...), so we sweep all
+        -- combos to fill the gaps. Class/spec DBC name universe is from the
+        -- client's CharacterAdvancementUtil.ClassConversions tables; unknown
+        -- combos just return empty. This makes the sweep O(34*95) one-shot calls.
+        local CA_CLASSES = {
+            "Hunter", "Warlock", "Priest", "Paladin", "Mage", "Rogue", "Druid",
+            "Shaman", "Warrior", "DeathKnight", "General", "Necromancer",
+            "Pyromancer", "Cultist", "Starcaller", "SunCleric", "Tinker",
+            "Runemaster", "Primalist", "Reaper", "Venomancer", "Chronomancer",
+            "SonOfArugal", "Guardian", "Stormbringer", "DemonHunter", "Barbarian",
+            "WitchDoctor", "WitchHunter", "KnightOfXoroth", "Monk", "Ranger",
+            "ConquestOfAzeroth", "Hero",
+        }
+        local CA_SPECS = {
+            "Survival", "Marksmanship", "BeastMastery", "Fury", "Arms",
+            "Protection", "Combat", "Subtlety", "Assassination", "Arcane",
+            "Frost", "Fire", "Holy", "Shadow", "Discipline", "Affliction",
+            "Demonology", "Destruction", "Restoration", "Feral", "Balance",
+            "Elemental", "Enhancement", "Retribution", "Blood", "Unholy",
+            "General1", "General2", "General3", "Brutality", "Tactics",
+            "Ancestry", "Voodoo", "Brewing", "Shadowhunting", "Slaying",
+            "Felblood", "Boltslinger", "Darkness", "Inquisition", "Lightning",
+            "Wind", "Gifts", "War", "Hellfire", "Defiance", "Inspiration",
+            "Gladiator", "Fighting", "Runes", "Ferocity", "Packleader",
+            "Archery", "Dueling", "Duality", "Time", "Displacement", "Death",
+            "Rime", "Animation", "Incineration", "Draconic", "Godblade",
+            "Corruption", "Influence", "AstralWarfare", "Tides", "Moonbow",
+            "Piety", "Blessings", "Seraphim", "Firearms", "Invention",
+            "Mechanics", "Venom", "Stalking", "Fortitude", "Reaping", "Soul",
+            "Domination", "Primal", "Geomancy", "Life", "Runic", "Riftblade",
+            "Class", "Bulwark", "Hydromancy", "Valkyr", "MountainKing", "Vizier",
+            "Fleshweaver", "WitchKnight", "None", "Hero",
+        }
+        local seen, merged, extra = {}, {}, 0
         for _, e in ipairs(CA.GetAllEntries()) do
+            if e.ID and not seen[e.ID] then seen[e.ID] = true; merged[#merged + 1] = e end
+        end
+        if CA.GetTalentsByClass then
+            for _, c in ipairs(CA_CLASSES) do
+                for _, s in ipairs(CA_SPECS) do
+                    local ok, list = pcall(CA.GetTalentsByClass, c, s, true)
+                    if ok and type(list) == "table" then
+                        for _, e in ipairs(list) do
+                            if e.ID and not seen[e.ID] then
+                                seen[e.ID] = true
+                                merged[#merged + 1] = e
+                                extra = extra + 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        local nodes, n = {}, 0
+        for _, e in ipairs(merged) do
             if e.ID then
                 local spells = spellList(e.Spells)
                 n = n + 1
@@ -4252,7 +4309,7 @@ SlashCmdList["CONLOGS"] = function(msg)
             count      = n,
             nodes      = nodes,
         }
-        print(string.format("|cff44ff88ConLogs|r: exported %d normalized CoA talent nodes to ConLogsTalentTreeDB.coaExport.", n))
+        print(string.format("|cff44ff88ConLogs|r: exported %d normalized CoA talent nodes to ConLogsTalentTreeDB.coaExport (%d beyond GetAllEntries via GetTalentsByClass).", n, extra))
         print("  |cff999999/reload|r or log out, then grab |cffffff00WTF\\Account\\<acct>\\SavedVariables\\ConLogs-CoA.lua|r (table |cffffff00ConLogsTalentTreeDB.coaExport|r).")
     elseif msg == "aura" then
         -- v1.1.7: explicit aura status check. Also resets the
