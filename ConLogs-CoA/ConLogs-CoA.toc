@@ -4,7 +4,7 @@
 ## X-Credits: Made by Defcon
 ## Author: Defcon
 ## Version: 0.2.2
-## SavedVariables: ConLogsDB, ConLogsItemCacheDB, ConLogsTalentTreeDB, ConLogsSpikeDB
+## SavedVariables: ConLogsDB, ConLogsItemCacheDB, ConLogsTalentTreeDB, ConLogsSpikeDB, ConLogsCAEntriesDB
 
 ConLogs.lua
 ConLogsUI.lua

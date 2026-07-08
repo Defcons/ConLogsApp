@@ -3789,7 +3789,8 @@ local function ShowHelp()
     print("  /conlogs aura          — check if Reality Recalibrators aura is active (gates auto-inspect of groupmates)")
     print("  /conlogs dump <name>   — diagnostic dump of every layer (itemstring, GetItemInfo, GetItemStats, cache) for each slot of a stored player")
     print("|cff888888  Source + releases: github.com/Defcons/ConLogsApp|r")
-    -- dumpspec left in place but not advertised — internal diagnostic.
+    -- dumpspec / dumpentries left in place but not advertised — internal
+    -- diagnostics (talent-read check; CoA node-DB export for the site decoder).
 end
 
 SLASH_CONLOGS1 = "/conlogs"
@@ -4065,6 +4066,56 @@ SlashCmdList["CONLOGS"] = function(msg)
         else
             print("  |cffff4444C_CharacterAdvancement NOT present|r — this client has no CoA talent API")
         end
+    elseif msg == "dumpentries" then
+        -- Claude (v0.2.2): export the full CoA Character Advancement node DB
+        -- (C_CharacterAdvancement.GetAllEntries — every talent/ability entry
+        -- for every class, ~11.8k) to the ConLogsCAEntriesDB SavedVariable.
+        -- This is the lookup the server needs to decode caBuild ("E:" compact
+        -- / "L:" id:rank) into real talents on coalogs.com: entry.ID → Name,
+        -- Spells, Class, Tab, Column/Row or PositionX/Y, NodeType, etc.
+        -- Account-wide SV, written to WTF\Account\<acct>\SavedVariables\
+        -- ConLogs-CoA.lua on the next /reload or logout.
+        local CA = C_CharacterAdvancement
+        if type(CA) ~= "table" or not CA.GetAllEntries then
+            print("|cffff4444ConLogs|r: C_CharacterAdvancement.GetAllEntries not available on this client")
+            return
+        end
+        -- Deep-copy only serializable values (number/string/boolean and tables
+        -- thereof), skipping functions/userdata, with a depth cap as a cycle
+        -- guard. Captures whatever fields the client exposes without hardcoding
+        -- DBC field names (they vary by entry type).
+        local function sanitize(v, depth)
+            local vt = type(v)
+            if vt == "number" or vt == "string" or vt == "boolean" then
+                return v
+            elseif vt == "table" and depth < 4 then
+                local out = {}
+                for k, val in pairs(v) do
+                    local kt = type(k)
+                    if kt == "number" or kt == "string" then
+                        local sv = sanitize(val, depth + 1)
+                        if sv ~= nil then out[k] = sv end
+                    end
+                end
+                return out
+            end
+            return nil
+        end
+        local entries = CA.GetAllEntries()
+        local out, n = {}, 0
+        for _, entry in ipairs(entries) do
+            n = n + 1
+            out[n] = sanitize(entry, 0)
+        end
+        ConLogsCAEntriesDB = {
+            version    = ADDON_VERSION,
+            capturedAt = floor(time()),
+            locale     = GetLocale and GetLocale() or "?",
+            count      = n,
+            entries    = out,
+        }
+        print(string.format("|cff44ff88ConLogs|r: exported %d CoA advancement entries to ConLogsCAEntriesDB.", n))
+        print("  |cff999999/reload|r or log out, then grab |cffffff00WTF\\Account\\<acct>\\SavedVariables\\ConLogs-CoA.lua|r (table ConLogsCAEntriesDB).")
     elseif msg == "aura" then
         -- v1.1.7: explicit aura status check. Also resets the
         -- realityAuraHintShown flag so the one-time hint can fire again
