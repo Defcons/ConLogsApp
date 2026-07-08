@@ -1007,6 +1007,18 @@ local function BuildTalentFrame()
     local COA_ROWH = 46          -- y-grid row pitch (y: 0..9)
     local COA_AREA_X = 18        -- grid origin from frame TOPLEFT
     local COA_AREA_Y = -84
+    -- node shape (from entry.NodeType) → the client's node-art atlas family +
+    -- icon-mask (from CoACharacterAdvancementUtil.NodeArtSet). Lets us frame
+    -- each node as its real square/circle/hexagon instead of a plain square.
+    local COA_SHAPE = {
+        SpendSquare = "square", SpendCircle = "circle",
+        SpendHex = "choice", SpendDiamond = "choice",
+    }
+    local COA_MASK = {
+        square = "Interface\\TalentFrame\\TalentsMaskNodeChoiceFlyout.blp",
+        circle = "Interface\\TalentFrame\\TalentsMaskNodeCircle.blp",
+        choice = "Interface\\TalentFrame\\TalentsMaskNodeChoice.blp",
+    }
     t.coaPool = {}
     t.coaEdges = {}
     local function coaCell(i)
@@ -1022,6 +1034,11 @@ local function BuildTalentFrame()
         c.icon:SetPoint("TOPLEFT", 2, -2)
         c.icon:SetPoint("BOTTOMRIGHT", -2, 2)
         c.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        -- shape frame drawn over the icon edges (client's node-art atlas)
+        c.ring = c:CreateTexture(nil, "OVERLAY")
+        c.ring:SetPoint("TOPLEFT", c, "TOPLEFT", -3, 3)
+        c.ring:SetPoint("BOTTOMRIGHT", c, "BOTTOMRIGHT", 3, -3)
+        c.ring:Hide()
         c.rankText = c:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         c.rankText:SetPoint("BOTTOMRIGHT", c, "BOTTOMRIGHT", -1, 1)
         c.rankText:SetShadowOffset(1, -1)
@@ -1040,6 +1057,26 @@ local function BuildTalentFrame()
         c:SetScript("OnLeave", function() GameTooltip:Hide() end)
         t.coaPool[i] = c
         return c
+    end
+
+    -- Frame a cell as its real shape for the given state ("yellow" maxed /
+    -- "green" partial / "gray" unpicked). Uses the client's node-art atlas via
+    -- SetAtlas + masks the icon to the shape via SetMask; both are guarded, so
+    -- on a client lacking them we fall back to the plain colored border (c.bg).
+    local function coaApplyShape(cell, nodeType, state)
+        local shape = COA_SHAPE[nodeType] or "square"
+        local okRing = false
+        if cell.ring.SetAtlas then
+            okRing = pcall(cell.ring.SetAtlas, cell.ring, "talents-node-" .. shape .. "-" .. state)
+        end
+        if okRing then
+            cell.ring:Show(); cell.bg:Hide()
+        else
+            cell.ring:Hide(); cell.bg:Show()
+        end
+        if cell.icon.SetMask then
+            pcall(cell.icon.SetMask, cell.icon, COA_MASK[shape])
+        end
     end
 
     -- Parse "L:id:rank,..." → pickRank { [id]=rank } plus the ordered list of the
@@ -1087,6 +1124,7 @@ local function BuildTalentFrame()
                     out[#out + 1] = {
                         id = n.id, x = n.x or n.col or 0, y = n.y or n.row or 0,
                         connected = n.connected, name = n.name, spells = n.spells,
+                        nodeType = n.nodeType,
                         maxRank = (type(n.spells) == "table" and #n.spells) or 1,
                         iconPath = (n.icon and n.icon ~= "") and ("Interface\\Icons\\" .. n.icon) or nil,
                     }
@@ -1105,6 +1143,7 @@ local function BuildTalentFrame()
                 out[#out + 1] = {
                     id = e.ID, x = e.PositionX or e.Column or 0, y = e.PositionY or e.Row or 0,
                     connected = e.ConnectedNodes, name = e.Name, spells = sp,
+                    nodeType = e.NodeType,
                     maxRank = (sp and #sp) or 1,
                     iconPath = (sp and sp[1] and GetSpellInfo and select(3, GetSpellInfo(sp[1]))) or nil,
                 }
@@ -1154,19 +1193,25 @@ local function BuildTalentFrame()
             cell.talentMaxRank = node.maxRank or 1
             cell.spellID = node.spells and (node.spells[rank or 1] or node.spells[1])
             cell.icon:SetTexture(node.iconPath or "Interface\\Icons\\INV_Misc_QuestionMark")
+            local state = "gray"
             if rank and rank > 0 then
                 cell.icon:SetDesaturated(false)
                 spent = spent + rank
                 if (node.maxRank or 1) > 1 then
+                    if rank >= node.maxRank then state = "yellow"; cell.rankText:SetTextColor(1, 0.95, 0.55)
+                    else state = "green"; cell.rankText:SetTextColor(0.5, 1, 0.5) end
                     cell.rankText:SetText(tostring(rank))
-                    if rank >= node.maxRank then cell.bg:SetVertexColor(1.0, 0.78, 0.18, 1); cell.rankText:SetTextColor(1, 0.95, 0.55)
-                    else cell.bg:SetVertexColor(0.18, 0.78, 0.22, 1); cell.rankText:SetTextColor(0.5, 1, 0.5) end
                 else
-                    cell.rankText:SetText(""); cell.bg:SetVertexColor(0.9, 0.72, 0.2, 1)
+                    state = "yellow"; cell.rankText:SetText("")
                 end
             else
-                cell.icon:SetDesaturated(true); cell.rankText:SetText(""); cell.bg:SetVertexColor(0.12, 0.12, 0.12, 1)
+                cell.icon:SetDesaturated(true); cell.rankText:SetText("")
             end
+            -- fallback colored border (used only when the shape atlas isn't available)
+            if state == "yellow" then cell.bg:SetVertexColor(1.0, 0.78, 0.18, 1)
+            elseif state == "green" then cell.bg:SetVertexColor(0.18, 0.78, 0.22, 1)
+            else cell.bg:SetVertexColor(0.12, 0.12, 0.12, 1) end
+            coaApplyShape(cell, node.nodeType, state)
             cell:Show()
             center[node.id] = { cx + COA_NODE / 2, cy - COA_NODE / 2 }
         end
