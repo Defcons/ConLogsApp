@@ -175,9 +175,18 @@ Load order is set by each addon's `.toc`. Epoch: `ConLogs.lua` → `ConLogsUI.lu
 - **Mesh interop**: any client on `PREFIX="EpogArmory"` interoperates — ConLogs-Epoch, ConLogs-CoA,
   and legacy EpogArmory all share the reassembly path (CoA is a separate client so no name collision
   despite identical SV/PREFIX names).
-- **CoA "Latest" release trap** (shared repo): Epoch tags `v*`, CoA tags `coa-v*`. `gh release create`
-  marks the newest as "Latest", and Epoch's in-game updater points at `/releases/latest` — so after
-  cutting a CoA release, **restore Epoch as latest**: `gh release edit v3.0.0 --repo Defcons/ConLogsApp --latest`.
+- **<coa-latest-trap>** (shared repo, ONE "Latest" flag): Epoch tags `v*`, CoA tags `coa-v*`, but the
+  repo has a SINGLE GitHub "Latest" marker — `gh release create` moves it to the newest tag regardless
+  of game, so `github.com/Defcons/ConLogsApp/releases/latest` returns whichever game published last.
+  **The addons themselves are SAFE**: both `RELEASES_URL = "…/releases/"` (the listing page, NOT
+  `/releases/latest`) — the in-game "newer version" nudge sends users to the full list to pick (verified
+  2026-07-08; the old note here claiming Epoch's updater uses `/releases/latest` was wrong). The real
+  risk is anything that consumes `/releases/latest` — notably the **epoglogs.com / coalogs.com download
+  links** (separate web-app repo, NOT verifiable from here). **Proper fix:** each site resolves the
+  latest release whose TAG PREFIX matches its game (`v*` vs `coa-v*`) via the GitHub `/releases` API,
+  never `/releases/latest` — then the "Latest" flag is irrelevant and both sites always point right.
+  **Interim workaround** (if a site still uses `/releases/latest`): after cutting a CoA release, re-mark
+  Epoch latest — `gh release edit <epoch tag> --repo Defcons/ConLogsApp --latest`.
 
 ## Known landmines / deferred
 - **<build-release>**: hand-built zips, no CI. (1) Bump BOTH `.toc ## Version` AND the Lua
