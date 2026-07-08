@@ -2,3 +2,5 @@
 *.bak
 .DS_Store
 Thumbs.db
+# generated CoA talent-tree export (regenerate via tools/extract_coa_talent_tree.py)
+tools/coa_talent_tree.json
