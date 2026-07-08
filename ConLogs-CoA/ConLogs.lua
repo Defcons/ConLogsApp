@@ -3921,6 +3921,23 @@ SlashCmdList["CONLOGS"] = function(msg)
             elseif (not liveSaysPvP) and storedKey == "pvp" then
                 print("    |cffffaa44NOTE:|r stored as PvP set but live trinket lookup doesn't match any PvP pattern. May be intentional (older scan, custom trinket) or pattern coverage gap.")
             end
+            -- Claude (v0.2.2): CoA Character Advancement build capture status.
+            -- caBuild = "E:"+ExportBuild (self scans) or "L:"+id:rank list
+            -- (inspected teammates). Confirms whether talents were captured for
+            -- this set. Empty "L:" means the async CA inspect missed the settle
+            -- window — the next inspect cycle should fill it.
+            if set.caBuild and set.caBuild ~= "" then
+                local kind = set.caBuild:match("^(%a):") or "?"
+                local n = 0
+                if kind == "L" then for _ in set.caBuild:gmatch("%d+:%d+") do n = n + 1 end end
+                print(string.format("  |cff44ff88CA build:|r spec=%s  %s  (%d bytes)",
+                    tostring(set.caSpec or "?"),
+                    kind == "E" and "E: compact export" or (kind == "L" and (n .. " learned entries") or "unknown format"),
+                    #set.caBuild))
+                print("    " .. set.caBuild:sub(1, 200) .. (#set.caBuild > 200 and "…" or ""))
+            else
+                print("  |cffff6666CA build: (none captured for this set)|r — teammate scanned before v0.2.2, or the async CA inspect hasn't landed yet")
+            end
             for slot = 1, 19 do
                 local itemstring = set.gear and set.gear[slot]
                 if not itemstring or itemstring == "" then
