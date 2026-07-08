@@ -678,7 +678,11 @@ local function BuildTalentFrame()
         tb:SetPoint("TOP", t, "TOP", (tabIdx - 2) * 64, -56)
         tb:SetText("Tab " .. tabIdx)
         tb:SetScript("OnClick", function()
-            if t.RenderTab then t.RenderTab(tabIdx) end
+            if t.coaMode then
+                if t.RenderCoATab then t.RenderCoATab(tabIdx) end
+            elseif t.RenderTab then
+                t.RenderTab(tabIdx)
+            end
         end)
         t.tabBtns[tabIdx] = tb
     end
@@ -805,6 +809,11 @@ local function BuildTalentFrame()
 
     function t.RenderTab(tabIdx)
         t.activeTab = tabIdx
+        -- Claude (v0.2.9): restore legacy visuals in case the CoA path hid them.
+        t.coaMode = false
+        for _, c in ipairs(t.coaPool) do c:Hide() end
+        for _, lbl in ipairs(t.tierLabels) do lbl:Show() end
+        t.bgLeft:Show(); t.bgRight:Show()
         for _, c in pairs(t.gridCells) do c:Hide() end
         t._hideAllArrows()
         t.emptyText:Hide()
@@ -985,13 +994,163 @@ local function BuildTalentFrame()
         end
     end
 
+    -- Claude (v0.2.9): CoA (Character Advancement) render path. CoA classes
+    -- have no legacy talentRanks (wire field 41 is empty) — their build is
+    -- set.caBuild ("L:nodeId:rank,..."). We resolve each picked node LIVE via
+    -- C_CharacterAdvancement.GetEntryByInternalID (always available in-game for
+    -- any id, incl. classes GetAllEntries omits like Wildwalker), group by the
+    -- node's spec tab, and flow the picked talents into a per-spec icon grid.
+    -- Independent of the legacy tier/column grid above.
+    local COA_COLS = 5
+    t.coaPool = {}
+    local function coaCell(i)
+        local c = t.coaPool[i]
+        if c then return c end
+        c = CreateFrame("Frame", nil, t)
+        c:EnableMouse(true)
+        c:SetWidth(t._CELL); c:SetHeight(t._CELL)
+        c.bg = c:CreateTexture(nil, "BACKGROUND")
+        c.bg:SetAllPoints(c)
+        c.bg:SetTexture("Interface\\Buttons\\WHITE8X8")
+        c.icon = c:CreateTexture(nil, "ARTWORK")
+        c.icon:SetPoint("TOPLEFT", 2, -2)
+        c.icon:SetPoint("BOTTOMRIGHT", -2, 2)
+        c.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        c.rankText = c:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        c.rankText:SetPoint("BOTTOMRIGHT", c, "BOTTOMRIGHT", -1, 2)
+        c.rankText:SetShadowOffset(1, -1)
+        c:SetScript("OnEnter", function(self)
+            if not self.talentName then return end
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            if self.spellID and GameTooltip.SetSpellByID then
+                GameTooltip:SetSpellByID(self.spellID)
+            else
+                GameTooltip:SetText(self.talentName, 1, 1, 1)
+            end
+            GameTooltip:AddLine(string.format("Rank %d / %d", self.talentRank or 0, self.talentMaxRank or 0), 0.4, 1, 0.4)
+            GameTooltip:Show()
+        end)
+        c:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        t.coaPool[i] = c
+        return c
+    end
+
+    -- Parse "L:id:rank,..." → byTab { [tabName] = { {name,icon,rank,maxRank,spellID}, } }, ordered tab list.
+    function t.ResolveCoA(caBuild)
+        local CA = C_CharacterAdvancement
+        if type(caBuild) ~= "string" or type(CA) ~= "table" or not CA.GetEntryByInternalID then return nil end
+        local byTab, order = {}, {}
+        for idStr, rankStr in caBuild:gmatch("(%d+):(%d+)") do
+            local id, rank = tonumber(idStr), tonumber(rankStr)
+            local e = CA.GetEntryByInternalID(id)
+            if e then
+                local spells = e.Spells
+                if type(spells) == "string" then
+                    local tt = {}; for s in spells:gmatch("%d+") do tt[#tt + 1] = tonumber(s) end; spells = tt
+                elseif type(spells) == "number" then spells = { spells } end
+                local spellID = spells and (spells[rank] or spells[1])
+                local icon = spellID and GetSpellInfo and select(3, GetSpellInfo(spellID)) or nil
+                local tab = e.Tab or "?"
+                if not byTab[tab] then byTab[tab] = {}; order[#order + 1] = tab end
+                local list = byTab[tab]
+                list[#list + 1] = { name = e.Name or ("#" .. id), icon = icon, rank = rank, maxRank = (spells and #spells) or 1, spellID = spellID }
+            end
+        end
+        if #order == 0 then return nil end
+        return byTab, order
+    end
+
+    function t.RenderCoATab(idx)
+        for _, c in ipairs(t.coaPool) do c:Hide() end
+        for i, tb in ipairs(t.tabBtns) do
+            if tb:IsShown() then if i == idx then tb:LockHighlight() else tb:UnlockHighlight() end end
+        end
+        local order = t._coaOrder
+        if not order then return end
+        local tab = order[idx]
+        local list = tab and t._coaByTab[tab]
+        if not list then return end
+        t.subtitle:SetText(string.format("|cffffd200%s|r |cff888888%d talents|r", tostring(tab), #list))
+        local CELL = t._CELL
+        local GAP, startX, startY = 8, 24, -86
+        for i, node in ipairs(list) do
+            local cell = coaCell(i)
+            local coln = (i - 1) % COA_COLS
+            local rown = math.floor((i - 1) / COA_COLS)
+            cell:ClearAllPoints()
+            cell:SetPoint("TOPLEFT", t, "TOPLEFT", startX + coln * (CELL + GAP), startY - rown * (CELL + GAP))
+            cell.talentName, cell.talentRank, cell.talentMaxRank, cell.spellID =
+                node.name, node.rank, node.maxRank, node.spellID
+            cell.icon:SetTexture((node.icon and node.icon ~= "") and node.icon or "Interface\\Icons\\INV_Misc_QuestionMark")
+            cell.icon:SetDesaturated(false)
+            if node.maxRank and node.maxRank > 1 then
+                cell.rankText:SetText(tostring(node.rank))
+                if node.rank >= node.maxRank then
+                    cell.bg:SetVertexColor(1.0, 0.78, 0.18, 1); cell.rankText:SetTextColor(1, 0.95, 0.55)
+                else
+                    cell.bg:SetVertexColor(0.18, 0.78, 0.22, 1); cell.rankText:SetTextColor(0.5, 1, 0.5)
+                end
+            else
+                cell.rankText:SetText("")
+                cell.bg:SetVertexColor(0.25, 0.5, 0.9, 1) -- ability (single-rank) = blue edge
+            end
+            cell:Show()
+        end
+    end
+
+    function t.RenderCoA(caBuild)
+        t.coaMode = true
+        -- hide every legacy visual
+        for _, c in pairs(t.gridCells) do c:Hide() end
+        t._hideAllArrows()
+        for _, lbl in ipairs(t.tierLabels) do lbl:Hide() end
+        t.bgLeft:Hide(); t.bgRight:Hide()
+        t.emptyText:Hide()
+        local byTab, order = t.ResolveCoA(caBuild)
+        t._coaByTab, t._coaOrder = byTab, order
+        if not byTab then
+            for _, tb in ipairs(t.tabBtns) do tb:Hide() end
+            for _, c in ipairs(t.coaPool) do c:Hide() end
+            t.subtitle:SetText("")
+            t.emptyText:SetText("No CoA talent data resolved for this character.")
+            t.emptyText:Show()
+            return
+        end
+        for i, tb in ipairs(t.tabBtns) do
+            local name = order[i]
+            if name then
+                local lbl = name; if #lbl > 9 then lbl = lbl:sub(1, 8) .. "." end
+                tb:SetText(lbl); tb:Show()
+            else
+                tb:Hide()
+            end
+        end
+        if #order > #t.tabBtns then
+            -- more specs than tab buttons (rare) — the extra ones aren't shown
+            t.title:SetText(t.title:GetText()) -- no-op guard; extras simply omitted
+        end
+        t.RenderCoATab(1)
+    end
+
     -- Update tab labels with the player's actual tree names whenever a new
     -- player is opened. Falls back to "Tab N" if names aren't available.
     function t.SetPlayer(player, group)
         t.activePlayer = player
         t.activeRanks  = nil
-        if player and player.sets and player.sets[group] then
-            t.activeRanks = player.sets[group].talentRanks
+        local set = player and player.sets and player.sets[group]
+        -- Claude (v0.2.9): CoA classes carry set.caBuild ("L:id:rank,…") and no
+        -- legacy talentRanks — render the node-based build instead of the 3-tab
+        -- grid. Falls through to the legacy path for default/reborn classes.
+        local caBuild = set and set.caBuild
+        if type(caBuild) == "string" and caBuild:match("^L:") then
+            t.title:SetText(string.format("Talents — %s", (player and player.name) or "?"))
+            t.RenderCoA(caBuild)
+            return
+        end
+        t.coaMode = false
+        for _, c in ipairs(t.coaPool) do c:Hide() end
+        if set then
+            t.activeRanks = set.talentRanks
         end
         local names = (player and player.tabNames) or {}
         local cls   = (player and player.class) or ""
