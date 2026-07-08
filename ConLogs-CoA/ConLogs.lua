@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.2.2"
+local ADDON_VERSION = "0.2.3"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -1408,29 +1408,58 @@ end
 -- the legacy 3.3.5 talent API (GetTalentInfo/GetTalentTabInfo return empty for
 -- CoA classes — that's the {0,0,0} the legacy ReadSpecPoints/BuildTalentRanks
 -- produce) and it does NOT use retail Dragonflight C_Traits. It uses
--- Ascension's custom C_CharacterAdvancement essence/loadout system (the same
--- one that powers ascension.gg/v2/builder/coa). We capture the real build:
---   * self  → C_CharacterAdvancement.ExportBuild(true): the compact build
---             string the ascension.gg/coalogs builder decodes. Prefixed "E:".
---   * other → C_CharacterAdvancement.GetInspectedBuild(unit, spec): a list of
---             {EntryId, Rank} learned entries. Encoded "L:id:rank,id:rank,...".
--- Returns build, spec (both strings; "" when CA is unavailable or has no data).
--- Non-player units require a prior C_CharacterAdvancement.InspectUnit(unit)
--- (fired at NotifyInspect time in TryInspect); if that async query hasn't
--- resolved by the settle-window BuildPayload, the build comes back "" and the
--- next inspect cycle captures it. Legacy field 41 (BuildTalentRanks) is left
--- in place for backward-compat; on CoA classes it just carries empty tabs.
+-- Ascension's custom C_CharacterAdvancement essence/loadout system.
+--
+-- We capture the character's SELECTION as a uniform "L:" nodeId:rank list —
+-- "L:nodeId:rank,nodeId:rank,..." — for BOTH self and inspected units, so the
+-- site's player.coaTalents is always a plain {nodeId=rank} map. (v0.2.3: self
+-- was previously an "E:" compact ExportBuild string; unified to "L:" so the
+-- site never has to decode Ascension's compact format.) The node LAYOUT these
+-- ranks draw onto ships separately via /conlogs dumpentries (ConLogsCAEntriesDB).
+--   * self  → iterate the (cached) entry IDs, GetTalentRankByID for talents /
+--             IsKnownID for abilities, reading the ACTIVE spec's ranks.
+--   * other → GetInspectedBuild(unit, spec): the learned {EntryId, Rank} list;
+--             requires a prior InspectUnit(unit) (fired at NotifyInspect time
+--             in TryInspect). If the async result hasn't landed by the settle
+--             window BuildPayload, the build is "" and the next cycle gets it.
+-- Returns build, spec (both strings; "" when CA is unavailable or empty).
+-- Legacy field 41 (BuildTalentRanks) is left in place for backward-compat; on
+-- CoA classes it just carries empty tabs.
+
+-- The set of CA entry IDs is static for the session, so cache it once — self
+-- scans then only read fresh ranks per entry instead of rebuilding the
+-- ~11.8k-entry GetAllEntries table every time (self-scan fires on gear swaps).
+local _caEntryIDs
+local function GetCAEntryIDs()
+    if _caEntryIDs then return _caEntryIDs end
+    local CA = C_CharacterAdvancement
+    if type(CA) ~= "table" or not CA.GetAllEntries then return nil end
+    local ids = {}
+    for _, e in ipairs(CA.GetAllEntries()) do
+        if e.ID then ids[#ids + 1] = e.ID end
+    end
+    _caEntryIDs = ids
+    return ids
+end
+
 local function EncodeCABuild(unit)
     local CA = C_CharacterAdvancement
     if type(CA) ~= "table" then return "", "" end
-    -- Strip wire-control chars (^ separator, | item-link escape) defensively.
-    local function clean(s) return (tostring(s or "")):gsub("[%^|]", "") end
     if UnitIsUnit(unit, "player") then
         local spec = CA.GetActiveSpecID and CA.GetActiveSpecID() or ""
-        if not CA.ExportBuild then return "", tostring(spec) end
-        local build = CA.ExportBuild(true)
-        if not build or build == "" then return "", tostring(spec) end
-        return "E:" .. clean(build), tostring(spec)
+        local ids = GetCAEntryIDs()
+        if not ids then return "", tostring(spec) end
+        local parts = {}
+        for _, id in ipairs(ids) do
+            if CA.IsTalentID and CA.IsTalentID(id) then
+                local rank = CA.GetTalentRankByID(id)
+                if rank and rank > 0 then parts[#parts + 1] = id .. ":" .. rank end
+            elseif CA.IsKnownID and CA.IsKnownID(id) then
+                parts[#parts + 1] = id .. ":1"
+            end
+        end
+        if #parts == 0 then return "", tostring(spec) end
+        return "L:" .. table.concat(parts, ","), tostring(spec)
     else
         if not (CA.GetInspectInfo and CA.GetInspectedBuild) then return "", "" end
         local spec = CA.GetInspectInfo(unit)
@@ -1873,12 +1902,12 @@ local function BuildPayload(unit, guid)
     local _, raceFile = UnitRace(unit)
     parts[#parts + 1] = raceFile or ""
     -- Claude (v0.2.2): wire positions 45/46 — CoA Character Advancement build.
-    -- Field 45 = active CA spec id; field 46 = the build (self: "E:"+ExportBuild
-    -- compact string; inspected units: "L:"+id:rank list). This is the REAL
+    -- Field 45 = active CA spec id; field 46 = the selection as a uniform
+    -- "L:"+nodeId:rank list (self and inspected alike, v0.2.3). This is the REAL
     -- talent/ability build for CoA classes, replacing the dead legacy talent
-    -- read (field 41 stays empty on CoA). Server-side decode powers coalogs.com.
-    -- Append-only: pre-v0.2.2 receivers ignore the trailing fields. See
-    -- EncodeCABuild.
+    -- read (field 41 stays empty on CoA). Site renders it against the node
+    -- layout from /conlogs dumpentries. Append-only: pre-v0.2.2 receivers ignore
+    -- the trailing fields. See EncodeCABuild.
     local caBuild, caSpec = EncodeCABuild(unit)
     parts[#parts + 1] = caSpec
     parts[#parts + 1] = caBuild
@@ -2130,9 +2159,9 @@ local function ParsePayload(payload)
         entry.race = t[44]
     end
     -- Claude (v0.2.2): wire positions 45/46 — CoA Character Advancement build.
-    -- 45 = active CA spec id, 46 = encoded build ("E:"+compact for self scans,
-    -- "L:"+id:rank list for inspected units). Stored raw on the set; server-side
-    -- decode into coalogs.com maps entry IDs → talents via the CoA node DB.
+    -- 45 = active CA spec id, 46 = the selection as a "L:"+nodeId:rank list
+    -- (self and inspected alike, v0.2.3). Stored raw on the set; the site maps
+    -- node IDs → talents via the layout from /conlogs dumpentries.
     -- Absent on pre-v0.2.2 / non-CoA payloads.
     if t[45] and t[45] ~= "" then entry.caSpec = t[45] end
     if t[46] and t[46] ~= "" then entry.caBuild = t[46] end
@@ -2298,10 +2327,10 @@ local function Ingest(payload, sender)
         -- name/tier/column via class talent tree metadata.
         talentRanks = entry.talentRanks,
         -- Claude (v0.2.2): CoA Character Advancement build (wire pos 45/46) —
-        -- the real talent/ability build for CoA classes. caBuild = "E:"+compact
-        -- ExportBuild string (self scans) or "L:"+id:rank list (inspected). The
-        -- server decodes this into coalogs.com; the raw wire is also replayable
-        -- verbatim via rawPayload above.
+        -- the real talent/ability build for CoA classes. caBuild = "L:"+nodeId:
+        -- rank list (self and inspected alike as of v0.2.3). The site renders it
+        -- against the node layout from /conlogs dumpentries; the raw wire is also
+        -- replayable verbatim via rawPayload above.
         caSpec  = entry.caSpec,
         caBuild = entry.caBuild,
         -- Claude (v1.4.4): live character stats from UnitStat-derived
@@ -3923,10 +3952,10 @@ SlashCmdList["CONLOGS"] = function(msg)
                 print("    |cffffaa44NOTE:|r stored as PvP set but live trinket lookup doesn't match any PvP pattern. May be intentional (older scan, custom trinket) or pattern coverage gap.")
             end
             -- Claude (v0.2.2): CoA Character Advancement build capture status.
-            -- caBuild = "E:"+ExportBuild (self scans) or "L:"+id:rank list
-            -- (inspected teammates). Confirms whether talents were captured for
-            -- this set. Empty "L:" means the async CA inspect missed the settle
-            -- window — the next inspect cycle should fill it.
+            -- caBuild = "L:"+nodeId:rank list (self and inspected as of v0.2.3;
+            -- "E:" is a legacy self format still shown for records scanned on
+            -- v0.2.2). Confirms whether talents were captured for this set; a
+            -- missing entry means the async CA inspect hasn't landed yet.
             if set.caBuild and set.caBuild ~= "" then
                 local kind = set.caBuild:match("^(%a):") or "?"
                 local n = 0
@@ -4067,54 +4096,90 @@ SlashCmdList["CONLOGS"] = function(msg)
             print("  |cffff4444C_CharacterAdvancement NOT present|r — this client has no CoA talent API")
         end
     elseif msg == "dumpentries" then
-        -- Claude (v0.2.2): export the full CoA Character Advancement node DB
-        -- (C_CharacterAdvancement.GetAllEntries — every talent/ability entry
-        -- for every class, ~11.8k) to the ConLogsCAEntriesDB SavedVariable.
-        -- This is the lookup the server needs to decode caBuild ("E:" compact
-        -- / "L:" id:rank) into real talents on coalogs.com: entry.ID → Name,
-        -- Spells, Class, Tab, Column/Row or PositionX/Y, NodeType, etc.
-        -- Account-wide SV, written to WTF\Account\<acct>\SavedVariables\
-        -- ConLogs-CoA.lua on the next /reload or logout.
+        -- Claude (v0.2.3): export a normalized, drop-in CoA talent-tree map for
+        -- the coalogs renderer. For each C_CharacterAdvancement.GetAllEntries()
+        -- node we resolve the fields the SITE cannot compute itself — the spell
+        -- icon + name (client-only spellID→texture lookup), maxRank (= #Spells),
+        -- grid/xy position, and the visual + logical links — so the site draws
+        -- straight from this with no DBC decoding. Pair it with each character's
+        -- selection (the "L:" nodeId:rank list from caBuild) to render the tree.
+        -- Written to the account-wide ConLogsCAEntriesDB SavedVariable →
+        -- WTF\Account\<acct>\SavedVariables\ConLogs-CoA.lua on the next /reload
+        -- or logout.
         local CA = C_CharacterAdvancement
         if type(CA) ~= "table" or not CA.GetAllEntries then
             print("|cffff4444ConLogs|r: C_CharacterAdvancement.GetAllEntries not available on this client")
             return
         end
-        -- Deep-copy only serializable values (number/string/boolean and tables
-        -- thereof), skipping functions/userdata, with a depth cap as a cycle
-        -- guard. Captures whatever fields the client exposes without hardcoding
-        -- DBC field names (they vary by entry type).
-        local function sanitize(v, depth)
-            local vt = type(v)
-            if vt == "number" or vt == "string" or vt == "boolean" then
-                return v
-            elseif vt == "table" and depth < 4 then
-                local out = {}
-                for k, val in pairs(v) do
-                    local kt = type(k)
-                    if kt == "number" or kt == "string" then
-                        local sv = sanitize(val, depth + 1)
-                        if sv ~= nil then out[k] = sv end
-                    end
-                end
-                return out
+        -- Normalize entry.Spells → array of spellIDs. The raw field is a table
+        -- for multi-rank talents, a comma-string, or a single number (abilities).
+        local function spellList(raw)
+            if type(raw) == "table" then return raw end
+            if type(raw) == "number" then return { raw } end
+            if type(raw) == "string" then
+                local t = {}
+                for s in raw:gmatch("%d+") do t[#t + 1] = tonumber(s) end
+                return t
             end
             return nil
         end
-        local entries = CA.GetAllEntries()
-        local out, n = {}, 0
-        for _, entry in ipairs(entries) do
-            n = n + 1
-            out[n] = sanitize(entry, 0)
+        -- spellID → lowercase icon basename ("spell_nature_earthquake"), the
+        -- CDN-friendly key. GetSpellInfo's 3rd return is the full texture path.
+        local function iconKey(spellID)
+            if not spellID then return nil end
+            local _, _, tex = GetSpellInfo(spellID)
+            if not tex then return nil end
+            return (tex:match("([^\\]+)$") or tex):lower()
+        end
+        -- Flag test via the client's Enum + bit.contains (both are custom
+        -- Ascension globals). Guarded — nil when unavailable, site ignores.
+        local haveFlags = Enum and Enum.CharacterAdvancementFlag and bit and bit.contains
+        local function flagged(flags, key)
+            if not (haveFlags and flags) then return nil end
+            local f = Enum.CharacterAdvancementFlag[key]
+            return (f and bit.contains(flags, f)) or false
+        end
+        local nodes, n = {}, 0
+        for _, e in ipairs(CA.GetAllEntries()) do
+            if e.ID then
+                local spells = spellList(e.Spells)
+                n = n + 1
+                nodes[n] = {
+                    id       = e.ID,
+                    name     = e.Name,
+                    icon     = iconKey(spells and spells[1]),
+                    desc     = e.Description,
+                    type     = e.Type,           -- "Talent" / "Ability"
+                    nodeType = e.NodeType,        -- shape (square/circle/choice/…)
+                    maxRank  = spells and #spells or 1,
+                    spells   = spells,            -- spellID per rank
+                    class    = e.Class,           -- grouping key ("Necromancer")
+                    tab      = e.Tab,             -- spec grouping key ("Geomancy")
+                    x        = e.PositionX,       -- custom/hero classes (free xy)
+                    y        = e.PositionY,
+                    col      = e.Column,          -- default/reborn classes (grid)
+                    row      = e.Row,
+                    parent   = e.ParentNode,      -- visual edge source id
+                    anchor   = e.Anchor,          -- edge attach side
+                    color    = e.Color,           -- edge color key
+                    distance = e.Distance,        -- edge length hint
+                    requires = e.RequiredIDs,     -- logical prereq ids (array)
+                    aeGate   = e.RequiredTabAEInvestment,
+                    teGate   = e.RequiredTabTEInvestment,
+                    reqLevel = e.RequiredLevel,
+                    disabled = flagged(e.Flags, "Disabled") or flagged(e.Flags, "Deprecated") or nil,
+                    hidden   = flagged(e.Flags, "HiddenClientside") or nil,
+                }
+            end
         end
         ConLogsCAEntriesDB = {
             version    = ADDON_VERSION,
             capturedAt = floor(time()),
             locale     = GetLocale and GetLocale() or "?",
             count      = n,
-            entries    = out,
+            nodes      = nodes,
         }
-        print(string.format("|cff44ff88ConLogs|r: exported %d CoA advancement entries to ConLogsCAEntriesDB.", n))
+        print(string.format("|cff44ff88ConLogs|r: exported %d normalized CoA talent nodes to ConLogsCAEntriesDB.", n))
         print("  |cff999999/reload|r or log out, then grab |cffffff00WTF\\Account\\<acct>\\SavedVariables\\ConLogs-CoA.lua|r (table ConLogsCAEntriesDB).")
     elseif msg == "aura" then
         -- v1.1.7: explicit aura status check. Also resets the
