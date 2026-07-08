@@ -3,8 +3,8 @@
 ## Notes: ConLogs for Conquest of Azeroth (CoA). Sibling of ConLogs-Epoch. Mesh gear inspector + combat-log relay (gear/talents/buffs/positions/loot + CoA difficulty/keystone). Auto-logs instances.
 ## X-Credits: Made by Defcon
 ## Author: Defcon
-## Version: 0.2.3
-## SavedVariables: ConLogsDB, ConLogsItemCacheDB, ConLogsTalentTreeDB, ConLogsSpikeDB, ConLogsCAEntriesDB
+## Version: 0.2.4
+## SavedVariables: ConLogsDB, ConLogsItemCacheDB, ConLogsTalentTreeDB, ConLogsSpikeDB
 
 ConLogs.lua
 ConLogsUI.lua

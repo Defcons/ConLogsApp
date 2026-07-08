@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.2.3"
+local ADDON_VERSION = "0.2.4"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -1415,7 +1415,7 @@ end
 -- site's player.coaTalents is always a plain {nodeId=rank} map. (v0.2.3: self
 -- was previously an "E:" compact ExportBuild string; unified to "L:" so the
 -- site never has to decode Ascension's compact format.) The node LAYOUT these
--- ranks draw onto ships separately via /conlogs dumpentries (ConLogsCAEntriesDB).
+-- ranks draw onto ships separately via /conlogs dumpentries (ConLogsTalentTreeDB.coaExport).
 --   * self  → iterate the (cached) entry IDs, GetTalentRankByID for talents /
 --             IsKnownID for abilities, reading the ACTIVE spec's ranks.
 --   * other → GetInspectedBuild(unit, spec): the learned {EntryId, Rank} list;
@@ -4103,9 +4103,9 @@ SlashCmdList["CONLOGS"] = function(msg)
         -- grid/xy position, and the visual + logical links — so the site draws
         -- straight from this with no DBC decoding. Pair it with each character's
         -- selection (the "L:" nodeId:rank list from caBuild) to render the tree.
-        -- Written to the account-wide ConLogsCAEntriesDB SavedVariable →
-        -- WTF\Account\<acct>\SavedVariables\ConLogs-CoA.lua on the next /reload
-        -- or logout.
+        -- Stored under ConLogsTalentTreeDB.coaExport (see write below for why not
+        -- a fresh SV) → WTF\Account\<acct>\SavedVariables\ConLogs-CoA.lua on the
+        -- next /reload or logout.
         local CA = C_CharacterAdvancement
         if type(CA) ~= "table" or not CA.GetAllEntries then
             print("|cffff4444ConLogs|r: C_CharacterAdvancement.GetAllEntries not available on this client")
@@ -4172,15 +4172,23 @@ SlashCmdList["CONLOGS"] = function(msg)
                 }
             end
         end
-        ConLogsCAEntriesDB = {
+        -- Claude (v0.2.4): stash under ConLogsTalentTreeDB (an already-registered,
+        -- already-persisting SavedVariable) rather than a fresh top-level SV.
+        -- Adding a brand-new SavedVariable name to the .toc doesn't reliably
+        -- register on this client without a full restart, so a new global never
+        -- saves; writing into an existing SV persists on the next /reload with no
+        -- restart. Namespaced under `.coaExport` so it can't collide with the
+        -- class-file keys CaptureTalentMetadata writes into the same table.
+        ConLogsTalentTreeDB = ConLogsTalentTreeDB or {}
+        ConLogsTalentTreeDB.coaExport = {
             version    = ADDON_VERSION,
             capturedAt = floor(time()),
             locale     = GetLocale and GetLocale() or "?",
             count      = n,
             nodes      = nodes,
         }
-        print(string.format("|cff44ff88ConLogs|r: exported %d normalized CoA talent nodes to ConLogsCAEntriesDB.", n))
-        print("  |cff999999/reload|r or log out, then grab |cffffff00WTF\\Account\\<acct>\\SavedVariables\\ConLogs-CoA.lua|r (table ConLogsCAEntriesDB).")
+        print(string.format("|cff44ff88ConLogs|r: exported %d normalized CoA talent nodes to ConLogsTalentTreeDB.coaExport.", n))
+        print("  |cff999999/reload|r or log out, then grab |cffffff00WTF\\Account\\<acct>\\SavedVariables\\ConLogs-CoA.lua|r (table |cffffff00ConLogsTalentTreeDB.coaExport|r).")
     elseif msg == "aura" then
         -- v1.1.7: explicit aura status check. Also resets the
         -- realityAuraHintShown flag so the one-time hint can fire again
