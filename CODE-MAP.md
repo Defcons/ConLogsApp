@@ -9,7 +9,7 @@
     - Update this file in the SAME diff that changes structure/behaviour, and bump the stamp below.
 -->
 
-_Last verified: 2026-07-08 @ aab7aa7 — by Claude (Opus 4.8), migrated from cross-project memory_
+_Last verified: 2026-07-08 @ d107cc0 — by Claude (Opus 4.8); CoA talent capture + map + in-game tree_
 
 ## What this is
 Client-side apps for the **ConLogs** logging platform (formerly *EpogArmory* / *epoglogs*). The web
@@ -97,6 +97,12 @@ Load order is set by each addon's `.toc`. Epoch: `ConLogs.lua` → `ConLogsUI.lu
     `SetMapToCurrentZone` dance only when self reads 0,0 and the map is closed. **Map-validity
     guard**: relay nothing when `GetMapInfo()` is a continent/world name (Kalimdor/Azeroth/etc.) —
     e.g. Onyxia has no instance map and falls back to "Kalimdor".
+- **<chunk-local-limit>**: `ConLogs.lua`'s main chunk sits right at Lua 5.1's **200-file-scope-local
+  cap**. Adding bare module-level `local`s can push it over → the file silently fails to COMPILE and
+  the whole addon never loads (`/conlogs` → "unknown command", no SV write — looks like the addon
+  vanished). Put new module-level helpers on a TABLE (e.g. `CoaBuild.*`), not bare `local function`.
+  Verify after edits with `luaparser` (count `LocalFunction`+`LocalAssign` targets directly under the
+  main chunk; must stay ≤200). No lua binary here — `pip install luaparser`.
 - **<sv-prune>**: 3.3.5 silently drops a WHOLE SavedVariable that exceeds an internal size limit.
   `PruneStoredData()` runs at `PLAYER_LOGIN`: age-prune player records (>45d), count-cap 4000 (drop
   oldest), age-prune item cache (>60d), drop orphan `lastScanned`.
@@ -131,9 +137,32 @@ Load order is set by each addon's `.toc`. Epoch: `ConLogs.lua` → `ConLogsUI.lu
 - **CoA removed vs Epoch**: dungeon-run tracker + training-dummy deleted (`ConLogsDungeon.lua` +
   `ConLogsDummy.lua` absent from the fork; `/conlogs dummy|dungeon|dungeondebug` gone). Auto-logging
   moved to `ConLogsAutoLog.lua`.
-- **CoA spec/talent read is BROKEN** — CoA's 21-class / 4-tab layout defeats the `GetTalentTabInfo`/
-  DominantTree logic (captured specs read `{0,0,0}`); gear captures fine. `tools/COA_TALENTS_CONTRACT.md`
-  + `extract_coa_talent_tree.py` + `coa_talent_tree.json` are the offline talent-map effort.
+- **<coa-talents>** (talent CAPTURE, fixed — the old `{0,0,0}` legacy read is dead): CoA does NOT use
+  `GetTalentInfo` (empty for CoA classes) nor DF `C_Traits` — it uses Ascension's custom
+  **`C_CharacterAdvancement`**. `ConLogs.lua` `CoaBuild` table: `CoaBuild.Encode(unit)` →
+  `"L:"+nodeId:rank,…` via `GetInspectedBuild(unit, spec)` (authoritative for ANY class incl.
+  Wildwalker/Primalist; self is warmed by `CoaBuild.Warm`=`InspectUnit("player")` at
+  login/PLAYER_TALENT_UPDATE/self-scan; iterate-`GetAllEntries` only as fallback). Wire **45=caSpec,
+  46=caBuild** (append-only tail); stored `set.caSpec/caBuild`; rides the CI relay unchanged. Respec
+  re-scan forced by clearing `lastSelfFingerprint` (the legacy fingerprint can't see CoA talent
+  changes). Full external-API notes: ~/.claude memory `reference_coa_talent_api.md`.
+- **<coa-talent-map>**: `/conlogs dumpentries` exports the full node map to
+  **`ConLogsTalentTreeDB.coaExport.nodes[]`** — written into that EXISTING SV on purpose (a NEW
+  top-level SV won't register on this client without a full restart, so it never persisted). Node
+  source = **`GetEntriesByClass(class,tab,false)`** (the FULL set incl. ABILITY nodes — what the
+  in-game tree uses; `GetTalentsByClass` is talents-ONLY and silently drops abilities like
+  Bearskin/Natural Efficiency) swept over all DBC class×spec combos, ∪ `GetAllEntries` ∪
+  `GetEntryByInternalID` over every seen pick. Per node: id, name, icon(basename), nodeType, x/y
+  (custom classes, integer grid 0–10 × 0–9) or col/row (default), **`connected[]` = THE tree edges**
+  (from `entry.ConnectedNodes`; `parent`/`requires` are near-empty — NOT the edges), `group` (choice).
+  `tools/extract_coa_talent_tree.py` → `coa_talent_tree.json` for the site; `COA_TALENTS_CONTRACT.md`.
+- **<coa-ingame-tree>**: `ConLogsUI.lua` `RenderCoA`/`RenderCoATab`/`coaNodeSet`/`coaApplyShape` draw
+  the node-graph in the Talents panel (source: `coaExport`, live `GetEntriesByClass` fallback),
+  positioned on the x/y grid, picks highlighted, shape frames via `SetAtlas("talents-node-<shape>-<state>")`
+  + icon `SetMask`. Gotchas: this client exposes **no `frame:CreateLine`** → edges are axis-aligned
+  L-connectors (plain textures), not diagonals; background is ONE shared spec scene
+  (`talents-background-<class>-<spec>` via `AtlasUtil:AtlasExists` — Class/General tabs have no atlas
+  of their own, and without a background the greyed nodes are invisible → look "missing").
 
 ## Contracts between modules
 - **Addon relay → epoglogs server**: the addon emits `[[CL_<KIND>_v1_…]]<b64>` chunks in the combat
@@ -162,8 +191,9 @@ Load order is set by each addon's `.toc`. Epoch: `ConLogs.lua` → `ConLogsUI.lu
   `python -c "import shutil; shutil.make_archive(...)"`. Also clean-sync source into the live AddOns
   folder on every change.
 - **Deferred / open**: server-side position replay viewer (TS not consumed yet); end-of-raid relay
-  flush (see [[relay-rides-failed-casts]]); CoA server-side decode into coalogs.com; CoA spec/talent
-  read fix; live-keystone probe (`/conlogs spike coa` inside an active M+).
+  flush (see [[relay-rides-failed-casts]]); **CoA talent rendering on coalogs.com** — addon side is
+  done (caBuild + `coa_talent_tree.json`), the site must read `player.coaTalents` + draw the map per
+  `COA_TALENTS_CONTRACT.md`; live-keystone probe (`/conlogs spike coa` inside an active M+).
 - **License inconsistency (flag)**: root `LICENSE` + root `README.md` say **GPLv3**;
   `ConLogs-Epoch/README.md` still says **MIT**. Treat GPLv3 (the actual `LICENSE` file) as
   authoritative; the subfolder README line is stale.
