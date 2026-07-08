@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.2.5"
+local ADDON_VERSION = "0.2.6"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -1426,31 +1426,37 @@ end
 -- Legacy field 41 (BuildTalentRanks) is left in place for backward-compat; on
 -- CoA classes it just carries empty tabs.
 
--- The set of CA entry IDs is static for the session, so cache it once — self
--- scans then only read fresh ranks per entry instead of rebuilding the
--- ~11.8k-entry GetAllEntries table every time (self-scan fires on gear swaps).
-local _caEntryIDs
-local function GetCAEntryIDs()
-    if _caEntryIDs then return _caEntryIDs end
+-- Claude (v0.2.6): all CoA-build helpers hang off ONE table so they cost a
+-- single main-chunk local instead of six. Lua 5.1 caps a chunk at 200 locals
+-- and ConLogs.lua sits right at that limit — v0.2.5 added these as separate
+-- `local function`s, pushing the chunk to 204, so it silently failed to compile
+-- and the whole addon (incl. the /conlogs slash command) never loaded. Any new
+-- module-level helper must go on a table, not a bare `local`.
+local CoaBuild = {}
+
+-- Cache the static set of CA entry IDs once per session (self scans then only
+-- read fresh ranks, not rebuild the ~11.8k-entry GetAllEntries table).
+function CoaBuild.EntryIDs()
+    if CoaBuild._ids then return CoaBuild._ids end
     local CA = C_CharacterAdvancement
     if type(CA) ~= "table" or not CA.GetAllEntries then return nil end
     local ids = {}
     for _, e in ipairs(CA.GetAllEntries()) do
         if e.ID then ids[#ids + 1] = e.ID end
     end
-    _caEntryIDs = ids
+    CoaBuild._ids = ids
     return ids
 end
 
--- Warm the player's OWN Character Advancement inspect data so GetInspectedBuild
--- ("player", ...) has it. Cheap; safe to call repeatedly.
-local function WarmSelfCA()
+-- Warm the player's OWN CA inspect data so GetInspectedBuild("player", ...) is
+-- populated. Cheap; safe to call repeatedly.
+function CoaBuild.Warm()
     local CA = C_CharacterAdvancement
     if type(CA) == "table" and CA.InspectUnit then CA.InspectUnit("player") end
 end
 
 -- Encode a GetInspectedBuild {EntryId, Rank} list to "L:"+id:rank,... or nil.
-local function encodeInspectedList(build)
+function CoaBuild.InspectedList(build)
     if type(build) ~= "table" then return nil end
     local parts = {}
     for _, e in ipairs(build) do
@@ -1460,14 +1466,13 @@ local function encodeInspectedList(build)
     return "L:" .. table.concat(parts, ",")
 end
 
--- Self fallback: iterate the GetAllEntries id list and read ranks/known. Only
--- CORRECT for classes present in that DB — it MISSES classes GetAllEntries
--- omits (e.g. Wildwalker/Primalist on this build) and can then false-positive
--- on cross-class ability entries. Used only when the authoritative
--- GetInspectedBuild path returns nothing.
-local function encodeSelfIterate()
+-- Self fallback: iterate the GetAllEntries id list. CORRECT only for classes
+-- present in that DB — MISSES ones GetAllEntries omits (e.g. Wildwalker) and can
+-- false-positive on cross-class ability entries. Used only when the
+-- authoritative GetInspectedBuild path returns nothing.
+function CoaBuild.SelfIterate()
     local CA = C_CharacterAdvancement
-    local ids = GetCAEntryIDs()
+    local ids = CoaBuild.EntryIDs()
     if not ids then return nil end
     local parts = {}
     for _, id in ipairs(ids) do
@@ -1482,15 +1487,14 @@ local function encodeSelfIterate()
     return "L:" .. table.concat(parts, ",")
 end
 
--- Encode a unit's CoA build as "L:"+nodeId:rank,... (see design note above the
--- helpers). PRIMARY path for BOTH self and inspected units is
--- GetInspectedBuild(unit, spec) — the engine's real build, which works for
--- ALL classes including ones missing from GetAllEntries (the v0.2.3 self-only
--- iterate approach silently produced WRONG picks for Wildwalker; v0.2.5 reads
--- the authoritative build instead). Self requires a prior InspectUnit("player")
--- (WarmSelfCA, fired at login / talent-update / self-scan); if that hasn't
--- landed, self falls back to the iterate approach. Returns build, spec.
-local function EncodeCABuild(unit)
+-- Encode a unit's CoA build as "L:"+nodeId:rank,... PRIMARY path for BOTH self
+-- and inspected units is GetInspectedBuild(unit, spec) — the engine's real
+-- build, which works for ALL classes including ones missing from GetAllEntries
+-- (the v0.2.3 self-only iterate silently produced WRONG picks for Wildwalker;
+-- v0.2.5 reads the authoritative build). Self needs a prior InspectUnit
+-- ("player") via CoaBuild.Warm (login / talent-update / self-scan); if that
+-- hasn't landed, self falls back to the iterate approach. Returns build, spec.
+function CoaBuild.Encode(unit)
     local CA = C_CharacterAdvancement
     if type(CA) ~= "table" then return "", "" end
     local isPlayer = UnitIsUnit(unit, "player")
@@ -1501,11 +1505,11 @@ local function EncodeCABuild(unit)
         spec = CA.GetInspectInfo and CA.GetInspectInfo(unit)
     end
     if CA.GetInspectedBuild and spec then
-        local l = encodeInspectedList(CA.GetInspectedBuild(unit, spec))
+        local l = CoaBuild.InspectedList(CA.GetInspectedBuild(unit, spec))
         if l then return l, tostring(spec) end
     end
     if isPlayer then
-        local l = encodeSelfIterate()
+        local l = CoaBuild.SelfIterate()
         if l then return l, tostring(spec or "") end
     end
     return "", tostring(spec or "")
@@ -1943,8 +1947,8 @@ local function BuildPayload(unit, guid)
     -- talent/ability build for CoA classes, replacing the dead legacy talent
     -- read (field 41 stays empty on CoA). Site renders it against the node
     -- layout from /conlogs dumpentries. Append-only: pre-v0.2.2 receivers ignore
-    -- the trailing fields. See EncodeCABuild.
-    local caBuild, caSpec = EncodeCABuild(unit)
+    -- the trailing fields. See CoaBuild.Encode.
+    local caBuild, caSpec = CoaBuild.Encode(unit)
     parts[#parts + 1] = caSpec
     parts[#parts + 1] = caBuild
     -- v1.3: capture talent metadata locally for this class (name, icon,
@@ -2922,7 +2926,7 @@ local function TryInspect()
     -- by the settle-window BuildPayload. Best-effort — the result arrives
     -- asynchronously via INSPECT_CHARACTER_ADVANCEMENT_RESULT; if it hasn't
     -- landed by settle time the CA build is absent this scan and the next
-    -- inspect cycle captures it. See EncodeCABuild.
+    -- inspect cycle captures it. See CoaBuild.Encode.
     if type(C_CharacterAdvancement) == "table" and C_CharacterAdvancement.InspectUnit then
         C_CharacterAdvancement.InspectUnit(entry.unit)
     end
@@ -3089,11 +3093,6 @@ local SELF_SCAN_LOGIN_DELAY = 3
 
 local selfScanPending = false
 local selfScanAt = 0
--- Claude (v0.2.5): forces the next self-scan past the fingerprint gate. Set on
--- PLAYER_TALENT_UPDATE — CoA respecs don't change the legacy ReadSpecPoints
--- fingerprint (it's 0/0/0 for CoA classes), so a talent change would otherwise
--- be suppressed as "nothing changed" and never re-broadcast the new build.
-local forceSelfScan = false
 -- Fingerprint of the last successfully-broadcast self-scan (level + talents
 -- + gear itemStrings). On Ascension, UNIT_INVENTORY_CHANGED fires every ~15s
 -- for reasons unrelated to real gear swaps (durability ticks, aura procs,
@@ -3154,12 +3153,11 @@ local function TryScanSelf()
     -- Ascension's classless GetActiveTalentGroup reports 1 unchanged, so
     -- the "active group" key never changed on a respec.
     local fp = SelfFingerprint()
-    if fp == lastSelfFingerprint and not forceSelfScan then return end
-    forceSelfScan = false
+    if fp == lastSelfFingerprint then return end
 
-    -- Keep our own CA inspect data warm so EncodeCABuild's GetInspectedBuild
+    -- Keep our own CA inspect data warm so CoaBuild.Encode's GetInspectedBuild
     -- ("player", ...) path stays populated for the NEXT scan (v0.2.5).
-    WarmSelfCA()
+    CoaBuild.Warm()
 
     local payload, info = BuildPayload("player", playerGUID)
     if not payload then
@@ -3658,7 +3656,7 @@ f:SetScript("OnEvent", function(self, event, ...)
         ConLogsTalentTreeDB = ConLogsTalentTreeDB or {} -- v1.3: per-class talent metadata
         MigratePlayers() -- wrap pre-v0.13 flat entries into sets[1]
         PruneStoredData() -- cap ConLogsDB.players / lastScanned / item cache (block-too-big guard)
-        WarmSelfCA() -- v0.2.5: warm own CA inspect data so the login self-scan reads the real build
+        CoaBuild.Warm() -- v0.2.5: warm own CA inspect data so the login self-scan reads the real build
         RequestSelfScan(SELF_SCAN_LOGIN_DELAY) -- initial self-scan after talent data warms up
         versionPingAt = now() + VERSION_PING_DELAY -- one-shot version broadcast, 2min after login
         return
@@ -3672,11 +3670,12 @@ f:SetScript("OnEvent", function(self, event, ...)
         if unit == "player" then RequestSelfScan() end
     elseif event == "PLAYER_TALENT_UPDATE" then
         -- v0.2.5: a respec changed our build. Re-warm CA inspect data, then
-        -- force a re-scan (bypassing the fingerprint gate, which is blind to
-        -- CoA talent changes) after a short delay so GetInspectedBuild has the
-        -- new build.
-        WarmSelfCA()
-        forceSelfScan = true
+        -- force a re-scan after a short delay so GetInspectedBuild has the new
+        -- build. Clearing lastSelfFingerprint defeats the fingerprint gate,
+        -- which is otherwise blind to CoA talent changes (legacy ReadSpecPoints
+        -- stays 0/0/0), so the new build actually re-broadcasts.
+        CoaBuild.Warm()
+        lastSelfFingerprint = ""
         RequestSelfScan(1.5)
     elseif event == "PLAYER_ENTERING_WORLD" then
         -- v1.1.7+: zone transitions (BG exit, instance load, login)
@@ -4135,12 +4134,12 @@ SlashCmdList["CONLOGS"] = function(msg)
         print(string.format("  ReadSpecPoints(player) = %d / %d / %d → DominantTree = %d  |cff888888(legacy API — empty on CoA classes)|r",
             s1, s2, s3, DominantTree({s1, s2, s3})))
         -- Claude (v0.2.2): CoA Character Advancement read — the real talent
-        -- source on this client. Confirms EncodeCABuild captures a build.
+        -- source on this client. Confirms CoaBuild.Encode captures a build.
         -- v0.2.5: compares the two self-read paths so we can see which one
         -- correctly captures classes missing from GetAllEntries (e.g. Wildwalker).
         local CA = C_CharacterAdvancement
         if type(CA) == "table" then
-            WarmSelfCA() -- populate self inspect data before reading it below
+            CoaBuild.Warm() -- populate self inspect data before reading it below
             local activeSpec = CA.GetActiveSpecID and CA.GetActiveSpecID() or "?"
             local nEntries = CA.GetAllEntries and #CA.GetAllEntries() or 0
             print(string.format("  |cff44ff88C_CharacterAdvancement|r present: activeSpec=%s  totalEntries=%d",
@@ -4148,15 +4147,15 @@ SlashCmdList["CONLOGS"] = function(msg)
             local function nodes(s) local n = 0 if s and s ~= "" then for _ in s:gmatch("%d+:%d+") do n = n + 1 end end return n end
             -- authoritative path
             local insp = CA.GetInspectedBuild and CA.GetInspectedBuild("player", activeSpec)
-            local inspStr = encodeInspectedList(insp) or ""
+            local inspStr = CoaBuild.InspectedList(insp) or ""
             print(string.format("  GetInspectedBuild(player,%s): %s",
                 tostring(activeSpec), inspStr == "" and "|cffff8800(empty — inspect data not warm yet, retry in ~2s)|r" or (nodes(inspStr) .. " nodes  " .. inspStr:sub(1, 90) .. (#inspStr > 90 and "…" or ""))))
             -- fallback path
-            local iter = encodeSelfIterate() or ""
+            local iter = CoaBuild.SelfIterate() or ""
             print(string.format("  iterate(GetAllEntries): %s", iter == "" and "(empty)" or (nodes(iter) .. " nodes")))
-            -- what EncodeCABuild actually ships
-            local caBuild, caSpec = EncodeCABuild("player")
-            print(string.format("  → EncodeCABuild ships: spec=%s  %s nodes  |cff888888(%s)|r",
+            -- what CoaBuild.Encode actually ships
+            local caBuild, caSpec = CoaBuild.Encode("player")
+            print(string.format("  → CoaBuild.Encode ships: spec=%s  %s nodes  |cff888888(%s)|r",
                 tostring(caSpec), nodes(caBuild), caBuild == inspStr and caBuild ~= "" and "authoritative" or "fallback/iterate"))
         else
             print("  |cffff4444C_CharacterAdvancement NOT present|r — this client has no CoA talent API")
