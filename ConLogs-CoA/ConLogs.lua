@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.2.9"
+local ADDON_VERSION = "0.2.10"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -4316,7 +4316,9 @@ SlashCmdList["CONLOGS"] = function(msg)
                     y        = e.PositionY,
                     col      = e.Column,          -- default/reborn classes (grid)
                     row      = e.Row,
-                    parent   = e.ParentNode,      -- visual edge source id
+                    connected = e.ConnectedNodes, -- THE tree edges: node ids this node links to
+                    group    = e.Group,           -- choice/group key (nodes sharing it are a choice)
+                    parent   = e.ParentNode,      -- visual edge source id (legacy/hero)
                     anchor   = e.Anchor,          -- edge attach side
                     color    = e.Color,           -- edge color key
                     distance = e.Distance,        -- edge length hint
