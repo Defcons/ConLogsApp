@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.3.0"
+local ADDON_VERSION = "0.3.1"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning

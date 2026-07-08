@@ -1074,86 +1074,130 @@ local function BuildTalentFrame()
         return nil
     end
 
+    -- Full node set for a (classDBC, tabDBC) spec, normalized to a common shape.
+    -- Prefer the complete exported map (ConLogsTalentTreeDB.coaExport) — it
+    -- includes the ABILITY nodes GetTalentsByClass omits (which is why the tree
+    -- looked half-empty). Fall back to live talents-only when no export exists.
+    local function coaNodeSet(classDBC, tabDBC)
+        local ex = ConLogsTalentTreeDB and ConLogsTalentTreeDB.coaExport
+        if ex and type(ex.nodes) == "table" then
+            local out = {}
+            for _, n in ipairs(ex.nodes) do
+                if n.class == classDBC and n.tab == tabDBC then
+                    out[#out + 1] = {
+                        id = n.id, x = n.x or n.col or 0, y = n.y or n.row or 0,
+                        connected = n.connected, name = n.name, spells = n.spells,
+                        maxRank = (type(n.spells) == "table" and #n.spells) or 1,
+                        iconPath = (n.icon and n.icon ~= "") and ("Interface\\Icons\\" .. n.icon) or nil,
+                    }
+                end
+            end
+            if #out > 0 then return out end
+        end
+        local CA = C_CharacterAdvancement
+        local live = CA.GetTalentsByClass and CA.GetTalentsByClass(classDBC, tabDBC, true)
+        if type(live) ~= "table" then return nil end
+        local out = {}
+        for _, e in ipairs(live) do
+            if e.ID then
+                local sp = coaSpells(e.Spells)
+                out[#out + 1] = {
+                    id = e.ID, x = e.PositionX or e.Column or 0, y = e.PositionY or e.Row or 0,
+                    connected = e.ConnectedNodes, name = e.Name, spells = sp,
+                    maxRank = (sp and #sp) or 1,
+                    iconPath = (sp and sp[1] and GetSpellInfo and select(3, GetSpellInfo(sp[1]))) or nil,
+                }
+            end
+        end
+        return out
+    end
+
     function t.RenderCoATab(idx)
         for _, c in ipairs(t.coaPool) do c:Hide() end
-        for _, ln in ipairs(t.coaEdges) do ln:Hide() end
+        for _, s in ipairs(t.coaEdges) do s:Hide() end
         for i, tb in ipairs(t.tabBtns) do
             if tb:IsShown() then if i == idx then tb:LockHighlight() else tb:UnlockHighlight() end end
         end
         local info = t._coaTabs and t._coaTabs[idx]
         if not info then return end
-        local CA = C_CharacterAdvancement
-        local full = CA.GetTalentsByClass and CA.GetTalentsByClass(info.class, info.tab, true)
-        if type(full) ~= "table" then
+        -- spec background art (mountain scene), behind everything
+        if not t.coaBg then
+            t.coaBg = t:CreateTexture(nil, "BACKGROUND")
+            t.coaBg:SetPoint("TOPLEFT", t, "TOPLEFT", 12, -78)
+            t.coaBg:SetPoint("BOTTOMRIGHT", t, "BOTTOMRIGHT", -12, 14)
+            t.coaBg:SetAlpha(0.5)
+        end
+        local cau = CharacterAdvancementUtil
+        local atlas
+        if cau and cau.GetBackgroundAtlas and cau.GetClassFileByDBC and cau.GetSpecFileByDBC and t.coaBg.SetAtlas then
+            local cf, sf = cau.GetClassFileByDBC(info.class), cau.GetSpecFileByDBC(info.tab)
+            if cf and sf then atlas = cau.GetBackgroundAtlas(cf, sf) end
+        end
+        if atlas then t.coaBg:SetAtlas(atlas); t.coaBg:Show() else t.coaBg:Hide() end
+
+        local nodes = coaNodeSet(info.class, info.tab)
+        if not nodes then
             t.subtitle:SetText(string.format("|cffffd200%s|r |cff888888(tree unavailable)|r", tostring(info.name)))
             return
         end
         local pick = t._coaPick or {}
-        local spent = 0
-        local center = {} -- id → {cx, cy} node centers for edge drawing
-        local ci = 0
-        for _, e in ipairs(full) do
-            if e.ID then
-                local x = e.PositionX or e.Column or 0
-                local y = e.PositionY or e.Row or 0
-                local cx = COA_AREA_X + x * COA_COLW
-                local cy = COA_AREA_Y - y * COA_ROWH
-                ci = ci + 1
-                local cell = coaCell(ci)
-                cell:ClearAllPoints()
-                cell:SetPoint("TOPLEFT", t, "TOPLEFT", cx, cy)
-                local spells = coaSpells(e.Spells)
-                local rank = pick[e.ID]
-                local maxRank = (spells and #spells) or 1
-                local spellID = spells and (spells[rank or 1] or spells[1])
-                cell.talentName = e.Name or ("#" .. e.ID)
-                cell.talentRank = rank or 0
-                cell.talentMaxRank = maxRank
-                cell.spellID = spellID
-                cell.icon:SetTexture(spellID and GetSpellInfo and select(3, GetSpellInfo(spellID))
-                    or "Interface\\Icons\\INV_Misc_QuestionMark")
-                if rank and rank > 0 then
-                    cell.icon:SetDesaturated(false)
-                    spent = spent + rank
-                    if maxRank > 1 then
-                        cell.rankText:SetText(tostring(rank))
-                        if rank >= maxRank then cell.bg:SetVertexColor(1.0, 0.78, 0.18, 1); cell.rankText:SetTextColor(1, 0.95, 0.55)
-                        else cell.bg:SetVertexColor(0.18, 0.78, 0.22, 1); cell.rankText:SetTextColor(0.5, 1, 0.5) end
-                    else
-                        cell.rankText:SetText("")
-                        cell.bg:SetVertexColor(0.9, 0.72, 0.2, 1)
-                    end
+        local spent, center = 0, {}
+        for ci, node in ipairs(nodes) do
+            local cx = COA_AREA_X + (node.x or 0) * COA_COLW
+            local cy = COA_AREA_Y - (node.y or 0) * COA_ROWH
+            local cell = coaCell(ci)
+            cell:ClearAllPoints()
+            cell:SetPoint("TOPLEFT", t, "TOPLEFT", cx, cy)
+            local rank = pick[node.id]
+            cell.talentName = node.name or ("#" .. tostring(node.id))
+            cell.talentRank = rank or 0
+            cell.talentMaxRank = node.maxRank or 1
+            cell.spellID = node.spells and (node.spells[rank or 1] or node.spells[1])
+            cell.icon:SetTexture(node.iconPath or "Interface\\Icons\\INV_Misc_QuestionMark")
+            if rank and rank > 0 then
+                cell.icon:SetDesaturated(false)
+                spent = spent + rank
+                if (node.maxRank or 1) > 1 then
+                    cell.rankText:SetText(tostring(rank))
+                    if rank >= node.maxRank then cell.bg:SetVertexColor(1.0, 0.78, 0.18, 1); cell.rankText:SetTextColor(1, 0.95, 0.55)
+                    else cell.bg:SetVertexColor(0.18, 0.78, 0.22, 1); cell.rankText:SetTextColor(0.5, 1, 0.5) end
                 else
-                    cell.icon:SetDesaturated(true)
-                    cell.rankText:SetText("")
-                    cell.bg:SetVertexColor(0.14, 0.14, 0.14, 1)
+                    cell.rankText:SetText(""); cell.bg:SetVertexColor(0.9, 0.72, 0.2, 1)
                 end
-                cell:Show()
-                center[e.ID] = { cx + COA_NODE / 2, cy - COA_NODE / 2 }
+            else
+                cell.icon:SetDesaturated(true); cell.rankText:SetText(""); cell.bg:SetVertexColor(0.12, 0.12, 0.12, 1)
             end
+            cell:Show()
+            center[node.id] = { cx + COA_NODE / 2, cy - COA_NODE / 2 }
         end
         t.subtitle:SetText(string.format("|cffffd200%s|r |cff888888%d points|r", tostring(info.name), spent))
-        -- connecting lines from each node's ConnectedNodes. Requires the modern
-        -- Line object (frame:CreateLine) — backported on this client; if absent
-        -- we skip edges and just show positioned nodes.
-        if t.CreateLine then
-            local ei = 0
-            for _, e in ipairs(full) do
-                local a = e.ID and center[e.ID]
-                local conn = e.ConnectedNodes
-                if a and type(conn) == "table" then
-                    for _, tid in ipairs(conn) do
-                        local b = center[tid]
-                        if b then
-                            ei = ei + 1
-                            local ln = t.coaEdges[ei]
-                            if not ln then ln = t:CreateLine(nil, "ARTWORK"); t.coaEdges[ei] = ln end
-                            if ln.SetThickness then ln:SetThickness(2) end
-                            if ln.SetColorTexture then ln:SetColorTexture(0.85, 0.78, 0.4, 0.85) end
-                            ln:ClearAllPoints()
-                            ln:SetStartPoint("TOPLEFT", t, a[1], a[2])
-                            ln:SetEndPoint("TOPLEFT", t, b[1], b[2])
-                            ln:Show()
+        -- edges: axis-aligned L-connectors from each node's `connected` list.
+        -- Drawn with plain textures (no rotation / no native Line dependency,
+        -- which this client lacks) so they render reliably; each edge = a
+        -- vertical segment + a horizontal segment meeting at a right angle.
+        local si = 0
+        local function seg()
+            si = si + 1
+            local s = t.coaEdges[si]
+            if not s then s = t:CreateTexture(nil, "BORDER"); s:SetTexture("Interface\\Buttons\\WHITE8X8"); t.coaEdges[si] = s end
+            s:SetVertexColor(0.82, 0.74, 0.38, 0.7)
+            s:ClearAllPoints(); s:Show()
+            return s
+        end
+        for _, node in ipairs(nodes) do
+            local a = center[node.id]
+            if a and type(node.connected) == "table" then
+                for _, tid in ipairs(node.connected) do
+                    local b = center[tid]
+                    if b then
+                        local ax, ay, bx, by = a[1], a[2], b[1], b[2]
+                        local v = seg()
+                        v:SetWidth(2); v:SetHeight(math.max(1, math.abs(ay - by)))
+                        v:SetPoint("TOPLEFT", t, "TOPLEFT", ax - 1, math.max(ay, by))
+                        if math.abs(ax - bx) > 1 then
+                            local h = seg()
+                            h:SetHeight(2); h:SetWidth(math.abs(ax - bx))
+                            h:SetPoint("TOPLEFT", t, "TOPLEFT", math.min(ax, bx), by + 1)
                         end
                     end
                 end
