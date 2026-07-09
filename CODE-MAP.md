@@ -143,7 +143,11 @@ Load order is set by each addon's `.toc`. Epoch: `ConLogs.lua` → `ConLogsUI.lu
   `"L:"+nodeId:rank,…` via `GetInspectedBuild(unit, spec)` (authoritative for ANY class incl.
   Wildwalker/Primalist; self is warmed by `CoaBuild.Warm`=`InspectUnit("player")` at
   login/PLAYER_TALENT_UPDATE/self-scan; iterate-`GetAllEntries` only as fallback). Wire **45=caSpec,
-  46=caBuild** (append-only tail); stored `set.caSpec/caBuild`; rides the CI relay unchanged. Respec
+  46=caBuild** (append-only tail); stored `set.caSpec/caBuild`; rides the CI relay unchanged. **Wire
+  47=per-slot scaled item stats** (`BuildScaledSlotStats` → `slot~itemID~itemLevel~TOKEN=val,…;…`,
+  stored `set.slotStats`): CoA scales item stats to the wearer's level, and the itemID-keyed global
+  hint cache (field 40) is last-scan-wins — 47 re-homes the SAME `GetItemStats(link)` values per-slot
+  on the character's own scan so the site stores them per-character. Respec
   re-scan forced by clearing `lastSelfFingerprint` (the legacy fingerprint can't see CoA talent
   changes). Full external-API notes: ~/.claude memory `reference_coa_talent_api.md`.
 - **<coa-talent-map>**: `/conlogs dumpentries` exports the full node map to
