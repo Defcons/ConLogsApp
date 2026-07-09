@@ -1,7 +1,7 @@
 import sys, json, re
 
 SV = r"C:\Private\Games\Ascension Launcher\resources\client\WTF\Account\DEFCON\SavedVariables\ConLogs-CoA.lua"
-OUT = r"C:\Dev\wow\ConLogsApp\tools\coa_talent_tree.json"
+OUT = r"C:\Dev\games\wow\ConLogsApp\tools\coa_talent_tree.json"
 
 txt = open(SV, encoding='utf-8', errors='replace').read()
 
