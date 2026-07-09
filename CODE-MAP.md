@@ -9,7 +9,7 @@
     - Update this file in the SAME diff that changes structure/behaviour, and bump the stamp below.
 -->
 
-_Last verified: 2026-07-08 @ d107cc0 — by Claude (Opus 4.8); CoA talent capture + map + in-game tree_
+_Last verified: 2026-07-09 — by Claude (Opus 4.8); CoA talent capture + map + in-game tree; release build strips dev slash cmds (tools/build_release.py)_
 
 ## What this is
 Client-side apps for the **ConLogs** logging platform (formerly *EpogArmory* / *epoglogs*). The web
@@ -192,9 +192,13 @@ Load order is set by each addon's `.toc`. Epoch: `ConLogs.lua` → `ConLogsUI.lu
 
 ## Known landmines / deferred
 - **<build-release>**: hand-built zips, no CI. (1) Bump BOTH `.toc ## Version` AND the Lua
-  `ADDON_VERSION` constant. (2) Build the zip EXCLUDING `ConLogsSpike.lua` + stripping
-  `, ConLogsSpikeDB` from the SV line + the `ConLogsSpike.lua` load line — **whitelist-copy** wanted
-  files into a staging dir (never copy-all-then-delete). (3) `gh release create`. A **minor** bump
+  `ADDON_VERSION` constant. (2) Run **`python tools/build_release.py <addon_dir> <out.zip>`** — it
+  whitelist-copies toc-listed files into staging and applies the two release-only transforms:
+  drops `ConLogsSpike.lua` (+ `, ConLogsSpikeDB` from the SV line), and **strips developer/diagnostic
+  slash commands** by deleting every `--@strip-dev-begin@ … --@strip-dev-end@` block from each `.lua`
+  (currently the `dump`/`dumpspec`/`dumpstats`/`dumpentries` handlers; `aura` is deliberately KEPT —
+  it's the one player-useful diagnostic). Dev source keeps all commands; only the zip is stripped.
+  Always `luaparser`-verify the zip's `ConLogs.lua` after building. (3) `gh release create`. A **minor** bump
   (2.x→2.(x+1).0) notifies users on older builds; **patch** bumps are silent (`CompareMajorMinor`).
   **PowerShell path-guard traps in this workspace**: `Remove-Item -Recurse` on staging/AddOns paths
   and `Select-String` get BLOCKED (sometimes silently, exit 1). Use whitelist `Copy-Item -Force` and

@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "3.0.0"
+local ADDON_VERSION = "3.0.1"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -3765,6 +3765,7 @@ SlashCmdList["CONLOGS"] = function(msg)
                 p.class or "?", p.name or "?", p.level or 0, p.zone or "?",
                 p.scannedBy or "?", date("%Y-%m-%d %H:%M", p.scanTime or 0)))
         end
+    --@strip-dev-begin@ (developer/diagnostic commands — removed from the public release build)
     elseif msg:sub(1, 4) == "dump" then
         -- v1.2: forensic diagnostic. Dumps every layer of what we know about
         -- a stored player's gear so we can find where transmog data is
@@ -3951,6 +3952,7 @@ SlashCmdList["CONLOGS"] = function(msg)
         local s1, s2, s3 = ReadSpecPoints("player")
         print(string.format("  ReadSpecPoints(player) = %d / %d / %d → DominantTree = %d",
             s1, s2, s3, DominantTree({s1, s2, s3})))
+    --@strip-dev-end@
     elseif msg == "aura" then
         -- v1.1.7: explicit aura status check. Also resets the
         -- realityAuraHintShown flag so the one-time hint can fire again
@@ -4321,6 +4323,7 @@ SlashCmdList["CONLOGS"] = function(msg)
             and _G.ConLogsBrowserFrame.Refresh then
             _G.ConLogsBrowserFrame.Refresh()
         end
+    --@strip-dev-begin@
     elseif msg:sub(1, 9) == "dumpstats" then
         -- Diagnostic: print GetItemStats + tooltip lines for equipped slots.
         -- Lets us see exactly which keys Ascension's client returns for a
@@ -4366,6 +4369,7 @@ SlashCmdList["CONLOGS"] = function(msg)
             end
         end
         tip:Hide()
+    --@strip-dev-end@
     else
         ShowHelp()
     end

@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.3.5"
+local ADDON_VERSION = "0.3.6"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -3925,6 +3925,7 @@ SlashCmdList["CONLOGS"] = function(msg)
                 p.class or "?", p.name or "?", p.level or 0, p.zone or "?",
                 p.scannedBy or "?", date("%Y-%m-%d %H:%M", p.scanTime or 0)))
         end
+    --@strip-dev-begin@ (developer/diagnostic commands — removed from the public release build)
     elseif msg == "dump" or msg:sub(1, 5) == "dump " then
         -- Claude (v0.2.2): guard tightened from `msg:sub(1,4)=="dump"` — the
         -- bare 4-char prefix swallowed every dump* command (dumpspec, dumpstats,
@@ -4363,6 +4364,7 @@ SlashCmdList["CONLOGS"] = function(msg)
         }
         print(string.format("|cff44ff88ConLogs|r: exported %d normalized CoA talent nodes to ConLogsTalentTreeDB.coaExport (%d beyond GetAllEntries via GetTalentsByClass).", n, extra))
         print("  |cff999999/reload|r or log out, then grab |cffffff00WTF\\Account\\<acct>\\SavedVariables\\ConLogs-CoA.lua|r (table |cffffff00ConLogsTalentTreeDB.coaExport|r).")
+    --@strip-dev-end@
     elseif msg == "aura" then
         -- v1.1.7: explicit aura status check. Also resets the
         -- realityAuraHintShown flag so the one-time hint can fire again
@@ -4696,6 +4698,7 @@ SlashCmdList["CONLOGS"] = function(msg)
             and _G.ConLogsBrowserFrame.Refresh then
             _G.ConLogsBrowserFrame.Refresh()
         end
+    --@strip-dev-begin@
     elseif msg:sub(1, 9) == "dumpstats" then
         -- Diagnostic: print GetItemStats + tooltip lines for equipped slots.
         -- Lets us see exactly which keys Ascension's client returns for a
@@ -4741,6 +4744,7 @@ SlashCmdList["CONLOGS"] = function(msg)
             end
         end
         tip:Hide()
+    --@strip-dev-end@
     else
         ShowHelp()
     end
