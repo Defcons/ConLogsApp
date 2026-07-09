@@ -1,7 +1,8 @@
-import sys, json, re
+import sys, json, re, os
 
 SV = r"C:\Private\Games\Ascension Launcher\resources\client\WTF\Account\DEFCON\SavedVariables\ConLogs-CoA.lua"
-OUT = r"C:\Dev\games\wow\ConLogsApp\tools\coa_talent_tree.json"
+# Write next to this script (tools/) — survives repo moves; no absolute path to rot.
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coa_talent_tree.json")
 
 txt = open(SV, encoding='utf-8', errors='replace').read()
 
