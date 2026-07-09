@@ -68,7 +68,7 @@ local PROTO = "1"
 -- tooltip + mesh version-ping would show a stale number after a bump until a full restart.
 -- A Lua constant re-executes on every /reload, so it always reflects the loaded build.
 -- KEEP THIS IN SYNC with the .toc "## Version" on every release.
-local ADDON_VERSION = "0.3.6"
+local ADDON_VERSION = "0.3.7"
 local RELEASES_URL = "https://github.com/Defcons/ConLogsApp/releases/"
 
 -- Tuning
@@ -1796,6 +1796,35 @@ local function BuildItemInfoHints(unit)
     return table.concat(pieces, ";")
 end
 
+-- Claude: per-slot SCALED item stats for the scanned character. CoA/Ascension
+-- scales an item's stats to the WEARER's level, so the same itemID has
+-- different stats on a L10 vs a L51 character. The global item-hint cache
+-- (field 40, keyed by itemID) is last-scan-wins and can't represent that — the
+-- armory ends up showing whoever scanned an item last, not the character being
+-- viewed. This field carries the SAME GetItemStats(link) values the hints read
+-- (already correct at scan time) but keyed by SLOT on the character's own scan,
+-- so the site can store them per-character and prefer them in the paperdoll.
+-- Format: "slot~itemID~itemLevel~TOKEN=val,TOKEN=val;slot~...". Wire-safe
+-- (no ^ / |); additive — pre-field-47 receivers ignore it.
+local function BuildScaledSlotStats(unit)
+    if not GetItemStats then return "" end
+    local pieces = {}
+    for slot = 1, 19 do
+        local link = GetInventoryItemLink(unit, slot)
+        if link then
+            local itemID = tonumber(link:match("item:(%d+)"))
+            if itemID then
+                local statsStr = EncodeHintStats(GetItemStats(link))
+                if statsStr ~= "" then
+                    local _, _, _, itemLevel = GetItemInfo(link)
+                    pieces[#pieces + 1] = string.format("%d~%d~%d~%s", slot, itemID, itemLevel or 0, statsStr)
+                end
+            end
+        end
+    end
+    return table.concat(pieces, ";")
+end
+
 local function BuildPayload(unit, guid)
     local name = UnitName(unit)
     if not name or name == "" or name == UNKNOWN then return nil, "name unresolved" end
@@ -1951,6 +1980,11 @@ local function BuildPayload(unit, guid)
     local caBuild, caSpec = CoaBuild.Encode(unit)
     parts[#parts + 1] = caSpec
     parts[#parts + 1] = caBuild
+    -- Claude: wire position 47 — per-slot SCALED item stats for THIS character
+    -- (see BuildScaledSlotStats). Lets the site store level-scaled item stats
+    -- per-character instead of last-scan-wins in the global itemID-keyed cache.
+    -- Append-only; older receivers ignore it.
+    parts[#parts + 1] = BuildScaledSlotStats(unit)
     -- v1.3: capture talent metadata locally for this class (name, icon,
     -- tier, column, maxRank per talent). Stored in ConLogsTalentTreeDB.
     -- Doesn't go on the wire — it's bulky and stable per-class. Each
@@ -2205,6 +2239,11 @@ local function ParsePayload(payload)
     -- Absent on pre-v0.2.2 / non-CoA payloads.
     if t[45] and t[45] ~= "" then entry.caSpec = t[45] end
     if t[46] and t[46] ~= "" then entry.caBuild = t[46] end
+    -- Claude: wire position 47 — per-slot scaled item stats for this character.
+    -- Stored raw on the set; the site parses it (slot~itemID~itemLevel~stats;…)
+    -- and prefers it in the paperdoll over the last-scan-wins global item row.
+    -- Absent on pre-field-47 payloads.
+    if t[47] and t[47] ~= "" then entry.slotStats = t[47] end
     if entry.name == "" or entry.guid == "" then return nil end
     return entry
 end
@@ -2373,6 +2412,10 @@ local function Ingest(payload, sender)
         -- replayable verbatim via rawPayload above.
         caSpec  = entry.caSpec,
         caBuild = entry.caBuild,
+        -- Claude: per-slot scaled item stats (wire pos 47). Level-scaled item
+        -- stats keyed by slot for THIS character, so the site shows the viewed
+        -- character's values instead of the last scanner's (global item cache).
+        slotStats = entry.slotStats,
         -- Claude (v1.4.4): live character stats from UnitStat-derived
         -- snapshot at scan time (wire pos 43). Lets the Stats panel show
         -- real character-pane values (base + items + buffs + talents)
