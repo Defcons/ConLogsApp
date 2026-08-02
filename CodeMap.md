@@ -1,4 +1,4 @@
-# Code Map — ConLogsApp
+# CodeMap — ConLogsApp
 
 <!--
   A THIN, POINTER-BASED index of this codebase. Read first, update after changes.
@@ -9,7 +9,7 @@
     - Update this file in the SAME diff that changes structure/behaviour, and bump the stamp below.
 -->
 
-_Last verified: 2026-07-09 — by Claude (Opus 4.8); CoA talent capture + map + in-game tree; release build strips dev slash cmds (tools/build_release.py)_
+_Last verified: 2026-08-03 @ f959bf7 — renamed CODE-MAP.md → CodeMap.md; verified thin (18.5 KB), no changelog disease, file/symbol pointers spot-checked current. No content change._
 
 ## What this is
 Client-side apps for the **ConLogs** logging platform (formerly *EpogArmory* / *epoglogs*). The web
