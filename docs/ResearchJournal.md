@@ -3,7 +3,7 @@
 <!--
   The append-only chronological history: how the ConLogs addon platform got built,
   what was learned, which approaches were tried and dropped. The HISTORY of the
-  triad — CodeMap = the machine · KnowledgeBase = the model · ResearchJournal =
+  triad — OrientationMap = the machine · KnowledgeBase = the model · ResearchJournal =
   the history. Append; never rewrite old entries. When an iteration confirms a
   durable fact, promote the distilled statement to KnowledgeBase.md and cross-link.
   Seeded 2026-08-03 from `git log --reverse` (103 commits, 2026-06-02 → 2026-08-03).
@@ -11,7 +11,7 @@
 
 _Last verified: 2026-08-03 @ cb5004d — seeded from the full git history — by Claude Opus 4.8._
 
-_The triad: **[CodeMap](../CodeMap.md) = the machine · [KnowledgeBase](KnowledgeBase.md)
+_The triad: **[OrientationMap](../OrientationMap.md) = the machine · [KnowledgeBase](KnowledgeBase.md)
 = the model · ResearchJournal = the history.**_
 
 ## What this is / mission
