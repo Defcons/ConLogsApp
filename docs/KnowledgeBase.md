@@ -6,15 +6,17 @@
   The MODEL of the triad — OrientationMap = the machine (where code lives, edit-time
   landmines) · KnowledgeBase = the model (what's TRUE about the system) ·
   ResearchJournal = the history (how it got built). Cross-link, don't copy: code
-  navigation + "DO NOT edit this" landmines stay in ../OrientationMap.md; this file
+  navigation + "DO NOT edit this" landmines stay in the maps (../OrientationMap.md hub +
+  ../NavigationMap.md per-domain detail); this file
   records confirmed BEHAVIOUR with confidence + a pointer to the owning symbol.
 -->
 
-_Last verified: 2026-08-03 @ cb5004d — seeded from code inspection (Epoch v3.0.1,
-CoA v0.3.7), OrientationMap, README, the field-47 spec, and the full git history — by
-Claude Opus 4.8._
+_Last verified: 2026-08-20 @ 4a58032 — freshness pass, no code changes since the seed: versions
+(Epoch 3.0.1 / CoA 0.3.7) + symbol pointers re-verified; map links updated for the
+OrientationMap→NavigationMap split._
 
-_The triad: **[OrientationMap](../OrientationMap.md) = the machine · KnowledgeBase = the model
+_The doc set: **[OrientationMap](../OrientationMap.md) (hub) + [NavigationMap](../NavigationMap.md)
+(per-domain map) = the machine · KnowledgeBase = the model
 · [ResearchJournal](ResearchJournal.md) = the history.**_
 
 ## How to read this doc
@@ -81,7 +83,7 @@ and is trust-but-verify — code wins a conflict; correct the KB.
   observed — **never at enqueue**. Advancing at enqueue = silent permanent data
   loss if the chunk never lands. On ring-cap front-eviction the `pending` slot
   MUST be reset or the next failed cast miscredits an innocent chunk. —
-  `ConLogsRelay.lua`; edit-time detail in [OrientationMap `<land-gated-dedup>`](../OrientationMap.md).
+  `ConLogsRelay.lua`; edit-time detail in [NavigationMap `<land-gated-dedup>`](../NavigationMap.md).
 - **[FACT, 95%] Architectural limit: relay rides failed casts, so it can starve.**
   A chunk lands only when a player fails a cast. **After the final boss kill
   nobody casts → nothing relays → end-of-raid loot can miss** (mitigated, not
@@ -147,7 +149,7 @@ and is trust-but-verify — code wins a conflict; correct the KB.
 - **[FACT, 100%] The reassembler bounds untrusted wire input** (reject `total>64`
   / out-of-range `idx`; cap concurrent reassembly buffers at 200). Anti-abuse
   cooldowns key on the authenticated `CHAT_MSG_ADDON` `sender`, NOT the spoofable
-  wire `requester` field. — `<mesh-hardening>`.
+  wire `requester` field. — [NavigationMap `<mesh-hardening>`](../NavigationMap.md).
 
 ## 6. CoA differences (ConLogs-CoA/ — the sibling fork)
 
