@@ -9,7 +9,7 @@
   Seeded 2026-08-03 from `git log --reverse` (103 commits, 2026-06-02 → 2026-08-03).
 -->
 
-_Last verified: 2026-08-03 @ cb5004d — seeded from the full git history — by Claude Opus 4.8._
+_Last verified: 2026-08-20 @ 4a58032 — appended the 2026-08-20 bible-pass entry; older entries untouched._
 
 _The triad: **[OrientationMap](../OrientationMap.md) = the machine · [KnowledgeBase](KnowledgeBase.md)
 = the model · ResearchJournal = the history.**_
@@ -177,3 +177,16 @@ step, hand-cut GitHub releases.
 - CoA talent rendering on coalogs.com — addon side done, site side pending — KB §8.
 - Live-keystone DI probe inside an active M+ — KB §9.
 - Resolve the GPLv3-vs-MIT license line in `ConLogs-Epoch/README.md` — KB §8.
+
+## Bible pass (2026-08-20)
+
+- **OrientationMap split at the ~20 KB ceiling** into the bounded hub + `NavigationMap.md`
+  (per-file symbols + domain-local gotchas, moved verbatim); hub now ~7 KB so it inlines whole at
+  SessionStart. No code commits since the 2026-08-03 seed — all map/KB pointers re-verified
+  against code (Epoch 3.0.1 / CoA 0.3.7 confirmed in `.toc` + `ADDON_VERSION`).
+- ToDo/Testing stubs got their first real fill: open work items consolidated from the old map
+  "Deferred" section + KB §8 into `docs/ToDo.md` (the live ledger from now on); the live-keystone
+  DI probe queued in `docs/Testing.md` with cold repro + pass criteria.
+- Noted for the record: `tools/track.js` + `NetherstormArena.png`/`WarsongGulch.png`/`preview.png`
+  sit UNTRACKED (successors of the dev tooling stripped in b6518ba) — their fate is a ToDo
+  "needs the user" item.
