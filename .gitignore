@@ -4,3 +4,21 @@
 Thumbs.db
 # generated CoA talent-tree export (regenerate via tools/extract_coa_talent_tree.py)
 tools/coa_talent_tree.json
+
+# Internal working notes, kept local and not published
+/OrientationMap.md
+/NavigationMap.md
+/KnowledgeBase.md
+/ResearchJournal.md
+/ToDo.md
+/Testing.md
+/CodeMap.md
+/CODE-MAP.md
+/docs/NavigationMap.md
+/docs/KnowledgeBase.md
+/docs/ResearchJournal.md
+/docs/ToDo.md
+/docs/Testing.md
+/CLAUDE.md
+/AGENTS.md
+.claude/
