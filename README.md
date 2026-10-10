@@ -8,7 +8,8 @@ Client-side apps for the **ConLogs** logging platform (the web app lives in the 
 - **`ConLogs-Epoch/`** — the in-game addon for **Project Epoch** (WoW 3.3.5). Mesh gear/talent
   inspector (formerly *EpogArmory*). Embeds gear/talents/positions into the combat log via the
   `SPELL_CAST_FAILED` relay, so a single uploaded `WoWCombatLog.txt` carries everything. Future
-  sibling clients (e.g. `ConLogs-CoA/`) would live alongside it.
+  sibling clients would live alongside it. The Conquest of Azeroth fork (`ConLogs-CoA/`) is retired
+  and stays in the git history and the `coa-v*` releases.
 
 > A desktop companion executable was prototyped and **dropped** — the relay makes the combat log
 > self-contained, so manual single-file upload on the website is enough; no external app needed.
